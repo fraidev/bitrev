@@ -1,7 +1,7 @@
 use serde_bencode::de;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use tokio::{select, sync::Semaphore};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{
     file::{self, TorrentMeta},
@@ -10,6 +10,7 @@ use crate::{
         FullPiece, PeerConnection, PeerHandler, PieceWorkState, TorrentDownloadedState,
     },
     peer_state::PeerStates,
+    protocol_udp::request_udp_peers,
     session::PieceWork,
 };
 
@@ -46,12 +47,19 @@ impl TrackerPeers {
         let info_hash = self.torrent_meta.info_hash;
         let peer_id = self.peer_id;
 
-        let tcp_trackers = all_trackers(&self.torrent_meta.clone())
-            .into_iter()
-            .filter(|t| !t.starts_with("udp://"));
+        let all_tracker_urls = all_trackers(&self.torrent_meta.clone());
+        let tcp_trackers: Vec<String> = all_tracker_urls
+            .iter()
+            .filter(|t| !t.starts_with("udp://"))
+            .cloned()
+            .collect();
+        let udp_trackers: Vec<String> = all_tracker_urls
+            .iter()
+            .filter(|t| t.starts_with("udp://"))
+            .cloned()
+            .collect();
 
-        //TODO: support udp trackers
-        let tcp_trackers = tcp_trackers.clone();
+        debug!("Connecting to trackers: TCP: {:?}, UDP: {:?}", tcp_trackers, udp_trackers);
         let torrent_meta = self.torrent_meta.clone();
         let peer_states = self.peer_states.clone();
         let piece_tx = self.piece_tx.clone();
@@ -70,93 +78,150 @@ impl TrackerPeers {
         });
         tokio::spawn(async move {
             loop {
+                // Handle TCP trackers
                 for tracker in tcp_trackers.clone() {
                     let torrent_meta = torrent_meta.clone();
                     let peer_states = peer_states.clone();
                     let piece_tx = piece_tx.clone();
                     let have_broadcast = have_broadcast.clone();
                     let torrent_downloaded_state = torrent_downloaded_state.clone();
-                    //let pieces_of_work = pieces_of_work.clone();
                     tokio::spawn(async move {
                         let url = file::build_tracker_url(&torrent_meta, &peer_id, 6881, &tracker);
 
-                        let request_peers_res = request_peers(&url).await.unwrap();
-                        let new_peers = request_peers_res.clone().get_peers().unwrap();
-                        let peer_states = peer_states.clone();
+                        match request_peers(&url).await {
+                            Ok(request_peers_res) => {
+                                match request_peers_res.clone().get_peers() {
+                                    Ok(new_peers) => {
+                                        process_peers(
+                                            new_peers,
+                                            info_hash,
+                                            peer_id,
+                                            peer_states.clone(),
+                                            piece_tx.clone(),
+                                            have_broadcast.clone(),
+                                            torrent_downloaded_state.clone(),
+                                        ).await;
 
-                        for peer in new_peers {
-                            let peer_states = peer_states.clone();
-                            //let pieces_of_work = pieces_of_work.clone();
-
-                            if peer_states.clone().states.contains_key(&peer) {
-                                continue;
+                                        //sleep interval
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            request_peers_res.interval,
+                                        )).await;
+                                    }
+                                    Err(e) => debug!("Failed to parse peers from TCP tracker {}: {}", tracker, e),
+                                }
                             }
+                            Err(e) => debug!("Failed to request peers from TCP tracker {}: {}", tracker, e),
+                        }
+                    });
+                }
 
-                            //let peers = peers.clone();
-                            let piece_tx = piece_tx.clone();
-                            let have_broadcast = have_broadcast.clone();
-                            let torrent_downloaded_state = torrent_downloaded_state.clone();
-
-                            tokio::spawn(async move {
-                                let unchoke_notify = tokio::sync::Notify::new();
-                                let (peer_writer_tx, peer_writer_rx) = flume::unbounded();
-
-                                let peer_handler = Arc::new(PeerHandler::new(
-                                    peer,
-                                    unchoke_notify,
-                                    piece_tx.clone(),
-                                    peer_writer_tx.clone(),
-                                    peer_states.clone(),
-                                    //pieces_of_work.clone(),
-                                    torrent_downloaded_state.clone(),
-                                ));
-
-                                let peer_connection = PeerConnection::new(
-                                    peer,
+                // Handle UDP trackers
+                for tracker in udp_trackers.clone() {
+                    let torrent_meta = torrent_meta.clone();
+                    let peer_states = peer_states.clone();
+                    let piece_tx = piece_tx.clone();
+                    let have_broadcast = have_broadcast.clone();
+                    let torrent_downloaded_state = torrent_downloaded_state.clone();
+                    tokio::spawn(async move {
+                        match request_udp_peers(&tracker, &torrent_meta, &peer_id, 6881).await {
+                            Ok(udp_response) => {
+                                debug!("Received UDP response from tracker {}: {:?}", tracker, udp_response);
+                                let new_peers: Vec<_> = udp_response.peers
+                                    .into_iter()
+                                    .map(|p| p.to_socket_addr())
+                                    .collect();
+                                
+                                process_peers(
+                                    new_peers,
                                     info_hash,
                                     peer_id,
-                                    peer_handler.clone(),
-                                );
-
-                                let task_peer_chunk_req_fut =
-                                    peer_handler.task_peer_chunk_requester();
-                                let connect_peer_fut = peer_connection.manage_peer_incoming(
-                                    peer_writer_rx,
-                                    have_broadcast.subscribe(),
-                                );
-
-                                let req = select! {
-                                    r = connect_peer_fut => {
-                                        debug!("connect_peer_fut: {:#?}", r);
-                                        r
-                                    }
-                                    r = task_peer_chunk_req_fut => {
-                                        debug!("task_peer_chunk_req_fut: {:#?}", r);
-                                        r
-                                    }
-                                };
-
-                                match req {
-                                    Ok(_) => {
-                                        // We disconnected the peer ourselves as we don't need it
-                                        peer_handler.on_peer_died();
-                                    }
-                                    Err(e) => {
-                                        debug!("error managing peer: {:#}", e);
-                                        peer_handler.on_peer_died();
-                                    }
-                                }
-                            });
+                                    peer_states.clone(),
+                                    piece_tx.clone(),
+                                    have_broadcast.clone(),
+                                    torrent_downloaded_state.clone(),
+                                ).await;
+                                
+                                //sleep interval
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    udp_response.interval as u64,
+                                )).await;
+                            }
+                            Err(e) => error!("Failed to request peers from UDP tracker {}: {}", tracker, e),
                         }
-                        //sleep interval
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            request_peers_res.interval,
-                        ))
-                        .await
                     });
                 }
 
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+}
+
+async fn process_peers(
+    new_peers: Vec<std::net::SocketAddr>,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    peer_states: Arc<PeerStates>,
+    piece_tx: flume::Sender<FullPiece>,
+    have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
+    torrent_downloaded_state: Arc<TorrentDownloadedState>,
+) {
+    for peer in new_peers {
+        if peer_states.clone().states.contains_key(&peer) {
+            continue;
+        }
+
+        let piece_tx = piece_tx.clone();
+        let have_broadcast = have_broadcast.clone();
+        let torrent_downloaded_state = torrent_downloaded_state.clone();
+        let peer_states = peer_states.clone();
+
+        tokio::spawn(async move {
+            let unchoke_notify = tokio::sync::Notify::new();
+            let (peer_writer_tx, peer_writer_rx) = flume::unbounded();
+
+            let peer_handler = Arc::new(PeerHandler::new(
+                peer,
+                unchoke_notify,
+                piece_tx.clone(),
+                peer_writer_tx.clone(),
+                peer_states.clone(),
+                torrent_downloaded_state.clone(),
+            ));
+
+            let peer_connection = PeerConnection::new(
+                peer,
+                info_hash,
+                peer_id,
+                peer_handler.clone(),
+            );
+
+            let task_peer_chunk_req_fut = peer_handler.task_peer_chunk_requester();
+            let connect_peer_fut = peer_connection.manage_peer_incoming(
+                peer_writer_rx,
+                have_broadcast.subscribe(),
+            );
+
+            let req = select! {
+                r = connect_peer_fut => {
+                    debug!("connect_peer_fut: {:#?}", r);
+                    r
+                }
+                r = task_peer_chunk_req_fut => {
+                    debug!("task_peer_chunk_req_fut: {:#?}", r);
+                    r
+                }
+            };
+
+            match req {
+                Ok(_) => {
+                    // We disconnected the peer ourselves as we don't need it
+                    peer_handler.on_peer_died();
+                }
+                Err(e) => {
+                    debug!("error managing peer: {:#}", e);
+                    peer_handler.on_peer_died();
+                }
             }
         });
     }
