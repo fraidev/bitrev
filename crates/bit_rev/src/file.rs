@@ -125,8 +125,11 @@ pub fn build_tracker_url(
     // let announce_url = torrent_meta.torrent_file.announce.as_ref().unwrap();
     let info_hash_encoded = url_encode_bytes(torrent_meta.info_hash.as_ref()).unwrap();
     let peer_id_encoded = url_encode_bytes(peer_id).unwrap();
+    // let info_hash_encoded = urlencoding::encode_binary(&torrent_meta.info_hash);
+    // let peer_id_encoded = urlencoding::encode_binary(&peer_id);
 
     format!(
+        // "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&compact=1&left={}&event=started?supportcrypto=1&numwant=80&key=DF45C574",
         "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&compact=1&left={}",
         tracker_url,
         info_hash_encoded,
