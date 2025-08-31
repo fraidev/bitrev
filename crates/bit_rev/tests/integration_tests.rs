@@ -1,7 +1,7 @@
+use bit_rev::protocol::Protocol;
 use std::io::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
-use bit_rev::protocol::Protocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

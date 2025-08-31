@@ -59,7 +59,10 @@ impl TrackerPeers {
             .cloned()
             .collect();
 
-        debug!("Connecting to trackers: TCP: {:?}, UDP: {:?}", tcp_trackers, udp_trackers);
+        debug!(
+            "Connecting to trackers: TCP: {:?}, UDP: {:?}",
+            tcp_trackers, udp_trackers
+        );
         let torrent_meta = self.torrent_meta.clone();
         let peer_states = self.peer_states.clone();
         let piece_tx = self.piece_tx.clone();
@@ -100,17 +103,25 @@ impl TrackerPeers {
                                             piece_tx.clone(),
                                             have_broadcast.clone(),
                                             torrent_downloaded_state.clone(),
-                                        ).await;
+                                        )
+                                        .await;
 
                                         //sleep interval
                                         tokio::time::sleep(std::time::Duration::from_millis(
                                             request_peers_res.interval,
-                                        )).await;
+                                        ))
+                                        .await;
                                     }
-                                    Err(e) => debug!("Failed to parse peers from TCP tracker {}: {}", tracker, e),
+                                    Err(e) => debug!(
+                                        "Failed to parse peers from TCP tracker {}: {}",
+                                        tracker, e
+                                    ),
                                 }
                             }
-                            Err(e) => debug!("Failed to request peers from TCP tracker {}: {}", tracker, e),
+                            Err(e) => debug!(
+                                "Failed to request peers from TCP tracker {}: {}",
+                                tracker, e
+                            ),
                         }
                     });
                 }
@@ -125,12 +136,16 @@ impl TrackerPeers {
                     tokio::spawn(async move {
                         match request_udp_peers(&tracker, &torrent_meta, &peer_id, 6881).await {
                             Ok(udp_response) => {
-                                debug!("Received UDP response from tracker {}: {:?}", tracker, udp_response);
-                                let new_peers: Vec<_> = udp_response.peers
+                                debug!(
+                                    "Received UDP response from tracker {}: {:?}",
+                                    tracker, udp_response
+                                );
+                                let new_peers: Vec<_> = udp_response
+                                    .peers
                                     .into_iter()
                                     .map(|p| p.to_socket_addr())
                                     .collect();
-                                
+
                                 process_peers(
                                     new_peers,
                                     info_hash,
@@ -139,14 +154,19 @@ impl TrackerPeers {
                                     piece_tx.clone(),
                                     have_broadcast.clone(),
                                     torrent_downloaded_state.clone(),
-                                ).await;
-                                
+                                )
+                                .await;
+
                                 //sleep interval
                                 tokio::time::sleep(std::time::Duration::from_secs(
                                     udp_response.interval as u64,
-                                )).await;
+                                ))
+                                .await;
                             }
-                            Err(e) => error!("Failed to request peers from UDP tracker {}: {}", tracker, e),
+                            Err(e) => error!(
+                                "Failed to request peers from UDP tracker {}: {}",
+                                tracker, e
+                            ),
                         }
                     });
                 }
@@ -189,18 +209,12 @@ async fn process_peers(
                 torrent_downloaded_state.clone(),
             ));
 
-            let peer_connection = PeerConnection::new(
-                peer,
-                info_hash,
-                peer_id,
-                peer_handler.clone(),
-            );
+            let peer_connection =
+                PeerConnection::new(peer, info_hash, peer_id, peer_handler.clone());
 
             let task_peer_chunk_req_fut = peer_handler.task_peer_chunk_requester();
-            let connect_peer_fut = peer_connection.manage_peer_incoming(
-                peer_writer_rx,
-                have_broadcast.subscribe(),
-            );
+            let connect_peer_fut =
+                peer_connection.manage_peer_incoming(peer_writer_rx, have_broadcast.subscribe());
 
             let req = select! {
                 r = connect_peer_fut => {

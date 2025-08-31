@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v4
+
+    - name: Install toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Run cargo test
+      run: cargo test --all-features --workspace
+
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v4
+
+    - name: Install toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: rustfmt
+
+    - name: Run cargo fmt
+      run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v4
+
+    - name: Install toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: clippy
+
+    - name: Run cargo clippy
+      run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v4
+
+    - name: Install toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Run cargo build
+      run: cargo build --all-features --workspace
+
+    - name: Run cargo build (release)
+      run: cargo build --release --all-features --workspace
+
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v4
+
+    - name: Install toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+
+    - name: Run cargo audit
+      run: cargo audit
