@@ -11,7 +11,7 @@ use crate::{
     },
     peer_state::PeerStates,
     protocol_udp::request_udp_peers,
-    session::PieceWork,
+    session::{PieceResult, PieceWork},
 };
 
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ pub struct TrackerPeers {
     pub peer_states: Arc<PeerStates>,
     pub piece_tx: flume::Sender<FullPiece>,
     pub piece_rx: flume::Receiver<FullPiece>,
+    pub pr_rx: flume::Receiver<PieceResult>,
     pub have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
 }
 
@@ -31,6 +32,7 @@ impl TrackerPeers {
         peer_id: [u8; 20],
         peer_states: Arc<PeerStates>,
         have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
+        pr_rx: flume::Receiver<PieceResult>,
     ) -> TrackerPeers {
         let (sender, receiver) = flume::unbounded();
         TrackerPeers {
@@ -38,6 +40,7 @@ impl TrackerPeers {
             peer_id,
             piece_tx: sender,
             piece_rx: receiver,
+            pr_rx,
             peer_states,
             have_broadcast,
         }
