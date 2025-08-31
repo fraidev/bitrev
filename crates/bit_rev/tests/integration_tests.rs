@@ -64,7 +64,7 @@ async fn successful_handshake_test() {
     // Wait for the server to start
     tokio::time::sleep(Duration::from_millis(200)).await;
     let peer_addr = SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), port);
-    let protocol = Protocol::connect(peer_addr.clone(), info_hash, client_peer_id)
+    let protocol = Protocol::connect(peer_addr, info_hash, client_peer_id)
         .await
         .expect("Failed to connect");
 

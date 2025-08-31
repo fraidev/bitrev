@@ -447,7 +447,7 @@ mod tests {
         let path = Path::new("/work/node_modules");
         let path_matcher = PathMatcher::new("**/node_modules/**").unwrap();
         assert!(
-            path_matcher.is_match(&path),
+            path_matcher.is_match(path),
             "Path matcher {path_matcher} should match {path:?}"
         );
     }
@@ -457,7 +457,7 @@ mod tests {
         let path = Path::new("/Users/someonetoignore/work/zed/zed.dev/node_modules");
         let path_matcher = PathMatcher::new("**/node_modules/**").unwrap();
         assert!(
-            path_matcher.is_match(&path),
+            path_matcher.is_match(path),
             "Path matcher {path_matcher} should match {path:?}"
         );
     }

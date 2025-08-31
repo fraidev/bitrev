@@ -395,7 +395,9 @@ impl PeerHandler {
                 debug!("peer sent bitfield");
                 let p_state = self.peers_state.states.get_mut(&self.peer);
 
-                if p_state.is_none() {
+                if let Some(mut ps) = p_state {
+                    ps.bitfield = Bitfield::new(vec);
+                } else {
                     self.peers_state.states.insert(
                         self.peer,
                         PeerState {
@@ -403,8 +405,6 @@ impl PeerHandler {
                             peer_interested: false,
                         },
                     );
-                } else {
-                    p_state.unwrap().bitfield = Bitfield::new(vec);
                 }
 
                 self.on_bitfield_notify.notify_waiters();
