@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_parse_udp_url() {
-        let tracker = UdpTracker::new("udp://tracker.example.com:8080/announce".to_string());
+        let tracker = UdpTracker::new("udp://tracker.opentrackr.org:1337/announce".to_string());
         let result = tracker.parse_udp_url();
         assert!(result.is_ok());
     }
