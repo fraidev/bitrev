@@ -12,6 +12,7 @@ default = []
 tokio-console = ["console-subscriber"]
 
 [dependencies]
+anyhow.workspace = true
 tokio.workspace = true
 bit_rev.workspace = true
 indicatif.workspace = true
