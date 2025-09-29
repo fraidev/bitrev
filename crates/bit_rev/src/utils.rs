@@ -1,4 +1,4 @@
-use crate::torrent::Torrent;
+use crate::torrent::{Torrent, TorrentFileInfo};
 use rand::Rng;
 
 const BLOCK_SIZE: u32 = 16384;
@@ -41,4 +41,45 @@ pub fn generate_peer_id() -> [u8; 20] {
         .collect::<Vec<u8>>()
         .try_into()
         .unwrap()
+}
+
+#[derive(Debug, Clone)]
+pub struct PieceFileMapping {
+    pub file_index: usize,
+    pub file_offset: usize,
+    pub length: usize,
+}
+
+pub fn map_piece_to_files(torrent: &Torrent, piece_index: usize) -> Vec<PieceFileMapping> {
+    let (piece_start, piece_end) = calculate_bounds_for_piece(torrent, piece_index);
+    let mut mappings = Vec::new();
+
+    for (file_index, file) in torrent.files.iter().enumerate() {
+        let file_start = file.offset as usize;
+        let file_end = file_start + file.length as usize;
+
+        // Check if piece overlaps with this file
+        if piece_start < file_end && piece_end > file_start {
+            let overlap_start = piece_start.max(file_start);
+            let overlap_end = piece_end.min(file_end);
+            let file_offset = overlap_start - file_start;
+            let length = overlap_end - overlap_start;
+
+            mappings.push(PieceFileMapping {
+                file_index,
+                file_offset,
+                length,
+            });
+        }
+    }
+
+    mappings
+}
+
+pub fn get_full_file_path(torrent: &Torrent, file_info: &TorrentFileInfo) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(&torrent.name);
+    for component in &file_info.path {
+        path.push(component);
+    }
+    path
 }

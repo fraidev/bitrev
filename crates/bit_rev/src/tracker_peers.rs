@@ -92,7 +92,12 @@ impl TrackerPeers {
                     let have_broadcast = have_broadcast.clone();
                     let torrent_downloaded_state = torrent_downloaded_state.clone();
                     tokio::spawn(async move {
-                        let url = file::build_tracker_url(&torrent_meta, &peer_id, 6881, &tracker);
+                        let url = file::build_tracker_url(&torrent_meta, &peer_id, 6881, &tracker)
+                            .map_err(|e| {
+                                error!("Failed to build tracker URL for {}: {}", tracker, e);
+                                e
+                            })
+                            .unwrap();
 
                         match request_peers(&url).await {
                             Ok(request_peers_res) => {

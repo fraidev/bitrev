@@ -77,7 +77,7 @@ impl Session {
         &self,
         add_torrent: AddTorrentOptions,
     ) -> anyhow::Result<AddTorrentResult> {
-        let torrent = Torrent::new(&add_torrent.torrent_meta.clone());
+        let torrent = Torrent::new(&add_torrent.torrent_meta.clone())?;
         let torrent_meta = add_torrent.torrent_meta.clone();
         let (pr_tx, pr_rx) = flume::bounded::<PieceResult>(torrent.piece_hashes.len());
         let have_broadcast = Arc::new(tokio::sync::broadcast::channel(128).0);
