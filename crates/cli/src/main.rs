@@ -1,11 +1,12 @@
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use std::{
+    collections::HashMap,
     fmt::Write,
     io::SeekFrom,
     sync::{atomic::AtomicU64, Arc},
 };
 use tokio::{
-    fs::File,
+    fs::{create_dir_all, File},
     io::{AsyncSeekExt, AsyncWriteExt},
 };
 use tracing::trace;
@@ -33,7 +34,7 @@ pub async fn download_file(filename: &str, out_file: Option<String>) -> anyhow::
 
     let add_torrent_result = session.add_torrent(filename.into()).await?;
     let torrent = add_torrent_result.torrent.clone();
-    let torrent_meta = add_torrent_result.torrent_meta;
+    let _torrent_meta = add_torrent_result.torrent_meta;
 
     let total_size = torrent.length as u64;
     let pb = ProgressBar::new(total_size);
@@ -47,13 +48,41 @@ pub async fn download_file(filename: &str, out_file: Option<String>) -> anyhow::
         ).progress_chars("#>-")
     );
 
-    let out_filename = match out_file {
+    // Determine the output directory
+    let output_dir = match out_file {
         Some(name) => name,
-        None => torrent_meta.clone().torrent_file.info.name.clone(),
+        None => torrent.name.clone(),
     };
-    let mut file = File::create(out_filename).await?;
 
-    // File
+    // Create output directory and prepare file handles
+    let mut file_handles: HashMap<usize, File> = HashMap::new();
+
+    // Create directories and prepare files for multi-file torrents
+    for (file_index, file_info) in torrent.files.iter().enumerate() {
+        let file_path = if torrent.files.len() == 1 {
+            // Single file torrent - use output_dir as filename
+            std::path::PathBuf::from(&output_dir)
+        } else {
+            // Multi-file torrent - create subdirectory structure
+            let mut path = std::path::PathBuf::from(&output_dir);
+            for component in &file_info.path {
+                path.push(component);
+            }
+            path
+        };
+
+        // Create parent directories if needed
+        if let Some(parent) = file_path.parent() {
+            create_dir_all(parent).await?;
+        }
+
+        // Create the file
+        let file = File::create(&file_path).await?;
+        file_handles.insert(file_index, file);
+
+        trace!("Created file: {:?}", file_path);
+    }
+
     let total_downloaded = Arc::new(AtomicU64::new(0));
     let total_downloaded_clone = total_downloaded.clone();
 
@@ -71,21 +100,41 @@ pub async fn download_file(filename: &str, out_file: Option<String>) -> anyhow::
         let pr = add_torrent_result.pr_rx.recv_async().await?;
 
         hashset.insert(pr.index);
-        let (start, end) = utils::calculate_bounds_for_piece(&torrent, pr.index as usize);
-        trace!(
-            "index: {}, start: {}, end: {} len {}",
-            pr.index,
-            start,
-            end,
-            pr.length
-        );
-        file.seek(SeekFrom::Start(start as u64)).await?;
-        file.write_all(pr.buf.as_slice()).await?;
+
+        // Map piece to files and write data accordingly
+        let file_mappings = utils::map_piece_to_files(&torrent, pr.index as usize);
+        let mut piece_offset = 0;
+
+        for mapping in file_mappings {
+            let file = file_handles.get_mut(&mapping.file_index).ok_or_else(|| {
+                anyhow::anyhow!("File handle not found for index {}", mapping.file_index)
+            })?;
+
+            // Seek to correct position in file
+            file.seek(SeekFrom::Start(mapping.file_offset as u64))
+                .await?;
+
+            // Write the portion of the piece that belongs to this file
+            let piece_data = &pr.buf[piece_offset..piece_offset + mapping.length];
+            file.write_all(piece_data).await?;
+
+            piece_offset += mapping.length;
+
+            trace!(
+                "Wrote {} bytes to file {} at offset {}",
+                mapping.length,
+                mapping.file_index,
+                mapping.file_offset
+            );
+        }
 
         total_downloaded.fetch_add(pr.length as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
-    file.sync_all().await?;
+    // Sync all files
+    for (_, file) in file_handles {
+        file.sync_all().await?;
+    }
 
     Ok(())
 }

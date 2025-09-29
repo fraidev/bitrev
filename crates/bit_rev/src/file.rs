@@ -4,7 +4,9 @@ use serde_bencode::de;
 use serde_bencode::ser;
 use serde_bytes::ByteBuf;
 use std::fmt::Write;
-use std::{error::Error, io::Read};
+use std::io::Read;
+
+use anyhow::Result;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Node(String, i64);
@@ -95,7 +97,7 @@ impl TorrentMeta {
     }
 }
 
-pub fn from_filename(filename: &str) -> Result<TorrentMeta, Box<dyn Error>> {
+pub fn from_filename(filename: &str) -> Result<TorrentMeta> {
     let mut file = std::fs::File::open(filename)?;
     let mut content = Vec::new();
     file.read_to_end(&mut content)?;
@@ -103,7 +105,7 @@ pub fn from_filename(filename: &str) -> Result<TorrentMeta, Box<dyn Error>> {
     Ok(TorrentMeta::new(torrent))
 }
 
-pub fn url_encode_bytes(content: &[u8]) -> Result<String, Box<dyn Error>> {
+pub fn url_encode_bytes(content: &[u8]) -> Result<String> {
     let mut out: String = String::new();
 
     for byte in content.iter() {
@@ -121,21 +123,27 @@ pub fn build_tracker_url(
     peer_id: &[u8],
     port: u16,
     tracker_url: &str,
-) -> String {
+) -> Result<String> {
     // let announce_url = torrent_meta.torrent_file.announce.as_ref().unwrap();
-    let info_hash_encoded = url_encode_bytes(torrent_meta.info_hash.as_ref()).unwrap();
-    let peer_id_encoded = url_encode_bytes(peer_id).unwrap();
+    let info_hash_encoded = url_encode_bytes(torrent_meta.info_hash.as_ref())?;
+    let peer_id_encoded = url_encode_bytes(peer_id)?;
     // let info_hash_encoded = urlencoding::encode_binary(&torrent_meta.info_hash);
     // let peer_id_encoded = urlencoding::encode_binary(&peer_id);
 
-    format!(
+    let total_length = if let Some(length) = torrent_meta.torrent_file.info.length {
+        length
+    } else if let Some(files) = &torrent_meta.torrent_file.info.files {
+        files.iter().map(|f| f.length).sum()
+    } else {
+        return Err(anyhow::anyhow!(
+            "Invalid torrent file: missing length information"
+        ));
+    };
+
+    Ok(format!(
         // "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&compact=1&left={}&event=started?supportcrypto=1&numwant=80&key=DF45C574",
         "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&compact=1&left={}",
-        tracker_url,
-        info_hash_encoded,
-        peer_id_encoded,
-        port,
-        torrent_meta.torrent_file.info.length.as_ref().unwrap()
+        tracker_url, info_hash_encoded, peer_id_encoded, port, total_length
     )
-    .to_string()
+    .to_string())
 }
