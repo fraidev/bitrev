@@ -19,7 +19,7 @@ impl BencodeResponse {
         let peer_size = 6;
         let peers_bin_length = peers_bin.len();
         let num_peers = peers_bin_length / peer_size;
-        if peers_bin_length % peer_size != 0 {
+        if !peers_bin_length.is_multiple_of(peer_size) {
             anyhow::bail!("Received empty peers");
         }
 
@@ -27,7 +27,7 @@ impl BencodeResponse {
         let peer_size6 = 18;
         let peers_bin_length6 = peers_bin6.len();
         let num_peers6 = peers_bin_length6 / peer_size6;
-        if peers_bin_length6 % peer_size6 != 0 {
+        if !peers_bin_length6.is_multiple_of(peer_size6) {
             anyhow::bail!("Received empty peers");
         }
 
