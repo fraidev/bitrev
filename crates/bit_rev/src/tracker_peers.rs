@@ -1,6 +1,6 @@
 use serde_bencode::de;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
-use tokio::{select, sync::Semaphore};
+use tokio::{select, sync::Semaphore, time::sleep};
 use tracing::{debug, error};
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     },
     peer_state::PeerStates,
     protocol_udp::request_udp_peers,
-    session::{PieceResult, PieceWork},
+    session::{DownloadState, PieceResult, PieceWork},
 };
 
 #[derive(Debug, Clone)]
@@ -23,6 +23,7 @@ pub struct TrackerPeers {
     pub piece_rx: flume::Receiver<FullPiece>,
     pub pr_rx: flume::Receiver<PieceResult>,
     pub have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
+    pub download_state: Arc<Mutex<DownloadState>>,
 }
 
 impl TrackerPeers {
@@ -33,6 +34,7 @@ impl TrackerPeers {
         peer_states: Arc<PeerStates>,
         have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
         pr_rx: flume::Receiver<PieceResult>,
+        download_state: Arc<Mutex<DownloadState>>,
     ) -> TrackerPeers {
         let (sender, receiver) = flume::unbounded();
         TrackerPeers {
@@ -43,7 +45,29 @@ impl TrackerPeers {
             pr_rx,
             peer_states,
             have_broadcast,
+            download_state,
         }
+    }
+
+    pub fn set_download_state(&self, state: DownloadState) {
+        let mut current_state = self.download_state.lock().unwrap();
+        *current_state = state;
+    }
+
+    pub fn get_download_state(&self) -> DownloadState {
+        *self.download_state.lock().unwrap()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.get_download_state() == DownloadState::Paused
+    }
+
+    pub fn is_downloading(&self) -> bool {
+        self.get_download_state() == DownloadState::Downloading
+    }
+
+    pub fn is_init(&self) -> bool {
+        self.get_download_state() == DownloadState::Init
     }
 
     pub async fn connect(&self, pieces_of_work: Vec<PieceWork>) {
@@ -70,6 +94,7 @@ impl TrackerPeers {
         let peer_states = self.peer_states.clone();
         let piece_tx = self.piece_tx.clone();
         let have_broadcast = self.have_broadcast.clone();
+        let download_state = self.download_state.clone();
         let torrent_downloaded_state = Arc::new(TorrentDownloadedState {
             semaphore: Semaphore::new(1),
             pieces: pieces_of_work
@@ -84,6 +109,13 @@ impl TrackerPeers {
         });
         tokio::spawn(async move {
             loop {
+                // Wait while not downloading
+                while {
+                    let state = *download_state.lock().unwrap();
+                    state != DownloadState::Downloading
+                } {
+                    sleep(std::time::Duration::from_millis(100)).await;
+                }
                 // Handle TCP trackers
                 for tracker in tcp_trackers.clone() {
                     let torrent_meta = torrent_meta.clone();
@@ -91,6 +123,7 @@ impl TrackerPeers {
                     let piece_tx = piece_tx.clone();
                     let have_broadcast = have_broadcast.clone();
                     let torrent_downloaded_state = torrent_downloaded_state.clone();
+                    let download_state = download_state.clone();
                     tokio::spawn(async move {
                         let url = file::build_tracker_url(&torrent_meta, &peer_id, 6881, &tracker)
                             .map_err(|e| {
@@ -105,12 +138,16 @@ impl TrackerPeers {
                                     Ok(new_peers) => {
                                         process_peers(
                                             new_peers,
-                                            info_hash,
-                                            peer_id,
-                                            peer_states.clone(),
-                                            piece_tx.clone(),
-                                            have_broadcast.clone(),
-                                            torrent_downloaded_state.clone(),
+                                            PeerProcessorConfig {
+                                                info_hash,
+                                                peer_id,
+                                                peer_states: peer_states.clone(),
+                                                piece_tx: piece_tx.clone(),
+                                                have_broadcast: have_broadcast.clone(),
+                                                torrent_downloaded_state: torrent_downloaded_state
+                                                    .clone(),
+                                                download_state: download_state.clone(),
+                                            },
                                         )
                                         .await;
 
@@ -141,6 +178,7 @@ impl TrackerPeers {
                     let piece_tx = piece_tx.clone();
                     let have_broadcast = have_broadcast.clone();
                     let torrent_downloaded_state = torrent_downloaded_state.clone();
+                    let download_state = download_state.clone();
                     tokio::spawn(async move {
                         match request_udp_peers(&tracker, &torrent_meta, &peer_id, 6881).await {
                             Ok(udp_response) => {
@@ -156,12 +194,15 @@ impl TrackerPeers {
 
                                 process_peers(
                                     new_peers,
-                                    info_hash,
-                                    peer_id,
-                                    peer_states.clone(),
-                                    piece_tx.clone(),
-                                    have_broadcast.clone(),
-                                    torrent_downloaded_state.clone(),
+                                    PeerProcessorConfig {
+                                        info_hash,
+                                        peer_id,
+                                        peer_states: peer_states.clone(),
+                                        piece_tx: piece_tx.clone(),
+                                        have_broadcast: have_broadcast.clone(),
+                                        torrent_downloaded_state: torrent_downloaded_state.clone(),
+                                        download_state: download_state.clone(),
+                                    },
                                 )
                                 .await;
 
@@ -185,24 +226,36 @@ impl TrackerPeers {
     }
 }
 
-async fn process_peers(
-    new_peers: Vec<std::net::SocketAddr>,
+struct PeerProcessorConfig {
     info_hash: [u8; 20],
     peer_id: [u8; 20],
     peer_states: Arc<PeerStates>,
     piece_tx: flume::Sender<FullPiece>,
     have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
     torrent_downloaded_state: Arc<TorrentDownloadedState>,
-) {
+    download_state: Arc<Mutex<DownloadState>>,
+}
+
+async fn process_peers(new_peers: Vec<std::net::SocketAddr>, config: PeerProcessorConfig) {
+    let info_hash = config.info_hash;
+    let peer_id = config.peer_id;
+
     for peer in new_peers {
-        if peer_states.clone().states.contains_key(&peer) {
+        // Skip processing new peers if not downloading
+        let current_state = *config.download_state.lock().unwrap();
+        if current_state != DownloadState::Downloading {
             continue;
         }
 
-        let piece_tx = piece_tx.clone();
-        let have_broadcast = have_broadcast.clone();
-        let torrent_downloaded_state = torrent_downloaded_state.clone();
-        let peer_states = peer_states.clone();
+        if config.peer_states.clone().states.contains_key(&peer) {
+            continue;
+        }
+
+        let piece_tx = config.piece_tx.clone();
+        let have_broadcast = config.have_broadcast.clone();
+        let torrent_downloaded_state = config.torrent_downloaded_state.clone();
+        let peer_states = config.peer_states.clone();
+        let download_state = config.download_state.clone();
 
         tokio::spawn(async move {
             let unchoke_notify = tokio::sync::Notify::new();
@@ -215,6 +268,7 @@ async fn process_peers(
                 peer_writer_tx.clone(),
                 peer_states.clone(),
                 torrent_downloaded_state.clone(),
+                download_state.clone(),
             ));
 
             let peer_connection =

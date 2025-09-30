@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::file::{self, TorrentMeta};
 use crate::peer_state::PeerStates;
@@ -7,6 +7,13 @@ use crate::tracker_peers::TrackerPeers;
 use crate::utils;
 use dashmap::DashMap;
 use flume::Receiver;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadState {
+    Init,
+    Downloading,
+    Paused,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PieceWork {
@@ -31,6 +38,7 @@ pub struct State {
 
 pub struct Session {
     pub streams: DashMap<[u8; 20], TrackerPeers>,
+    pub download_state: Arc<Mutex<DownloadState>>,
 }
 
 pub struct AddTorrentOptions {
@@ -70,7 +78,54 @@ impl Session {
     pub fn new() -> Self {
         Self {
             streams: DashMap::new(),
+            download_state: Arc::new(Mutex::new(DownloadState::Init)),
         }
+    }
+
+    pub fn start_downloading(&self) {
+        {
+            let mut state = self.download_state.lock().unwrap();
+            *state = DownloadState::Downloading;
+        }
+        for entry in self.streams.iter() {
+            entry.value().set_download_state(DownloadState::Downloading);
+        }
+    }
+
+    pub fn pause(&self) {
+        {
+            let mut state = self.download_state.lock().unwrap();
+            *state = DownloadState::Paused;
+        }
+        for entry in self.streams.iter() {
+            entry.value().set_download_state(DownloadState::Paused);
+        }
+    }
+
+    pub fn resume(&self) {
+        {
+            let mut state = self.download_state.lock().unwrap();
+            *state = DownloadState::Downloading;
+        }
+        for entry in self.streams.iter() {
+            entry.value().set_download_state(DownloadState::Downloading);
+        }
+    }
+
+    pub fn get_download_state(&self) -> DownloadState {
+        *self.download_state.lock().unwrap()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.get_download_state() == DownloadState::Paused
+    }
+
+    pub fn is_downloading(&self) -> bool {
+        self.get_download_state() == DownloadState::Downloading
+    }
+
+    pub fn is_init(&self) -> bool {
+        self.get_download_state() == DownloadState::Init
     }
 
     pub async fn add_torrent(
@@ -91,6 +146,7 @@ impl Session {
             peer_states,
             have_broadcast.clone(),
             pr_rx.clone(),
+            self.download_state.clone(),
         );
 
         let pieces_of_work = (0..(torrent.piece_hashes.len()) as u64)
@@ -127,6 +183,9 @@ impl Session {
 
         self.streams
             .insert(torrent.info_hash, tracker_stream.clone());
+
+        // Start downloading
+        self.start_downloading();
 
         Ok(AddTorrentResult {
             torrent,
