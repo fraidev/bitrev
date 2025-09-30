@@ -20,7 +20,7 @@ use crate::{
     peer::PeerAddr,
     peer_state::{PeerState, PeerStates},
     protocol::{Protocol, ProtocolError},
-    session::PieceWork,
+    session::{DownloadState, PieceWork},
     utils,
 };
 
@@ -226,6 +226,7 @@ pub struct PeerHandler {
     requests_sem: Semaphore,
     peer: PeerAddr,
     torrent_downloaded_state: Arc<TorrentDownloadedState>,
+    download_state: Arc<Mutex<DownloadState>>,
 }
 
 impl PeerHandler {
@@ -237,6 +238,7 @@ impl PeerHandler {
         peers_state: Arc<PeerStates>,
         //pieces: Vec<PieceWork>,
         torrent_downloaded_state: Arc<TorrentDownloadedState>,
+        download_state: Arc<Mutex<DownloadState>>,
     ) -> Self {
         Self {
             unchoke_notify: unchoked_notify,
@@ -249,6 +251,7 @@ impl PeerHandler {
             peer_writer_tx,
             peer,
             torrent_downloaded_state,
+            download_state,
             //torrent_downloaded_state: Arc::new(TorrentDownloadedState {
             //
             //    semaphore: Semaphore::new(1),
@@ -276,6 +279,14 @@ impl PeerHandler {
         } else {
             false
         }
+    }
+
+    pub fn get_download_state(&self) -> DownloadState {
+        *self.download_state.lock().unwrap()
+    }
+
+    pub fn is_downloading(&self) -> bool {
+        self.get_download_state() == DownloadState::Downloading
     }
 
     // The job of this is to request chunks and also to keep peer alive.
@@ -307,6 +318,11 @@ impl PeerHandler {
         };
 
         loop {
+            // Wait while not downloading
+            while !self.is_downloading() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
             update_interest(self, true)?;
 
             trace!("waiting for unchoke");
@@ -335,6 +351,14 @@ impl PeerHandler {
 
             let mut offset: u32 = 0;
             while offset < piece.length {
+                // Check download state before requesting each block
+                if !self.is_downloading() {
+                    // Wait while not downloading
+                    while !self.is_downloading() {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+
                 loop {
                     match (tokio::time::timeout(
                         Duration::from_secs(5),
