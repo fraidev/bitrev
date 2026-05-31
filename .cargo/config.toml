@@ -1,2 +1,12 @@
+# switch-patch: cross-build config for the bit_rev lib.
 [build]
-rustflags = ["--cfg", "tokio_unstable"]
+target = "aarch64-nintendo-switch"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.aarch64-nintendo-switch]
+rustflags = [
+  "-C", "relocation-model=pic",
+]

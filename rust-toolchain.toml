@@ -1,0 +1,4 @@
+# switch-patch: pin to the locally-built fork that contains the switch PAL.
+[toolchain]
+channel = "switch-stage1"
+components = ["rust-src"]
