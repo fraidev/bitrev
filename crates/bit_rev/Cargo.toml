@@ -22,3 +22,6 @@ sha1_smol.workspace = true
 dashmap.workspace = true
 rand.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

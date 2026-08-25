@@ -8,9 +8,14 @@ pub struct PeerStates {
 }
 
 impl PeerStates {
-    pub fn add_if_not_seen(&self, peer: PeerAddr) {
-        if !self.states.contains_key(&peer) {
-            self.states.insert(peer, PeerState::default());
+    pub fn add_if_not_seen(&self, peer: PeerAddr) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.states.entry(peer) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(PeerState::default());
+                true
+            }
         }
     }
 }
@@ -29,5 +34,19 @@ impl Default for PeerState {
             peer_interested: true,
             bitfield: Bitfield::new(vec![]),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_if_not_seen_dedups() {
+        let states = PeerStates::default();
+        let peer = "127.0.0.1:6881".parse().unwrap();
+        assert!(states.add_if_not_seen(peer));
+        assert!(!states.add_if_not_seen(peer));
+        assert_eq!(states.states.len(), 1);
     }
 }

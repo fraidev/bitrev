@@ -9,5 +9,6 @@ pub mod protocol;
 pub mod protocol_udp;
 pub mod session;
 pub mod torrent;
+pub mod tracker;
 pub mod tracker_peers;
 pub mod utils;

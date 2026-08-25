@@ -1,14 +1,11 @@
 use rand::Rng;
-use serde_bencode::de;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use tokio::{select, sync::Semaphore, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::{
-    file::{self, AnnounceEvent, AnnounceParams, TorrentMeta},
+    file::TorrentMeta,
     peer::BencodeResponse,
     peer_connection::{
         FullPiece, PeerConnection, PeerHandler, PieceWorkState, TorrentDownloadedState,
@@ -16,6 +13,7 @@ use crate::{
     peer_state::PeerStates,
     protocol_udp::request_udp_peers,
     session::{DownloadState, PieceResult, PieceWork},
+    tracker::{self, HttpAnnounceContext, TrackerError},
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +27,7 @@ pub struct TrackerPeers {
     pub have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
     pub download_state: Arc<Mutex<DownloadState>>,
     announce_key: u32,
+    cancel: CancellationToken,
 }
 
 impl TrackerPeers {
@@ -52,7 +51,12 @@ impl TrackerPeers {
             have_broadcast,
             download_state,
             announce_key: rand::thread_rng().gen(),
+            cancel: CancellationToken::new(),
         }
+    }
+
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
     }
 
     pub fn set_download_state(&self, state: DownloadState) {
@@ -102,8 +106,8 @@ impl TrackerPeers {
         let have_broadcast = self.have_broadcast.clone();
         let download_state = self.download_state.clone();
         let announce_key = self.announce_key;
-        let sent_started = Arc::new(AtomicBool::new(false));
-        let sent_completed = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        let http_client = tracker::http_client();
         let torrent_downloaded_state = Arc::new(TorrentDownloadedState {
             semaphore: Semaphore::new(1),
             pieces: pieces_of_work
@@ -116,148 +120,118 @@ impl TrackerPeers {
                 })
                 .collect(),
         });
-        tokio::spawn(async move {
-            loop {
-                // Wait while not downloading
-                while {
-                    let state = *download_state.lock().unwrap();
-                    state != DownloadState::Downloading
-                } {
-                    sleep(std::time::Duration::from_millis(100)).await;
-                }
 
-                // TODO(#8): wire uploaded from the session upload counter once seeding exists
-                let uploaded = 0u64;
-                let downloaded = torrent_downloaded_state.downloaded_bytes();
-                let left = torrent_downloaded_state.left_bytes();
-                let event = if torrent_downloaded_state.is_complete()
-                    && sent_started.load(Ordering::Relaxed)
-                    && !sent_completed.swap(true, Ordering::Relaxed)
-                {
-                    Some(AnnounceEvent::Completed)
-                } else if !sent_started.swap(true, Ordering::Relaxed) {
-                    Some(AnnounceEvent::Started)
-                } else {
-                    None
-                };
-                let announce_params = AnnounceParams {
-                    uploaded,
-                    downloaded,
-                    left,
-                    port: 6881,
-                    event,
-                    numwant: AnnounceParams::DEFAULT_NUMWANT,
-                    key: announce_key,
-                };
-
-                // Handle TCP trackers
-                for tracker in tcp_trackers.clone() {
-                    let torrent_meta = torrent_meta.clone();
+        for tracker_url in tcp_trackers {
+            let ctx = HttpAnnounceContext {
+                client: http_client.clone(),
+                torrent_meta: torrent_meta.clone(),
+                peer_id,
+                tracker_url,
+                announce_key,
+                port: 6881,
+                download_state: download_state.clone(),
+                torrent_downloaded_state: torrent_downloaded_state.clone(),
+            };
+            let peer_states = peer_states.clone();
+            let piece_tx = piece_tx.clone();
+            let have_broadcast = have_broadcast.clone();
+            let download_state = download_state.clone();
+            let torrent_downloaded_state = torrent_downloaded_state.clone();
+            let shutdown = cancel.clone();
+            tokio::spawn(async move {
+                tracker::run_http_announce_loop(ctx, shutdown, |new_peers| {
                     let peer_states = peer_states.clone();
                     let piece_tx = piece_tx.clone();
                     let have_broadcast = have_broadcast.clone();
                     let torrent_downloaded_state = torrent_downloaded_state.clone();
                     let download_state = download_state.clone();
-                    let announce_params = announce_params.clone();
-                    tokio::spawn(async move {
-                        let url = file::build_tracker_url(
-                            &torrent_meta,
-                            &peer_id,
-                            &tracker,
-                            &announce_params,
-                        );
+                    async move {
+                        process_peers(
+                            new_peers,
+                            PeerProcessorConfig {
+                                info_hash,
+                                peer_id,
+                                peer_states,
+                                piece_tx,
+                                have_broadcast,
+                                torrent_downloaded_state,
+                                download_state,
+                            },
+                        )
+                        .await;
+                    }
+                })
+                .await;
+            });
+        }
 
-                        match request_peers(&url).await {
-                            Ok(request_peers_res) => {
-                                match request_peers_res.clone().get_peers() {
-                                    Ok(new_peers) => {
-                                        process_peers(
-                                            new_peers,
-                                            PeerProcessorConfig {
-                                                info_hash,
-                                                peer_id,
-                                                peer_states: peer_states.clone(),
-                                                piece_tx: piece_tx.clone(),
-                                                have_broadcast: have_broadcast.clone(),
-                                                torrent_downloaded_state: torrent_downloaded_state
-                                                    .clone(),
-                                                download_state: download_state.clone(),
-                                            },
-                                        )
-                                        .await;
+        if !udp_trackers.is_empty() {
+            let udp_cancel = cancel;
+            tokio::spawn(async move {
+                loop {
+                    if udp_cancel.is_cancelled() {
+                        break;
+                    }
+                    while {
+                        let state = *download_state.lock().unwrap();
+                        state != DownloadState::Downloading
+                    } {
+                        if udp_cancel.is_cancelled() {
+                            return;
+                        }
+                        sleep(std::time::Duration::from_millis(100)).await;
+                    }
 
-                                        //sleep interval
-                                        tokio::time::sleep(std::time::Duration::from_millis(
-                                            request_peers_res.interval,
-                                        ))
-                                        .await;
-                                    }
-                                    Err(e) => debug!(
-                                        "Failed to parse peers from TCP tracker {}: {}",
-                                        tracker, e
-                                    ),
+                    for tracker in udp_trackers.clone() {
+                        let torrent_meta = torrent_meta.clone();
+                        let peer_states = peer_states.clone();
+                        let piece_tx = piece_tx.clone();
+                        let have_broadcast = have_broadcast.clone();
+                        let torrent_downloaded_state = torrent_downloaded_state.clone();
+                        let download_state = download_state.clone();
+                        tokio::spawn(async move {
+                            match request_udp_peers(&tracker, &torrent_meta, &peer_id, 6881).await {
+                                Ok(udp_response) => {
+                                    debug!(
+                                        "Received UDP response from tracker {}: {:?}",
+                                        tracker, udp_response
+                                    );
+                                    let new_peers: Vec<_> = udp_response
+                                        .peers
+                                        .into_iter()
+                                        .map(|p| p.to_socket_addr())
+                                        .collect();
+
+                                    process_peers(
+                                        new_peers,
+                                        PeerProcessorConfig {
+                                            info_hash,
+                                            peer_id,
+                                            peer_states: peer_states.clone(),
+                                            piece_tx: piece_tx.clone(),
+                                            have_broadcast: have_broadcast.clone(),
+                                            torrent_downloaded_state: torrent_downloaded_state
+                                                .clone(),
+                                            download_state: download_state.clone(),
+                                        },
+                                    )
+                                    .await;
                                 }
+                                Err(e) => error!(
+                                    "Failed to request peers from UDP tracker {}: {}",
+                                    tracker, e
+                                ),
                             }
-                            Err(e) => debug!(
-                                "Failed to request peers from TCP tracker {}: {}",
-                                tracker, e
-                            ),
-                        }
-                    });
+                        });
+                    }
+
+                    tokio::select! {
+                        _ = udp_cancel.cancelled() => break,
+                        _ = sleep(std::time::Duration::from_secs(30)) => {}
+                    }
                 }
-
-                // Handle UDP trackers
-                for tracker in udp_trackers.clone() {
-                    let torrent_meta = torrent_meta.clone();
-                    let peer_states = peer_states.clone();
-                    let piece_tx = piece_tx.clone();
-                    let have_broadcast = have_broadcast.clone();
-                    let torrent_downloaded_state = torrent_downloaded_state.clone();
-                    let download_state = download_state.clone();
-                    tokio::spawn(async move {
-                        match request_udp_peers(&tracker, &torrent_meta, &peer_id, 6881).await {
-                            Ok(udp_response) => {
-                                debug!(
-                                    "Received UDP response from tracker {}: {:?}",
-                                    tracker, udp_response
-                                );
-                                let new_peers: Vec<_> = udp_response
-                                    .peers
-                                    .into_iter()
-                                    .map(|p| p.to_socket_addr())
-                                    .collect();
-
-                                process_peers(
-                                    new_peers,
-                                    PeerProcessorConfig {
-                                        info_hash,
-                                        peer_id,
-                                        peer_states: peer_states.clone(),
-                                        piece_tx: piece_tx.clone(),
-                                        have_broadcast: have_broadcast.clone(),
-                                        torrent_downloaded_state: torrent_downloaded_state.clone(),
-                                        download_state: download_state.clone(),
-                                    },
-                                )
-                                .await;
-
-                                //sleep interval
-                                tokio::time::sleep(std::time::Duration::from_secs(
-                                    udp_response.interval as u64,
-                                ))
-                                .await;
-                            }
-                            Err(e) => error!(
-                                "Failed to request peers from UDP tracker {}: {}",
-                                tracker, e
-                            ),
-                        }
-                    });
-                }
-
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            }
-        });
+            });
+        }
     }
 }
 
@@ -282,7 +256,7 @@ async fn process_peers(new_peers: Vec<std::net::SocketAddr>, config: PeerProcess
             continue;
         }
 
-        if config.peer_states.clone().states.contains_key(&peer) {
+        if !config.peer_states.add_if_not_seen(peer) {
             continue;
         }
 
@@ -356,11 +330,6 @@ fn all_trackers(torrent_meta: &TorrentMeta) -> Vec<String> {
     }
 }
 
-pub async fn request_peers(uri: &str) -> anyhow::Result<BencodeResponse> {
-    let client = reqwest::Client::new();
-    let response = client.get(uri).send().await?;
-    let body_bytes = response.bytes().await?;
-
-    let tracker_bencode_decode = de::from_bytes::<BencodeResponse>(&body_bytes)?;
-    Ok(tracker_bencode_decode)
+pub async fn request_peers(uri: &str) -> Result<BencodeResponse, TrackerError> {
+    tracker::announce(&tracker::http_client(), uri).await
 }

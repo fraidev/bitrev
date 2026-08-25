@@ -153,6 +153,7 @@ pub struct AnnounceParams {
     pub event: Option<AnnounceEvent>,
     pub numwant: u32,
     pub key: u32,
+    pub tracker_id: Option<Vec<u8>>,
 }
 
 impl AnnounceParams {
@@ -193,6 +194,9 @@ pub fn build_tracker_url(
     }
     push_encoded_pair(&mut url, "numwant", params.numwant.to_string().as_bytes());
     push_encoded_pair(&mut url, "key", params.key.to_string().as_bytes());
+    if let Some(tracker_id) = params.tracker_id.as_deref() {
+        push_encoded_pair(&mut url, "trackerid", tracker_id);
+    }
 
     url
 }
@@ -249,6 +253,7 @@ mod tests {
             event,
             numwant: AnnounceParams::DEFAULT_NUMWANT,
             key: 0xDF45_C574,
+            tracker_id: None,
         }
     }
 
@@ -331,5 +336,18 @@ mod tests {
             &sample_params(Some(AnnounceEvent::Stopped)),
         );
         assert!(stopped.contains("&event=stopped&"));
+    }
+
+    #[test]
+    fn build_tracker_url_echoes_trackerid() {
+        let mut params = sample_params(None);
+        params.tracker_id = Some(b"abc".to_vec());
+        let url = build_tracker_url(
+            &test_meta(INFO_HASH_FIXTURE),
+            &PEER_ID,
+            "http://tracker.example/announce",
+            &params,
+        );
+        assert!(url.ends_with("&trackerid=abc"));
     }
 }

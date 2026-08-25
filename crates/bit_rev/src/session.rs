@@ -128,6 +128,18 @@ impl Session {
         self.get_download_state() == DownloadState::Init
     }
 
+    pub fn shutdown(&self) {
+        for entry in self.streams.iter() {
+            entry.value().shutdown();
+        }
+    }
+
+    pub fn remove_torrent(&self, info_hash: &[u8; 20]) {
+        if let Some((_, tracker)) = self.streams.remove(info_hash) {
+            tracker.shutdown();
+        }
+    }
+
     pub async fn add_torrent(
         &self,
         add_torrent: AddTorrentOptions,
@@ -192,6 +204,12 @@ impl Session {
             torrent_meta,
             pr_rx,
         })
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
