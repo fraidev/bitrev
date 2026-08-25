@@ -73,10 +73,11 @@ fn parse_peers_value(value: &Value, out: &mut Vec<PeerAddr>) -> anyhow::Result<(
 }
 
 fn parse_compact_v4(buf: &[u8], out: &mut Vec<PeerAddr>) -> anyhow::Result<()> {
-    if !buf.len().is_multiple_of(6) {
+    let (chunks, remainder) = buf.as_chunks::<6>();
+    if !remainder.is_empty() {
         anyhow::bail!("invalid compact peers length");
     }
-    for chunk in buf.chunks_exact(6) {
+    for chunk in chunks {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         out.push(SocketAddr::new(ip.into(), port));
@@ -85,10 +86,11 @@ fn parse_compact_v4(buf: &[u8], out: &mut Vec<PeerAddr>) -> anyhow::Result<()> {
 }
 
 fn parse_compact_v6(buf: &[u8], out: &mut Vec<PeerAddr>) -> anyhow::Result<()> {
-    if !buf.len().is_multiple_of(18) {
+    let (chunks, remainder) = buf.as_chunks::<18>();
+    if !remainder.is_empty() {
         anyhow::bail!("invalid compact peers6 length");
     }
-    for chunk in buf.chunks_exact(18) {
+    for chunk in chunks {
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&chunk[..16]);
         let ip = Ipv6Addr::from(octets);
