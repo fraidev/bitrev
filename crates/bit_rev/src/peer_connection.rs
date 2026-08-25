@@ -36,6 +36,22 @@ impl TorrentDownloadedState {
             .all(|pw| pw.downloaded.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    pub fn downloaded_bytes(&self) -> u64 {
+        self.pieces
+            .iter()
+            .filter(|pw| pw.downloaded.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|pw| u64::from(pw.piece_work.length))
+            .sum()
+    }
+
+    pub fn left_bytes(&self) -> u64 {
+        self.pieces
+            .iter()
+            .filter(|pw| !pw.downloaded.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|pw| u64::from(pw.piece_work.length))
+            .sum()
+    }
+
     pub fn missing_pieces(&self) -> Vec<u32> {
         self.pieces
             .iter()
@@ -185,7 +201,7 @@ impl PieceWorkState {
         let mut chuncks = self.chuncks.lock().unwrap();
         let mut buf = vec![];
         // sort by start
-        chuncks.sort_by(|a, b| a.start.cmp(&b.start));
+        chuncks.sort_by_key(|a| a.start);
         for chunk in chuncks.iter() {
             buf.extend(chunk.buf.iter());
         }

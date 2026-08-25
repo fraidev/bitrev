@@ -1,10 +1,14 @@
+use rand::Rng;
 use serde_bencode::de;
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tokio::{select, sync::Semaphore, time::sleep};
 use tracing::{debug, error};
 
 use crate::{
-    file::{self, TorrentMeta},
+    file::{self, AnnounceEvent, AnnounceParams, TorrentMeta},
     peer::BencodeResponse,
     peer_connection::{
         FullPiece, PeerConnection, PeerHandler, PieceWorkState, TorrentDownloadedState,
@@ -24,6 +28,7 @@ pub struct TrackerPeers {
     pub pr_rx: flume::Receiver<PieceResult>,
     pub have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
     pub download_state: Arc<Mutex<DownloadState>>,
+    announce_key: u32,
 }
 
 impl TrackerPeers {
@@ -46,6 +51,7 @@ impl TrackerPeers {
             peer_states,
             have_broadcast,
             download_state,
+            announce_key: rand::thread_rng().gen(),
         }
     }
 
@@ -95,6 +101,9 @@ impl TrackerPeers {
         let piece_tx = self.piece_tx.clone();
         let have_broadcast = self.have_broadcast.clone();
         let download_state = self.download_state.clone();
+        let announce_key = self.announce_key;
+        let sent_started = Arc::new(AtomicBool::new(false));
+        let sent_completed = Arc::new(AtomicBool::new(false));
         let torrent_downloaded_state = Arc::new(TorrentDownloadedState {
             semaphore: Semaphore::new(1),
             pieces: pieces_of_work
@@ -116,6 +125,31 @@ impl TrackerPeers {
                 } {
                     sleep(std::time::Duration::from_millis(100)).await;
                 }
+
+                // TODO(#8): wire uploaded from the session upload counter once seeding exists
+                let uploaded = 0u64;
+                let downloaded = torrent_downloaded_state.downloaded_bytes();
+                let left = torrent_downloaded_state.left_bytes();
+                let event = if torrent_downloaded_state.is_complete()
+                    && sent_started.load(Ordering::Relaxed)
+                    && !sent_completed.swap(true, Ordering::Relaxed)
+                {
+                    Some(AnnounceEvent::Completed)
+                } else if !sent_started.swap(true, Ordering::Relaxed) {
+                    Some(AnnounceEvent::Started)
+                } else {
+                    None
+                };
+                let announce_params = AnnounceParams {
+                    uploaded,
+                    downloaded,
+                    left,
+                    port: 6881,
+                    event,
+                    numwant: AnnounceParams::DEFAULT_NUMWANT,
+                    key: announce_key,
+                };
+
                 // Handle TCP trackers
                 for tracker in tcp_trackers.clone() {
                     let torrent_meta = torrent_meta.clone();
@@ -124,13 +158,14 @@ impl TrackerPeers {
                     let have_broadcast = have_broadcast.clone();
                     let torrent_downloaded_state = torrent_downloaded_state.clone();
                     let download_state = download_state.clone();
+                    let announce_params = announce_params.clone();
                     tokio::spawn(async move {
-                        let url = file::build_tracker_url(&torrent_meta, &peer_id, 6881, &tracker)
-                            .map_err(|e| {
-                                error!("Failed to build tracker URL for {}: {}", tracker, e);
-                                e
-                            })
-                            .unwrap();
+                        let url = file::build_tracker_url(
+                            &torrent_meta,
+                            &peer_id,
+                            &tracker,
+                            &announce_params,
+                        );
 
                         match request_peers(&url).await {
                             Ok(request_peers_res) => {
