@@ -90,21 +90,21 @@ impl UdpTracker {
         let left = announce_options.left;
         let event = announce_options.event;
 
-        // Build announce request
-        let mut request = Vec::new();
-        request.write_u64::<BigEndian>(connection_id)?;
-        request.write_u32::<BigEndian>(ACTION_ANNOUNCE)?;
-        request.write_u32::<BigEndian>(transaction_id)?;
-        request.write_all(&torrent_meta.info_hash)?;
-        request.write_all(peer_id)?;
-        request.write_u64::<BigEndian>(downloaded)?;
-        request.write_u64::<BigEndian>(left)?;
-        request.write_u64::<BigEndian>(uploaded)?;
-        request.write_u32::<BigEndian>(event)?; // 0: none, 1: completed, 2: started, 3: stopped
-        request.write_u32::<BigEndian>(0)?; // IP address (0 = default)
-        request.write_u32::<BigEndian>(rand::thread_rng().gen())?; // key
-        request.write_i32::<BigEndian>(-1)?; // num_want (-1 = default)
-        request.write_u16::<BigEndian>(port)?;
+        let key = rand::thread_rng().gen();
+        let request = build_announce_request(AnnounceRequest {
+            connection_id,
+            transaction_id,
+            info_hash: torrent_meta.info_hash,
+            peer_id: *peer_id,
+            downloaded,
+            left,
+            uploaded,
+            event,
+            ip: 0,
+            key,
+            num_want: -1,
+            port,
+        })?;
 
         debug!("Sending UDP announce request to {}", addr);
         socket.send_to(&request, addr).await?;
@@ -122,11 +122,7 @@ impl UdpTracker {
 
         let transaction_id: u32 = rand::thread_rng().gen();
 
-        // Build connect request
-        let mut request = Vec::new();
-        request.write_u64::<BigEndian>(PROTOCOL_ID)?;
-        request.write_u32::<BigEndian>(ACTION_CONNECT)?;
-        request.write_u32::<BigEndian>(transaction_id)?;
+        let request = build_connect_request(transaction_id)?;
 
         debug!("Sending UDP connect request to {}", addr);
         socket.send_to(&request, addr).await?;
@@ -135,28 +131,7 @@ impl UdpTracker {
         let mut buf = [0u8; 16];
         let (len, _) = timeout(Duration::from_secs(15), socket.recv_from(&mut buf)).await??;
 
-        if len < 16 {
-            return Err(anyhow!("Connect response too short: {} bytes", len));
-        }
-
-        let mut cursor = Cursor::new(&buf[..len]);
-        let action = cursor.read_u32::<BigEndian>()?;
-        let response_transaction_id = cursor.read_u32::<BigEndian>()?;
-
-        if action == ACTION_ERROR {
-            let error_msg = String::from_utf8_lossy(&buf[8..len]);
-            return Err(anyhow!("Tracker error: {}", error_msg));
-        }
-
-        if action != ACTION_CONNECT {
-            return Err(anyhow!("Invalid action in connect response: {}", action));
-        }
-
-        if response_transaction_id != transaction_id {
-            return Err(anyhow!("Transaction ID mismatch in connect response"));
-        }
-
-        self.connection_id = Some(cursor.read_u64::<BigEndian>()?);
+        self.connection_id = Some(parse_connect_response(&buf[..len], transaction_id)?);
         self.last_connect = Some(Instant::now());
 
         debug!(
@@ -167,17 +142,7 @@ impl UdpTracker {
     }
 
     fn parse_udp_url(&self) -> Result<SocketAddr> {
-        if !self.url.starts_with("udp://") {
-            return Err(anyhow!("Invalid UDP tracker URL: {}", self.url));
-        }
-
-        let url_without_scheme = &self.url[6..]; // Remove "udp://"
-
-        // Split at the first '/' to separate hostname:port from path
-        let host_port = url_without_scheme
-            .split('/')
-            .next()
-            .ok_or_else(|| anyhow!("Invalid UDP tracker URL format: {}", self.url))?;
+        let host_port = parse_udp_host_port(&self.url)?;
 
         let addr = host_port
             .to_socket_addrs()?
@@ -245,6 +210,90 @@ impl UdpTracker {
             peers,
         })
     }
+}
+
+struct AnnounceRequest {
+    connection_id: u64,
+    transaction_id: u32,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    downloaded: u64,
+    left: u64,
+    uploaded: u64,
+    event: u32,
+    ip: u32,
+    key: u32,
+    num_want: i32,
+    port: u16,
+}
+
+fn build_connect_request(transaction_id: u32) -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+    request.write_u64::<BigEndian>(PROTOCOL_ID)?;
+    request.write_u32::<BigEndian>(ACTION_CONNECT)?;
+    request.write_u32::<BigEndian>(transaction_id)?;
+    Ok(request)
+}
+
+fn build_announce_request(req: AnnounceRequest) -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+    request.write_u64::<BigEndian>(req.connection_id)?;
+    request.write_u32::<BigEndian>(ACTION_ANNOUNCE)?;
+    request.write_u32::<BigEndian>(req.transaction_id)?;
+    request.write_all(&req.info_hash)?;
+    request.write_all(&req.peer_id)?;
+    request.write_u64::<BigEndian>(req.downloaded)?;
+    request.write_u64::<BigEndian>(req.left)?;
+    request.write_u64::<BigEndian>(req.uploaded)?;
+    request.write_u32::<BigEndian>(req.event)?;
+    request.write_u32::<BigEndian>(req.ip)?;
+    request.write_u32::<BigEndian>(req.key)?;
+    request.write_i32::<BigEndian>(req.num_want)?;
+    request.write_u16::<BigEndian>(req.port)?;
+    Ok(request)
+}
+
+fn parse_udp_host_port(url: &str) -> Result<&str> {
+    if !url.starts_with("udp://") {
+        return Err(anyhow!("Invalid UDP tracker URL: {}", url));
+    }
+
+    let url_without_scheme = &url[6..];
+    let host_port = url_without_scheme
+        .split('/')
+        .next()
+        .ok_or_else(|| anyhow!("Invalid UDP tracker URL format: {}", url))?;
+
+    if host_port.is_empty() {
+        return Err(anyhow!("Invalid UDP tracker URL format: {}", url));
+    }
+
+    Ok(host_port)
+}
+
+fn parse_connect_response(data: &[u8], expected_transaction_id: u32) -> Result<u64> {
+    if data.len() < 16 {
+        return Err(anyhow!("Connect response too short: {} bytes", data.len()));
+    }
+
+    let mut cursor = Cursor::new(data);
+    let action = cursor.read_u32::<BigEndian>()?;
+    let response_transaction_id = cursor.read_u32::<BigEndian>()?;
+
+    if action == ACTION_ERROR {
+        let error_msg = String::from_utf8_lossy(&data[8..]);
+        return Err(anyhow!("Tracker error: {}", error_msg));
+    }
+
+    if action != ACTION_CONNECT {
+        return Err(anyhow!("Invalid action in connect response: {}", action));
+    }
+
+    if response_transaction_id != expected_transaction_id {
+        return Err(anyhow!("Transaction ID mismatch in connect response"));
+    }
+
+    Ok(cursor.read_u64::<BigEndian>()?)
 }
 
 impl UdpPeer {
