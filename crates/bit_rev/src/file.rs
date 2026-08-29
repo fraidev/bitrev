@@ -73,16 +73,20 @@ pub struct TorrentMeta {
 }
 
 impl TorrentMeta {
-    pub fn new(torrent_file: TorrentFile) -> Self {
-        let file_info_beaconde = &ser::to_bytes(&torrent_file.info).unwrap();
+    pub fn new(torrent_file: TorrentFile) -> Result<Self> {
+        validate_torrent_file(&torrent_file)?;
+        let file_info_bencode = ser::to_bytes(&torrent_file.info)?;
         let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(file_info_beaconde);
+        hasher.update(&file_info_bencode);
         let info_hash = hasher.digest().bytes();
+        Ok(Self::from_validated(torrent_file, info_hash))
+    }
 
+    fn from_validated(torrent_file: TorrentFile, info_hash: [u8; 20]) -> Self {
         let piece_hashes: Vec<[u8; 20]> = torrent_file
             .info
             .pieces
-            .chunks(20)
+            .chunks_exact(20)
             .map(|chunk| {
                 let mut array = [0u8; 20];
                 array.copy_from_slice(chunk);
@@ -98,12 +102,137 @@ impl TorrentMeta {
     }
 }
 
+pub fn from_bytes(content: &[u8]) -> Result<TorrentMeta> {
+    let torrent = de::from_bytes::<TorrentFile>(content)?;
+    validate_torrent_file(&torrent)?;
+    let info_bytes = raw_info_dict(content)?;
+    let mut hasher = sha1_smol::Sha1::new();
+    hasher.update(info_bytes);
+    let info_hash = hasher.digest().bytes();
+    Ok(TorrentMeta::from_validated(torrent, info_hash))
+}
+
 pub fn from_filename(filename: &str) -> Result<TorrentMeta> {
     let mut file = std::fs::File::open(filename)?;
     let mut content = Vec::new();
     file.read_to_end(&mut content)?;
-    let torrent = de::from_bytes::<TorrentFile>(&content)?;
-    Ok(TorrentMeta::new(torrent))
+    from_bytes(&content)
+}
+
+fn validate_torrent_file(torrent_file: &TorrentFile) -> Result<()> {
+    if torrent_file.info.piece_length <= 0 {
+        anyhow::bail!("piece length must be positive");
+    }
+    if torrent_file.info.pieces.len() % 20 != 0 {
+        anyhow::bail!("pieces length must be a multiple of 20");
+    }
+
+    match (
+        torrent_file.info.length.is_some(),
+        torrent_file.info.files.as_ref(),
+    ) {
+        (true, None) => {}
+        (false, Some(files)) => {
+            for file in files {
+                validate_file_path(&file.path)?;
+            }
+        }
+        _ => anyhow::bail!("exactly one of length or files must be present"),
+    }
+
+    Ok(())
+}
+
+fn validate_file_path(path: &[String]) -> Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("file path must not be empty");
+    }
+    for component in path {
+        if !path_component_is_safe(component) {
+            anyhow::bail!("unsafe file path component: {component:?}");
+        }
+    }
+    Ok(())
+}
+
+fn path_component_is_safe(component: &str) -> bool {
+    if component.is_empty() || component == ".." {
+        return false;
+    }
+    if component.starts_with('/') || component.contains('/') || component.contains('\\') {
+        return false;
+    }
+    if component.len() >= 2 && component.as_bytes()[1] == b':' {
+        return false;
+    }
+    true
+}
+
+fn parse_bencode_byte_string(data: &[u8], i: usize) -> Result<(&[u8], usize)> {
+    let colon = data[i..]
+        .iter()
+        .position(|&b| b == b':')
+        .map(|p| i + p)
+        .ok_or_else(|| anyhow::anyhow!("truncated bencode string"))?;
+    let len: usize = std::str::from_utf8(&data[i..colon])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid bencode string length"))?;
+    let start = colon + 1;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("bencode string length overflow"))?;
+    if end > data.len() {
+        anyhow::bail!("truncated bencode string");
+    }
+    Ok((&data[start..end], end))
+}
+
+fn skip_bencode(data: &[u8], i: usize) -> Result<usize> {
+    if i >= data.len() {
+        anyhow::bail!("truncated bencode");
+    }
+    match data[i] {
+        b'i' => {
+            let end = data[i + 1..]
+                .iter()
+                .position(|&b| b == b'e')
+                .map(|p| i + 1 + p)
+                .ok_or_else(|| anyhow::anyhow!("truncated bencode integer"))?;
+            Ok(end + 1)
+        }
+        b'l' | b'd' => {
+            let mut j = i + 1;
+            while j < data.len() && data[j] != b'e' {
+                j = skip_bencode(data, j)?;
+            }
+            if j >= data.len() {
+                anyhow::bail!("truncated bencode list or dict");
+            }
+            Ok(j + 1)
+        }
+        b'0'..=b'9' => {
+            let (_, end) = parse_bencode_byte_string(data, i)?;
+            Ok(end)
+        }
+        _ => anyhow::bail!("invalid bencode"),
+    }
+}
+
+fn raw_info_dict(data: &[u8]) -> Result<&[u8]> {
+    if data.first() != Some(&b'd') {
+        anyhow::bail!("torrent metainfo must be a dict");
+    }
+    let mut i = 1;
+    while i < data.len() && data[i] != b'e' {
+        let (key, after_key) = parse_bencode_byte_string(data, i)?;
+        let value_end = skip_bencode(data, after_key)?;
+        if key == b"info" {
+            return Ok(&data[after_key..value_end]);
+        }
+        i = value_end;
+    }
+    anyhow::bail!("missing info dictionary")
 }
 
 /// RFC 3986 unreserved set `A-Z a-z 0-9 - . _ ~` stays literal; every other byte is `%XX`.
