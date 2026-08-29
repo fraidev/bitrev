@@ -225,8 +225,8 @@ pub fn serialize(msg: Option<Message>) -> Vec<u8> {
                 Message::KeepAlive => return vec![0, 0, 0, 0],
             };
 
-            let length = payload.len() + 1;
-            let mut buf = Vec::with_capacity(4 + length);
+            let length = (payload.len() + 1) as u32;
+            let mut buf = Vec::with_capacity(4 + length as usize);
             buf.extend_from_slice(&length.to_be_bytes());
             buf.push(id as u8);
             buf.extend_from_slice(&payload);
@@ -236,42 +236,50 @@ pub fn serialize(msg: Option<Message>) -> Vec<u8> {
 }
 
 pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Option<Message> {
-    let length = u32::from_be_bytes(length_buf.try_into().unwrap());
-    match length {
-        0 => None,
-        _ => {
-            let char_code = &message_buf[0..];
-            let id = char_code[0];
-            let payload = message_buf[1..(length) as usize].into();
-
-            let message_id = match id {
-                0 => MessageId::MsgChoke,
-                1 => MessageId::MsgUnchoke,
-                2 => MessageId::MsgInterested,
-                3 => MessageId::MsgNotInterested,
-                4 => MessageId::MsgHave,
-                5 => MessageId::MsgBitfield,
-                6 => MessageId::MsgRequest,
-                7 => MessageId::MsgPiece,
-                8 => MessageId::MsgCancel,
-                16 => MessageId::MsgReject,
-                21 => MessageId::MsgHashRequest,
-                22 => MessageId::MsgHashes,
-                23 => MessageId::MsgHashReject,
-                _ => {
-                    return None;
-                }
-            };
-
-            Some(
-                (MessageInner {
-                    id: message_id,
-                    payload,
-                })
-                .into(),
-            )
-        }
+    let length_buf: [u8; 4] = length_buf.try_into().ok()?;
+    let length = u32::from_be_bytes(length_buf);
+    if length == 0 {
+        return None;
     }
+    let length = length as usize;
+    if message_buf.is_empty() || message_buf.len() < length {
+        return None;
+    }
+
+    let id = message_buf[0];
+    let payload = message_buf[1..length].to_vec();
+
+    let message_id = match id {
+        0 => MessageId::MsgChoke,
+        1 => MessageId::MsgUnchoke,
+        2 => MessageId::MsgInterested,
+        3 => MessageId::MsgNotInterested,
+        4 => MessageId::MsgHave,
+        5 => MessageId::MsgBitfield,
+        6 => MessageId::MsgRequest,
+        7 => MessageId::MsgPiece,
+        8 => MessageId::MsgCancel,
+        16 => MessageId::MsgReject,
+        21 => MessageId::MsgHashRequest,
+        22 => MessageId::MsgHashes,
+        23 => MessageId::MsgHashReject,
+        _ => return None,
+    };
+
+    match message_id {
+        MessageId::MsgHave if payload.len() < 4 => return None,
+        MessageId::MsgRequest | MessageId::MsgCancel if payload.len() < 12 => return None,
+        MessageId::MsgPiece if payload.len() < 8 => return None,
+        _ => {}
+    }
+
+    Some(
+        (MessageInner {
+            id: message_id,
+            payload,
+        })
+        .into(),
+    )
 }
 
 #[cfg(test)]
@@ -344,8 +352,8 @@ mod tests {
             data: vec![0x00, 0x00, 0x00, 0x04],
         });
         let expected = vec![
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x07, 0x00, 0x00, 0x00, 0x04, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x0d, 0x07, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x04,
         ];
         let result = serialize(Some(msg));
         assert_eq!(result, expected);
