@@ -1,76 +1,168 @@
-use std::net::SocketAddr;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use serde::{Deserialize, Serialize};
+use serde_bencode::value::Value;
 use serde_bytes::ByteBuf;
 
 pub type PeerAddr = SocketAddr;
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct BencodeResponse {
-    pub peers: ByteBuf,
-    pub peers6: ByteBuf,
-    pub interval: u64,
+    #[serde(default)]
+    pub peers: Option<Value>,
+    #[serde(default)]
+    pub peers6: Option<ByteBuf>,
+    #[serde(default)]
+    pub interval: Option<u64>,
+    #[serde(default, rename = "min interval")]
+    pub min_interval: Option<u64>,
+    #[serde(default, rename = "failure reason")]
+    pub failure_reason: Option<ByteBuf>,
+    #[serde(default, rename = "warning message")]
+    pub warning_message: Option<ByteBuf>,
+    #[serde(default, rename = "tracker id")]
+    pub tracker_id: Option<ByteBuf>,
+    #[serde(default)]
+    pub complete: Option<i64>,
+    #[serde(default)]
+    pub incomplete: Option<i64>,
 }
 
 impl BencodeResponse {
-    pub fn get_peers(self) -> anyhow::Result<Vec<PeerAddr>> {
-        // TODO: This is a bit of a mess
-        let peers_bin = self.peers;
-        let peer_size = 6;
-        let peers_bin_length = peers_bin.len();
-        let num_peers = peers_bin_length / peer_size;
-        if !peers_bin_length.is_multiple_of(peer_size) {
-            anyhow::bail!("Received empty peers");
-        }
+    pub fn failure_reason_str(&self) -> Option<String> {
+        self.failure_reason
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    }
 
-        let peers_bin6 = self.peers6;
-        let peer_size6 = 18;
-        let peers_bin_length6 = peers_bin6.len();
-        let num_peers6 = peers_bin_length6 / peer_size6;
-        if !peers_bin_length6.is_multiple_of(peer_size6) {
-            anyhow::bail!("Received empty peers");
-        }
+    pub fn warning_message_str(&self) -> Option<String> {
+        self.warning_message
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    }
 
+    pub fn get_peers(&self) -> anyhow::Result<Vec<PeerAddr>> {
         let mut peers = Vec::new();
-        for i in 0..num_peers {
-            let ip_size = 4;
-            let offset = i * peer_size;
-            let ip_bin = &peers_bin[offset..offset + ip_size];
-            let port =
-                u16::from_be_bytes([peers_bin[offset + ip_size], peers_bin[offset + ip_size + 1]]);
-            let ip_array = [ip_bin[0], ip_bin[1], ip_bin[2], ip_bin[3]];
-            let ip = std::net::Ipv4Addr::new(ip_array[0], ip_array[1], ip_array[2], ip_array[3]);
-            let peer = SocketAddr::new(ip.into(), port);
-            peers.push(peer);
+        if let Some(value) = self.peers.as_ref() {
+            parse_peers_value(value, &mut peers)?;
         }
-
-        for i in 0..num_peers6 {
-            let ip_size = 16;
-            let offset = i * peer_size6;
-            let ip_bin = &peers_bin6[offset..offset + ip_size];
-            let port = u16::from_be_bytes([
-                peers_bin6[offset + ip_size],
-                peers_bin6[offset + ip_size + 1],
-            ]);
-            let ip_array = [
-                ip_bin[0], ip_bin[1], ip_bin[2], ip_bin[3], ip_bin[4], ip_bin[5], ip_bin[6],
-                ip_bin[7], ip_bin[8], ip_bin[9], ip_bin[10], ip_bin[11], ip_bin[12], ip_bin[13],
-                ip_bin[14], ip_bin[15],
-            ];
-            let ip = std::net::Ipv6Addr::new(
-                u16::from_be_bytes([ip_array[0], ip_array[1]]),
-                u16::from_be_bytes([ip_array[2], ip_array[3]]),
-                u16::from_be_bytes([ip_array[4], ip_array[5]]),
-                u16::from_be_bytes([ip_array[6], ip_array[7]]),
-                u16::from_be_bytes([ip_array[8], ip_array[9]]),
-                u16::from_be_bytes([ip_array[10], ip_array[11]]),
-                u16::from_be_bytes([ip_array[12], ip_array[13]]),
-                u16::from_be_bytes([ip_array[14], ip_array[15]]),
-            );
-            let peer = SocketAddr::new(ip.into(), port);
-            peers.push(peer);
+        if let Some(peers6) = self.peers6.as_ref() {
+            parse_compact_v6(peers6, &mut peers)?;
         }
-
         Ok(peers)
+    }
+}
+
+fn parse_peers_value(value: &Value, out: &mut Vec<PeerAddr>) -> anyhow::Result<()> {
+    match value {
+        Value::Bytes(buf) => parse_compact_v4(buf, out),
+        Value::List(list) => {
+            for item in list {
+                match item {
+                    Value::Dict(dict) => out.push(peer_from_dict(dict)?),
+                    _ => anyhow::bail!("invalid dictionary peer entry"),
+                }
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("invalid peers field"),
+    }
+}
+
+fn parse_compact_v4(buf: &[u8], out: &mut Vec<PeerAddr>) -> anyhow::Result<()> {
+    let (chunks, remainder) = buf.as_chunks::<6>();
+    if !remainder.is_empty() {
+        anyhow::bail!("invalid compact peers length");
+    }
+    for chunk in chunks {
+        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+        out.push(SocketAddr::new(ip.into(), port));
+    }
+    Ok(())
+}
+
+fn parse_compact_v6(buf: &[u8], out: &mut Vec<PeerAddr>) -> anyhow::Result<()> {
+    let (chunks, remainder) = buf.as_chunks::<18>();
+    if !remainder.is_empty() {
+        anyhow::bail!("invalid compact peers6 length");
+    }
+    for chunk in chunks {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&chunk[..16]);
+        let ip = Ipv6Addr::from(octets);
+        let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+        out.push(SocketAddr::new(ip.into(), port));
+    }
+    Ok(())
+}
+
+fn peer_from_dict(dict: &HashMap<Vec<u8>, Value>) -> anyhow::Result<PeerAddr> {
+    let ip = match dict.get(&b"ip"[..]) {
+        Some(Value::Bytes(bytes)) => String::from_utf8_lossy(bytes)
+            .parse::<IpAddr>()
+            .map_err(|e| anyhow::anyhow!("invalid peer ip: {e}"))?,
+        _ => anyhow::bail!("peer dict missing ip"),
+    };
+    let port = match dict.get(&b"port"[..]) {
+        Some(Value::Int(port)) if *port >= 0 && *port <= i64::from(u16::MAX) => *port as u16,
+        _ => anyhow::bail!("peer dict missing port"),
+    };
+    Ok(SocketAddr::new(ip, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_bencode::de;
+
+    #[test]
+    fn decodes_failure_reason() {
+        let body = b"d14:failure reason16:unregistered 123e";
+        let decoded = de::from_bytes::<BencodeResponse>(body).unwrap();
+        assert_eq!(
+            decoded.failure_reason_str().as_deref(),
+            Some("unregistered 123")
+        );
+        assert!(decoded.interval.is_none());
+    }
+
+    #[test]
+    fn decodes_warning_and_compact_peers() {
+        let mut body = b"d8:intervali1800e15:warning message7:slow ok5:peers6:".to_vec();
+        body.extend_from_slice(&[127, 0, 0, 1, 0x1A, 0xE1]);
+        body.push(b'e');
+        let decoded = de::from_bytes::<BencodeResponse>(&body).unwrap();
+        assert_eq!(decoded.interval, Some(1800));
+        assert_eq!(decoded.warning_message_str().as_deref(), Some("slow ok"));
+        assert_eq!(
+            decoded.get_peers().unwrap(),
+            vec!["127.0.0.1:6881".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn decodes_dictionary_peers_and_min_interval() {
+        let body = b"d8:intervali60e12:min intervali120e5:peersld2:ip9:127.0.0.14:porti51413eeee";
+        let decoded = de::from_bytes::<BencodeResponse>(body).unwrap();
+        assert_eq!(decoded.min_interval, Some(120));
+        assert_eq!(
+            decoded.get_peers().unwrap(),
+            vec!["127.0.0.1:51413".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn decodes_tracker_id() {
+        let body = b"d8:intervali60e10:tracker id3:abc5:peers0:e";
+        let decoded = de::from_bytes::<BencodeResponse>(body).unwrap();
+        assert_eq!(
+            decoded.tracker_id.as_ref().map(|id| id.as_ref()),
+            Some(&b"abc"[..])
+        );
+        assert!(decoded.get_peers().unwrap().is_empty());
     }
 }

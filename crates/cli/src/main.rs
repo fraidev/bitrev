@@ -136,5 +136,8 @@ pub async fn download_file(filename: &str, out_file: Option<String>) -> anyhow::
         file.sync_all().await?;
     }
 
+    session.shutdown();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
     Ok(())
 }
