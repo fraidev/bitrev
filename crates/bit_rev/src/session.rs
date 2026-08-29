@@ -39,6 +39,7 @@ pub struct State {
 pub struct Session {
     pub streams: DashMap<[u8; 20], TrackerPeers>,
     pub download_state: Arc<Mutex<DownloadState>>,
+    peer_id: [u8; 20],
 }
 
 pub struct AddTorrentOptions {
@@ -79,6 +80,7 @@ impl Session {
         Self {
             streams: DashMap::new(),
             download_state: Arc::new(Mutex::new(DownloadState::Init)),
+            peer_id: utils::generate_peer_id(),
         }
     }
 
@@ -149,12 +151,10 @@ impl Session {
         let (pr_tx, pr_rx) = flume::bounded::<PieceResult>(torrent.piece_hashes.len());
         let have_broadcast = Arc::new(tokio::sync::broadcast::channel(128).0);
         let peer_states = Arc::new(PeerStates::default());
-        let random_peers = utils::generate_peer_id();
-
         let tracker_stream = TrackerPeers::new(
             torrent_meta.clone(),
             15,
-            random_peers,
+            self.peer_id,
             peer_states,
             have_broadcast.clone(),
             pr_rx.clone(),

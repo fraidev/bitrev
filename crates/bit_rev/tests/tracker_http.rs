@@ -10,12 +10,13 @@ use std::{
 
 use bit_rev::{
     file::{Info, TorrentFile, TorrentMeta},
+    identity,
     peer_connection::{PieceWorkState, TorrentDownloadedState},
     peer_state::PeerStates,
     session::{DownloadState, PieceWork},
     tracker::{
-        self, announce, build_http_client, run_http_announce_loop, HttpAnnounceContext,
-        TrackerError,
+        self, announce, build_http_client, http_client, run_http_announce_loop,
+        HttpAnnounceContext, TrackerError,
     },
 };
 use serde::Serialize;
@@ -254,6 +255,7 @@ fn announce_ctx(url: String, download: Arc<TorrentDownloadedState>) -> HttpAnnou
 
 fn test_http_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(identity::user_agent())
         .redirect(reqwest::redirect::Policy::limited(tracker::REDIRECT_LIMIT))
         .gzip(true)
         .http1_only()
@@ -271,6 +273,27 @@ async fn settle_io() {
     for _ in 0..16 {
         tokio::task::yield_now().await;
     }
+}
+
+#[tokio::test]
+async fn announce_sends_bitrev_user_agent() {
+    let (url, mut rx, handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 200,
+        body: ok_announce(1800, None, None),
+    }])
+    .await;
+
+    announce(&http_client(), &url).await.unwrap();
+    let request = rx.recv().await.expect("announce request");
+    assert_eq!(
+        request.headers.get("user-agent"),
+        Some(&identity::user_agent())
+    );
+    assert_eq!(
+        request.headers.get("user-agent").map(String::as_str),
+        Some("bitrev/0.1.0")
+    );
+    handle.abort();
 }
 
 #[tokio::test]
@@ -333,6 +356,10 @@ async fn announce_loop_respects_interval_and_echoes_tracker_id() {
     let first = rx.recv().await.expect("started announce");
     assert_eq!(first.path, "/announce");
     assert_eq!(first.query_param("event"), Some("started"));
+    assert_eq!(
+        first.headers.get("user-agent"),
+        Some(&identity::user_agent())
+    );
     assert!(first
         .headers
         .get("accept-encoding")

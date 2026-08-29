@@ -50,7 +50,7 @@ pub fn build_http_client() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::limited(REDIRECT_LIMIT))
         .gzip(true)
         .http1_only()
-        // TODO(#16): set User-Agent to bitrev/<version>
+        .user_agent(crate::identity::user_agent())
         .build()
         .expect("failed to build tracker HTTP client")
 }
