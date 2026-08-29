@@ -202,3 +202,106 @@ impl Protocol {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const INFO_HASH: [u8; 20] = [
+        134, 212, 200, 0, 36, 164, 105, 190, 76, 80, 188, 90, 16, 44, 247, 23, 128, 49, 0, 116,
+    ];
+    const LOCAL_PEER_ID: [u8; 20] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    ];
+    const REMOTE_PEER_ID: [u8; 20] = [
+        20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+    ];
+
+    fn peer_addr() -> PeerAddr {
+        "127.0.0.1:6881".parse().unwrap()
+    }
+
+    async fn protocol() -> Protocol {
+        Protocol::connect(peer_addr(), INFO_HASH, LOCAL_PEER_ID)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn complete_handshake_success_round_trip() {
+        let proto = protocol().await;
+        let (mut client, mut server) = tokio::io::duplex(256);
+
+        let server_task = tokio::spawn(async move {
+            let mut client_hs = [0u8; 68];
+            server.read_exact(&mut client_hs).await.unwrap();
+            let reply = Handshake::new(INFO_HASH, REMOTE_PEER_ID).serialize();
+            server.write_all(&reply).await.unwrap();
+        });
+
+        let handshake = proto.complete_handshake(&mut client).await.unwrap();
+        assert_eq!(handshake.info_hash, INFO_HASH);
+        assert_eq!(handshake.peer_id, REMOTE_PEER_ID);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_handshake_info_hash_mismatch() {
+        let proto = protocol().await;
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let other_hash = [0xABu8; 20];
+
+        let server_task = tokio::spawn(async move {
+            let mut client_hs = [0u8; 68];
+            server.read_exact(&mut client_hs).await.unwrap();
+            let reply = Handshake::new(other_hash, REMOTE_PEER_ID).serialize();
+            server.write_all(&reply).await.unwrap();
+        });
+
+        let err = proto.complete_handshake(&mut client).await.unwrap_err();
+        assert!(matches!(err, ProtocolError::InfoHashIsNotEqual));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_not_interested_writes_not_interested_frame() {
+        let proto = protocol().await;
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+
+        proto.send_not_interested(&mut writer).await.unwrap();
+
+        let expected = message::serialize(Some(Message::NotInterested));
+        let interested = message::serialize(Some(Message::Interested));
+        let mut buf = vec![0u8; expected.len()];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, expected);
+        assert_ne!(buf, interested);
+        assert_eq!(buf[4], message::MessageId::MsgNotInterested as u8);
+    }
+
+    #[tokio::test]
+    async fn send_interested_writes_interested_frame() {
+        let proto = protocol().await;
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+
+        proto.send_interested(&mut writer).await.unwrap();
+
+        let expected = message::serialize(Some(Message::Interested));
+        let mut buf = vec![0u8; expected.len()];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, expected);
+        assert_eq!(buf[4], message::MessageId::MsgInterested as u8);
+    }
+
+    #[tokio::test]
+    async fn read_keep_alive_returns_none() {
+        let proto = protocol().await;
+        let (mut writer, reader) = tokio::io::duplex(64);
+
+        writer.write_all(&[0, 0, 0, 0]).await.unwrap();
+        let result = proto.read(reader).await.unwrap();
+        assert_eq!(result, None);
+    }
+}

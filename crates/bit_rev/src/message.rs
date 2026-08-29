@@ -368,4 +368,130 @@ mod tests {
         let result = read(&length_buf, &message_buf);
         assert_eq!(result, Some(expected));
     }
+
+    fn round_trip(msg: Message) -> Option<Message> {
+        let bytes = serialize(Some(msg));
+        read(&bytes[0..4], &bytes[4..])
+    }
+
+    #[test]
+    fn serialize_read_round_trip_all_variants() {
+        let cases = [
+            Message::Choke,
+            Message::Unchoke,
+            Message::Interested,
+            Message::NotInterested,
+            Message::Have(42),
+            Message::Bitfield(vec![0b1010_0001, 0b0000_1111]),
+            Message::Request(vec![
+                0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x02, 0x37, 0x00, 0x00, 0x10, 0xe1,
+            ]),
+            Message::Piece(PieceChunk {
+                index: 7,
+                start: 16384,
+                length: 4,
+                data: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            }),
+            Message::Cancel(vec![
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+            ]),
+            Message::Reject,
+            Message::HashRequest,
+            Message::Hashes(vec![0x01, 0x02, 0x03]),
+            Message::HashReject,
+        ];
+
+        for msg in cases {
+            let expected = msg.clone();
+            assert_eq!(round_trip(msg), Some(expected));
+        }
+
+        // Keep-alive serializes to a zero length prefix. read maps length 0 to None.
+        assert_eq!(serialize(Some(Message::KeepAlive)), vec![0, 0, 0, 0]);
+        assert_eq!(round_trip(Message::KeepAlive), None);
+    }
+
+    #[test]
+    fn read_keep_alive_length_zero() {
+        assert_eq!(read(&[0, 0, 0, 0], &[]), None);
+    }
+
+    #[test]
+    fn read_truncated_payloads() {
+        let cases: &[(&[u8], &[u8])] = &[
+            // Have claims length 5 (id + 4) but only the id byte is present
+            (&[0, 0, 0, 5], &[4]),
+            // Have with a present but too-short payload
+            (&[0, 0, 0, 2], &[4, 0]),
+            // Piece payload shorter than 8 bytes
+            (&[0, 0, 0, 5], &[7, 0, 0, 0, 1]),
+            (&[0, 0, 0, 8], &[7, 0, 0, 0, 1, 0, 0, 0]),
+            // Request payload shorter than 12 bytes
+            (&[0, 0, 0, 9], &[6, 0, 0, 0, 1, 0, 0, 0, 0]),
+            (&[0, 0, 0, 12], &[6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+
+        for (length_buf, message_buf) in cases {
+            assert_eq!(read(length_buf, message_buf), None);
+        }
+    }
+
+    #[test]
+    fn read_unknown_id() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (&[0, 0, 0, 1], &[99]),
+            (&[0, 0, 0, 3], &[9, 0, 1]),
+            (&[0, 0, 0, 1], &[255]),
+        ];
+
+        for (length_buf, message_buf) in cases {
+            assert_eq!(read(length_buf, message_buf), None);
+        }
+    }
+
+    #[test]
+    fn read_empty_buffer() {
+        assert_eq!(read(&[], &[]), None);
+        assert_eq!(read(&[0, 0, 0, 1], &[]), None);
+    }
+
+    #[test]
+    fn piece_framing_payload_sizes() {
+        use rand::{Rng, RngCore};
+
+        let mut rng = rand::thread_rng();
+        let mut sizes = vec![0usize, 1, 16, 16383, 16384, 40000];
+        for _ in 0..5 {
+            sizes.push(rng.gen_range(2..4096));
+        }
+
+        for size in sizes {
+            let mut data = vec![0u8; size];
+            rng.fill_bytes(&mut data);
+
+            let index = 3u32;
+            let start = 16u32;
+            let msg = Message::Piece(PieceChunk {
+                index,
+                start,
+                length: size as u32,
+                data: data.clone(),
+            });
+
+            let bytes = serialize(Some(msg));
+            let length = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+            assert_eq!(length, 1 + 8 + size as u32);
+
+            let parsed = read(&bytes[0..4], &bytes[4..]).expect("piece should parse");
+            assert_eq!(
+                parsed,
+                Message::Piece(PieceChunk {
+                    index,
+                    start,
+                    length: size as u32,
+                    data,
+                })
+            );
+        }
+    }
 }

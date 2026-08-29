@@ -137,4 +137,81 @@ mod tests {
 
         assert_eq!(result, Err(HandshakeError::ProtocolLengthCantBeZero));
     }
+
+    #[test]
+    fn serialize_read_round_trip() {
+        let handshake = Handshake::new(HASH_INFO, PEER_ID);
+        let serialized = handshake.serialize();
+        let protocol_str_len = serialized[0] as usize;
+        let rest = serialized[1..].to_vec();
+        let read = Handshake::read(protocol_str_len, rest).unwrap();
+        assert_eq!(read, handshake);
+    }
+
+    #[test]
+    fn exact_68_byte_layout_for_standard_pstr() {
+        let handshake = Handshake::new(HASH_INFO, PEER_ID);
+        let serialized = handshake.serialize();
+        assert_eq!(serialized.len(), 68);
+        assert_eq!(serialized[0], 19);
+        assert_eq!(&serialized[1..20], b"BitTorrent protocol");
+        assert_eq!(&serialized[20..28], &[0u8; 8]);
+        assert_eq!(&serialized[28..48], &HASH_INFO);
+        assert_eq!(&serialized[48..68], &PEER_ID);
+
+        let mut with_reserved = Handshake::new(HASH_INFO, PEER_ID);
+        with_reserved.set_reserved_bit(0);
+        let serialized = with_reserved.serialize();
+        assert_eq!(serialized.len(), 68);
+        assert_eq!(serialized[20], 0b1000_0000);
+        assert_eq!(&serialized[21..28], &[0u8; 7]);
+    }
+
+    #[test]
+    fn wrong_length_pstr() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"hello");
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&HASH_INFO);
+        buf.extend_from_slice(&PEER_ID);
+        assert_eq!(buf.len(), 5 + 48);
+        let result = Handshake::read(5, buf).unwrap();
+        assert_eq!(result.pstr, "hello");
+        assert_eq!(result.pstr.len(), 5);
+        assert_eq!(result.info_hash, HASH_INFO);
+        assert_eq!(result.peer_id, PEER_ID);
+
+        let short = vec![0u8; 10];
+        let result = Handshake::read(19, short);
+        assert_eq!(result, Err(HandshakeError::BufferTooShort));
+    }
+
+    #[test]
+    fn reserved_bit_get_set_across_byte_boundaries() {
+        let mut handshake = Handshake::new(HASH_INFO, PEER_ID);
+        for index in [0, 7, 8, 63] {
+            assert!(!handshake.reserved_bit(index));
+        }
+
+        handshake.set_reserved_bit(0);
+        handshake.set_reserved_bit(7);
+        handshake.set_reserved_bit(8);
+        handshake.set_reserved_bit(63);
+
+        assert!(handshake.reserved_bit(0));
+        assert!(handshake.reserved_bit(7));
+        assert!(handshake.reserved_bit(8));
+        assert!(handshake.reserved_bit(63));
+        assert!(!handshake.reserved_bit(1));
+        assert!(!handshake.reserved_bit(6));
+        assert!(!handshake.reserved_bit(9));
+        assert!(!handshake.reserved_bit(62));
+
+        handshake.set_reserved_bit(64);
+        assert!(!handshake.reserved_bit(64));
+
+        assert_eq!(handshake.reserved[0], 0b1000_0001);
+        assert_eq!(handshake.reserved[1], 0b1000_0000);
+        assert_eq!(handshake.reserved[7], 0b0000_0001);
+    }
 }

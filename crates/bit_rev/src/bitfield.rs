@@ -79,3 +79,39 @@ fn set_piece_test() {
         assert_eq!(bitfield.bytes, *expected);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_and_set_across_byte_boundaries() {
+        let mut bitfield = Bitfield::new(vec![0, 0]);
+        let last = 15;
+        for index in [0, 7, 8, last] {
+            bitfield.set_piece(index);
+            assert!(bitfield.has_piece(index));
+        }
+        for index in [1, 6, 9, 14] {
+            assert!(!bitfield.has_piece(index));
+        }
+    }
+
+    #[test]
+    fn out_of_range_has_and_set_are_safe() {
+        let mut bitfield = Bitfield::new(vec![0, 0]);
+        assert!(!bitfield.has_piece(100));
+        bitfield.set_piece(100);
+        assert!(!bitfield.has_piece(100));
+        assert!(bitfield.is_empty());
+    }
+
+    #[test]
+    fn is_empty_for_zero_set_and_empty_vec() {
+        let mut bitfield = Bitfield::new(vec![0, 0]);
+        assert!(bitfield.is_empty());
+        bitfield.set_piece(0);
+        assert!(!bitfield.is_empty());
+        assert!(Bitfield::new(vec![]).is_empty());
+    }
+}

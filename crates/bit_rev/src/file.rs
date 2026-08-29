@@ -123,7 +123,7 @@ fn validate_torrent_file(torrent_file: &TorrentFile) -> Result<()> {
     if torrent_file.info.piece_length <= 0 {
         anyhow::bail!("piece length must be positive");
     }
-    if torrent_file.info.pieces.len() % 20 != 0 {
+    if !torrent_file.info.pieces.len().is_multiple_of(20) {
         anyhow::bail!("pieces length must be a multiple of 20");
     }
 
@@ -386,6 +386,67 @@ mod tests {
         }
     }
 
+    fn decode_info_hash(hex: &str) -> [u8; 20] {
+        assert_eq!(hex.len(), 40, "info hash hex must be 40 chars");
+        let mut out = [0u8; 20];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex digit");
+        }
+        out
+    }
+
+    fn torrent_file_entry(path: &[&str], length: i64) -> File {
+        File {
+            path: path
+                .iter()
+                .map(|component| (*component).to_string())
+                .collect(),
+            length,
+            md5sum: None,
+        }
+    }
+
+    fn torrent_file(
+        name: &str,
+        piece_length: i64,
+        pieces: Vec<u8>,
+        length: Option<i64>,
+        files: Option<Vec<File>>,
+    ) -> TorrentFile {
+        TorrentFile {
+            info: Info {
+                name: name.into(),
+                pieces: ByteBuf::from(pieces),
+                piece_length,
+                md5sum: None,
+                length,
+                files,
+                private: None,
+                path: None,
+                root_hash: None,
+            },
+            announce: Some("http://tracker.example/announce".into()),
+            nodes: None,
+            encoding: None,
+            httpseeds: None,
+            announce_list: None,
+            creation_date: None,
+            comment: None,
+            created_by: None,
+        }
+    }
+
+    fn encode_torrent(
+        name: &str,
+        piece_length: i64,
+        pieces: Vec<u8>,
+        length: Option<i64>,
+        files: Option<Vec<File>>,
+    ) -> Vec<u8> {
+        ser::to_bytes(&torrent_file(name, piece_length, pieces, length, files))
+            .expect("serialize torrent")
+    }
+
     #[test]
     fn url_encode_bytes_encodes_binary_info_hash() {
         assert_eq!(url_encode_bytes(&INFO_HASH_FIXTURE), INFO_HASH_ENCODED);
@@ -478,5 +539,166 @@ mod tests {
             &params,
         );
         assert!(url.ends_with("&trackerid=abc"));
+    }
+
+    #[test]
+    fn from_filename_parses_debian_sample() {
+        const DEBIAN_SAMPLE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../samples/debian-13.0.0-amd64-netinst.iso.torrent"
+        );
+        const DEBIAN_INFO_HASH_HEX: &str = "155a51b44b337d3b147c8d93d9764df48705ff89";
+
+        let meta = from_filename(DEBIAN_SAMPLE).expect("parse debian sample");
+        let info = &meta.torrent_file.info;
+
+        assert_eq!(info.name, "debian-13.0.0-amd64-netinst.iso");
+        assert_eq!(info.piece_length, 262144);
+        assert_eq!(meta.piece_hashes.len(), 3016);
+        assert_eq!(info.pieces.len(), 3016 * 20);
+        assert_eq!(info.length, Some(790_626_304));
+        assert!(info.files.is_none());
+        assert_eq!(meta.info_hash, decode_info_hash(DEBIAN_INFO_HASH_HEX));
+        assert_eq!(
+            meta.torrent_file.announce.as_deref(),
+            Some("http://bttracker.debian.org:6969/announce")
+        );
+    }
+
+    #[test]
+    fn from_bytes_parses_multi_file_fixture_and_offsets() {
+        let files = vec![
+            torrent_file_entry(
+                &["images", "LOC_Main_Reading_Room_Highsmith.jpg"],
+                17_614_527,
+            ),
+            torrent_file_entry(&["images", "melk-abbey-library.jpg"], 1_682_177),
+            torrent_file_entry(&["README"], 20),
+        ];
+        let encoded = encode_torrent("test_folder", 32768, vec![0u8; 3 * 20], None, Some(files));
+        let meta = from_bytes(&encoded).expect("parse multi-file fixture");
+        let info = &meta.torrent_file.info;
+
+        assert_eq!(info.name, "test_folder");
+        assert_eq!(info.piece_length, 32768);
+        assert_eq!(meta.piece_hashes.len(), 3);
+
+        let files = info.files.as_ref().expect("multi-file layout");
+        assert_eq!(
+            files[0].path,
+            ["images", "LOC_Main_Reading_Room_Highsmith.jpg"]
+        );
+        assert_eq!(files[0].length, 17_614_527);
+        assert_eq!(files[1].path, ["images", "melk-abbey-library.jpg"]);
+        assert_eq!(files[1].length, 1_682_177);
+        assert_eq!(files[2].path, ["README"]);
+        assert_eq!(files[2].length, 20);
+
+        let torrent = crate::torrent::Torrent::new(&meta).expect("torrent layout");
+        assert_eq!(torrent.files[0].offset, 0);
+        assert_eq!(torrent.files[1].offset, 17_614_527);
+        assert_eq!(torrent.files[2].offset, 17_614_527 + 1_682_177);
+        assert_eq!(torrent.length, 17_614_527 + 1_682_177 + 20);
+    }
+
+    #[test]
+    fn from_bytes_hashes_raw_info_dict() {
+        // SHA-1 of the info dict bytes, not a re-encoded struct.
+        const RAW: &[u8] = b"d8:announce31:http://tracker.example/announce4:infod6:lengthi4e4:name8:tiny.bin12:piece lengthi16384e6:pieces20:01234567890123456789ee";
+        const INFO_HASH_HEX: &str = "fea8fe53535a24b45effde348c0daab127924ff2";
+
+        let meta = from_bytes(RAW).expect("parse tiny fixture");
+        assert_eq!(meta.torrent_file.info.name, "tiny.bin");
+        assert_eq!(meta.torrent_file.info.piece_length, 16384);
+        assert_eq!(meta.torrent_file.info.length, Some(4));
+        assert_eq!(meta.piece_hashes.len(), 1);
+        assert_eq!(meta.info_hash, decode_info_hash(INFO_HASH_HEX));
+    }
+
+    #[test]
+    fn from_bytes_rejects_malformed_inputs() {
+        let valid = encode_torrent("test", 16384, vec![0u8; 20], Some(4), None);
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("empty", b"".to_vec()),
+            ("truncated dict", b"d4:infod".to_vec()),
+            ("truncated valid torrent", valid[..valid.len() / 2].to_vec()),
+            (
+                "pieces not multiple of 20",
+                encode_torrent("test", 16384, vec![0u8; 21], Some(4), None),
+            ),
+            (
+                "both length and files",
+                encode_torrent(
+                    "test",
+                    16384,
+                    vec![0u8; 20],
+                    Some(4),
+                    Some(vec![torrent_file_entry(&["a"], 4)]),
+                ),
+            ),
+            (
+                "neither length nor files",
+                encode_torrent("test", 16384, vec![0u8; 20], None, None),
+            ),
+            (
+                "piece_length zero",
+                encode_torrent("test", 0, vec![0u8; 20], Some(4), None),
+            ),
+            (
+                "piece_length negative",
+                encode_torrent("test", -1, vec![0u8; 20], Some(4), None),
+            ),
+        ];
+
+        for (label, bytes) in cases {
+            assert!(
+                from_bytes(bytes).is_err(),
+                "{label} should be rejected without panicking"
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_rejects_unsafe_file_paths() {
+        let cases: &[&[&str]] = &[
+            &["..", "secret"],
+            &["dir", ""],
+            &["/etc", "passwd"],
+            &["foo/bar"],
+            &["foo\\bar"],
+            &["C:windows"],
+        ];
+
+        for path in cases {
+            let files = vec![torrent_file_entry(path, 4)];
+            let encoded = encode_torrent("test", 16384, vec![0u8; 20], None, Some(files));
+            assert!(
+                from_bytes(&encoded).is_err(),
+                "path {path:?} should be rejected"
+            );
+        }
+
+        let empty_path = encode_torrent(
+            "test",
+            16384,
+            vec![0u8; 20],
+            None,
+            Some(vec![torrent_file_entry(&[], 4)]),
+        );
+        assert!(from_bytes(&empty_path).is_err());
+    }
+
+    #[test]
+    fn from_bytes_ignores_unknown_keys() {
+        let raw = b"d8:announce31:http://tracker.example/announce7:unknown7:ignored4:infod6:lengthi4e4:name4:test12:piece lengthi16384e6:pieces20:012345678901234567896:unused3:baree";
+        let meta = from_bytes(raw).expect("unknown keys should be ignored");
+        assert_eq!(meta.torrent_file.info.name, "test");
+        assert_eq!(meta.torrent_file.info.piece_length, 16384);
+        assert_eq!(meta.torrent_file.info.length, Some(4));
+        assert_eq!(meta.piece_hashes.len(), 1);
+        assert_eq!(
+            meta.torrent_file.announce.as_deref(),
+            Some("http://tracker.example/announce")
+        );
     }
 }
