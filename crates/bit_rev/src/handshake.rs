@@ -3,6 +3,7 @@ use thiserror::Error;
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Handshake {
     pub pstr: String,
+    pub reserved: [u8; 8],
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
 }
@@ -11,22 +12,43 @@ pub struct Handshake {
 pub enum HandshakeError {
     #[error("Protocol length can't be zero")]
     ProtocolLengthCantBeZero,
+    #[error("Handshake buffer is too short")]
+    BufferTooShort,
 }
 
 impl Handshake {
     pub fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
         Self {
             pstr: "BitTorrent protocol".to_string(),
+            reserved: [0u8; 8],
             info_hash,
             peer_id,
         }
+    }
+
+    pub fn reserved_bit(&self, index: usize) -> bool {
+        if index >= 64 {
+            return false;
+        }
+        let byte_index = index / 8;
+        let offset = index % 8;
+        (self.reserved[byte_index] >> (7 - offset)) & 1 != 0
+    }
+
+    pub fn set_reserved_bit(&mut self, index: usize) {
+        if index >= 64 {
+            return;
+        }
+        let byte_index = index / 8;
+        let offset = index % 8;
+        self.reserved[byte_index] |= 1 << (7 - offset);
     }
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut handshake = Vec::new();
         handshake.push(self.pstr.len() as u8);
         handshake.extend(self.pstr.as_bytes());
-        handshake.extend(vec![0u8; 8]);
+        handshake.extend(self.reserved);
         handshake.extend(self.info_hash);
         handshake.extend(self.peer_id);
         handshake
@@ -38,10 +60,28 @@ impl Handshake {
         if protocol_str_len == 0 {
             return Err(HandshakeError::ProtocolLengthCantBeZero);
         }
-        let i = protocol_str_len + 8;
-        let info_hash_buffer = handshake_buf[i..(i + 20)].try_into().unwrap();
-        let peer_id_buffer = handshake_buf[(i + 20)..].try_into().unwrap();
-        Ok(Handshake::new(info_hash_buffer, peer_id_buffer))
+        if handshake_buf.len() < protocol_str_len + 48 {
+            return Err(HandshakeError::BufferTooShort);
+        }
+        let pstr = String::from_utf8_lossy(&handshake_buf[..protocol_str_len]).into_owned();
+        let reserved_start = protocol_str_len;
+        let info_start = reserved_start + 8;
+        let peer_start = info_start + 20;
+        let reserved = handshake_buf[reserved_start..info_start]
+            .try_into()
+            .map_err(|_| HandshakeError::BufferTooShort)?;
+        let info_hash = handshake_buf[info_start..peer_start]
+            .try_into()
+            .map_err(|_| HandshakeError::BufferTooShort)?;
+        let peer_id = handshake_buf[peer_start..peer_start + 20]
+            .try_into()
+            .map_err(|_| HandshakeError::BufferTooShort)?;
+        Ok(Handshake {
+            pstr,
+            reserved,
+            info_hash,
+            peer_id,
+        })
     }
 }
 
