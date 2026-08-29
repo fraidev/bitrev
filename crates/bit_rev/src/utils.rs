@@ -35,12 +35,10 @@ pub fn check_integrity(hash: &[u8], buf: &[u8]) -> bool {
 }
 
 pub fn generate_peer_id() -> [u8; 20] {
-    let mut rng = rand::prelude::ThreadRng::default();
-    (0..20)
-        .map(|_| rng.gen())
-        .collect::<Vec<u8>>()
-        .try_into()
-        .unwrap()
+    let mut id = [0u8; 20];
+    id[..8].copy_from_slice(&crate::identity::peer_id_prefix());
+    rand::thread_rng().fill(&mut id[8..]);
+    id
 }
 
 #[derive(Debug, Clone)]
@@ -82,4 +80,29 @@ pub fn get_full_file_path(torrent: &Torrent, file_info: &TorrentFileInfo) -> std
         path.push(component);
     }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity;
+
+    #[test]
+    fn peer_id_matches_bep20_for_current_version() {
+        let id = generate_peer_id();
+        assert_eq!(id.len(), 20);
+        assert_eq!(&id[..8], b"-BR0100-");
+        assert_eq!(&id[..8], &identity::peer_id_prefix());
+        assert_eq!(id[0], b'-');
+        assert_eq!(&id[1..3], b"BR");
+        assert_eq!(id[7], b'-');
+    }
+
+    #[test]
+    fn peer_ids_differ_in_random_suffix() {
+        let a = generate_peer_id();
+        let b = generate_peer_id();
+        assert_eq!(&a[..8], &b[..8]);
+        assert_ne!(&a[8..], &b[8..]);
+    }
 }

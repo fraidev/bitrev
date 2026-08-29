@@ -1,6 +1,7 @@
 pub mod bitfield;
 pub mod file;
 pub mod handshake;
+pub mod identity;
 pub mod message;
 pub mod peer;
 pub mod peer_connection;
