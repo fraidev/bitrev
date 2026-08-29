@@ -6,7 +6,6 @@ use byteorder::{BigEndian, ByteOrder};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::error::Elapsed;
 
 const HANDSHAKE_TIMEOUT: u64 = 3;
@@ -105,8 +104,11 @@ impl Protocol {
             .map_err(ProtocolError::Io)
     }
 
-    pub async fn send_not_interested(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
-        let msg = message::Message::Interested;
+    pub async fn send_not_interested(
+        &self,
+        mut stream: impl AsyncWriteExt + Unpin,
+    ) -> Result<(), ProtocolError> {
+        let msg = message::Message::NotInterested;
         let msg_bytes = message::serialize(Some(msg));
         stream
             .write_all(&msg_bytes)
@@ -126,7 +128,11 @@ impl Protocol {
             .map_err(ProtocolError::Io)
     }
 
-    pub async fn send_have(&self, stream: &mut TcpStream, index: u32) -> Result<(), ProtocolError> {
+    pub async fn send_have(
+        &self,
+        mut stream: impl AsyncWriteExt + Unpin,
+        index: u32,
+    ) -> Result<(), ProtocolError> {
         let msg = message::format_have(index);
         let msg_bytes = message::serialize(Some(msg));
         stream
@@ -137,7 +143,7 @@ impl Protocol {
 
     pub async fn complete_handshake(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
     ) -> Result<Handshake, ProtocolError> {
         let timeout = tokio::time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), async {
             let handshake = Handshake::new(self.info_hash, self.peer_id);
@@ -176,7 +182,10 @@ impl Protocol {
         }
     }
 
-    pub async fn recv_bitfield(&self, stream: &mut TcpStream) -> Result<Vec<u8>, ProtocolError> {
+    pub async fn recv_bitfield(
+        &self,
+        stream: &mut (impl AsyncReadExt + Unpin),
+    ) -> Result<Vec<u8>, ProtocolError> {
         let func = async {
             match self.read(stream).await? {
                 None => Err(ProtocolError::MessageIsNone),
