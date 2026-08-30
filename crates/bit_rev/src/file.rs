@@ -83,16 +83,7 @@ impl TorrentMeta {
     }
 
     fn from_validated(torrent_file: TorrentFile, info_hash: [u8; 20]) -> Self {
-        let piece_hashes: Vec<[u8; 20]> = torrent_file
-            .info
-            .pieces
-            .chunks_exact(20)
-            .map(|chunk| {
-                let mut array = [0u8; 20];
-                array.copy_from_slice(chunk);
-                array
-            })
-            .collect();
+        let piece_hashes = torrent_file.info.pieces.as_chunks::<20>().0.to_vec();
 
         Self {
             torrent_file,
