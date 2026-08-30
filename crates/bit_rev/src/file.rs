@@ -82,6 +82,12 @@ impl TorrentMeta {
         Ok(Self::from_validated(torrent_file, info_hash))
     }
 
+    /// BEP-0012 tiers: `announce-list` wins when it has at least one URL,
+    /// otherwise a single tier is synthesized from `announce`.
+    pub fn announce_tiers(&self) -> Vec<Vec<String>> {
+        self.torrent_file.announce_tiers()
+    }
+
     fn from_validated(torrent_file: TorrentFile, info_hash: [u8; 20]) -> Self {
         let piece_hashes = torrent_file.info.pieces.as_chunks::<20>().0.to_vec();
 
@@ -91,6 +97,37 @@ impl TorrentMeta {
             piece_hashes,
         }
     }
+}
+
+impl TorrentFile {
+    /// BEP-0012 tiers from metainfo. `announce-list` takes precedence when it
+    /// contains at least one non-empty URL. Empty inner lists are dropped.
+    pub fn announce_tiers(&self) -> Vec<Vec<String>> {
+        let from_list = self
+            .announce_list
+            .as_ref()
+            .map(|list| normalize_announce_list(list))
+            .unwrap_or_default();
+        if !from_list.is_empty() {
+            return from_list;
+        }
+        match self.announce.as_deref() {
+            Some(url) if !url.is_empty() => vec![vec![url.to_string()]],
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn normalize_announce_list(list: &[Vec<String>]) -> Vec<Vec<String>> {
+    list.iter()
+        .map(|tier| {
+            tier.iter()
+                .filter(|url| !url.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|tier| !tier.is_empty())
+        .collect()
 }
 
 pub fn from_bytes(content: &[u8]) -> Result<TorrentMeta> {
@@ -262,6 +299,20 @@ impl AnnounceEvent {
             Self::Completed => "completed",
         }
     }
+
+    /// BEP-0015 event codes: 1 completed, 2 started, 3 stopped. Regular
+    /// re-announces omit the event and use 0.
+    pub fn as_udp(self) -> u32 {
+        match self {
+            Self::Completed => 1,
+            Self::Started => 2,
+            Self::Stopped => 3,
+        }
+    }
+}
+
+pub fn udp_announce_event(event: Option<AnnounceEvent>) -> u32 {
+    event.map(AnnounceEvent::as_udp).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +490,14 @@ mod tests {
     }
 
     #[test]
+    fn udp_announce_event_codes_match_bep_0015() {
+        assert_eq!(udp_announce_event(None), 0);
+        assert_eq!(udp_announce_event(Some(AnnounceEvent::Completed)), 1);
+        assert_eq!(udp_announce_event(Some(AnnounceEvent::Started)), 2);
+        assert_eq!(udp_announce_event(Some(AnnounceEvent::Stopped)), 3);
+    }
+
+    #[test]
     fn url_encode_bytes_encodes_binary_info_hash() {
         assert_eq!(url_encode_bytes(&INFO_HASH_FIXTURE), INFO_HASH_ENCODED);
     }
@@ -554,6 +613,70 @@ mod tests {
             meta.torrent_file.announce.as_deref(),
             Some("http://bttracker.debian.org:6969/announce")
         );
+        assert!(meta.torrent_file.announce_list.is_none());
+        assert_eq!(
+            meta.announce_tiers(),
+            vec![vec!["http://bttracker.debian.org:6969/announce".to_string()]]
+        );
+    }
+
+    #[test]
+    fn from_filename_parses_multi_tier_announce_list() {
+        const GIMP_SAMPLE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../samples/gimp-3.0.4-arm64.dmg.torrent"
+        );
+
+        let meta = from_filename(GIMP_SAMPLE).expect("parse gimp sample");
+        assert_eq!(
+            meta.torrent_file.announce.as_deref(),
+            Some("udp://tracker.opentrackr.org:1337/announce")
+        );
+        let list = meta
+            .torrent_file
+            .announce_list
+            .as_ref()
+            .expect("gimp torrent has announce-list");
+        assert_eq!(list.len(), 5);
+        assert_eq!(
+            list,
+            &vec![
+                vec!["udp://tracker.opentrackr.org:1337/announce".to_string()],
+                vec!["udp://tracker.coppersurfer.tk:6969/announce".to_string()],
+                vec!["udp://tracker.leechers-paradise.org:6969/announce".to_string()],
+                vec!["udp://tracker.openbittorrent.com:80/announce".to_string()],
+                vec!["https://ashrise.com:443/phoenix/announce".to_string()],
+            ]
+        );
+        assert_eq!(meta.announce_tiers(), *list);
+    }
+
+    #[test]
+    fn from_filename_parses_mixed_scheme_announce_list() {
+        const FOLDER_SAMPLE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../samples/test_folder-d984f67af9917b214cd8b6048ab5624c7df6a07a.torrent"
+        );
+
+        let meta = from_filename(FOLDER_SAMPLE).expect("parse test_folder sample");
+        assert_eq!(
+            meta.torrent_file.announce.as_deref(),
+            Some("https://academictorrents.com/announce.php")
+        );
+        let list = meta
+            .torrent_file
+            .announce_list
+            .as_ref()
+            .expect("test_folder torrent has announce-list");
+        assert_eq!(
+            list,
+            &vec![
+                vec!["https://academictorrents.com/announce.php".to_string()],
+                vec!["https://ipv6.academictorrents.com/announce.php".to_string()],
+                vec!["udp://tracker.opentrackr.org:1337/announce".to_string()],
+            ]
+        );
+        assert_eq!(meta.announce_tiers(), *list);
     }
 
     #[test]
@@ -677,6 +800,86 @@ mod tests {
             Some(vec![torrent_file_entry(&[], 4)]),
         );
         assert!(from_bytes(&empty_path).is_err());
+    }
+
+    #[test]
+    fn from_bytes_parses_single_tier_multi_url_announce_list() {
+        let mut torrent = torrent_file("test", 16384, vec![0u8; 20], Some(4), None);
+        torrent.announce = Some("http://ignored.example/announce".into());
+        torrent.announce_list = Some(vec![vec![
+            "http://a.example/announce".into(),
+            "http://b.example/announce".into(),
+            "udp://c.example:80/announce".into(),
+        ]]);
+        let encoded = ser::to_bytes(&torrent).expect("serialize torrent");
+        assert!(encoded.windows(13).any(|w| w == b"announce-list"));
+
+        let meta = from_bytes(&encoded).expect("parse single-tier announce-list");
+        assert_eq!(
+            meta.torrent_file.announce.as_deref(),
+            Some("http://ignored.example/announce")
+        );
+        assert_eq!(
+            meta.torrent_file.announce_list,
+            Some(vec![vec![
+                "http://a.example/announce".into(),
+                "http://b.example/announce".into(),
+                "udp://c.example:80/announce".into(),
+            ]])
+        );
+        assert_eq!(
+            meta.announce_tiers(),
+            vec![vec![
+                "http://a.example/announce".to_string(),
+                "http://b.example/announce".to_string(),
+                "udp://c.example:80/announce".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn from_bytes_parses_multi_tier_announce_list() {
+        let mut torrent = torrent_file("test", 16384, vec![0u8; 20], Some(4), None);
+        torrent.announce = Some("http://legacy.example/announce".into());
+        torrent.announce_list = Some(vec![
+            vec!["http://tier0.example/announce".into()],
+            vec![
+                "http://tier1a.example/announce".into(),
+                "udp://tier1b.example:6969/announce".into(),
+            ],
+        ]);
+        let encoded = ser::to_bytes(&torrent).expect("serialize torrent");
+        let meta = from_bytes(&encoded).expect("parse multi-tier announce-list");
+
+        assert_eq!(
+            meta.announce_tiers(),
+            vec![
+                vec!["http://tier0.example/announce".to_string()],
+                vec![
+                    "http://tier1a.example/announce".to_string(),
+                    "udp://tier1b.example:6969/announce".to_string(),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn announce_tiers_synthesizes_announce_when_list_absent_or_empty() {
+        let mut torrent = torrent_file("test", 16384, vec![0u8; 20], Some(4), None);
+        assert_eq!(
+            torrent.announce_tiers(),
+            vec![vec!["http://tracker.example/announce".to_string()]]
+        );
+
+        torrent.announce_list = Some(vec![vec![String::new()], vec![]]);
+        assert_eq!(
+            torrent.announce_tiers(),
+            vec![vec!["http://tracker.example/announce".to_string()]]
+        );
+
+        torrent.announce = None;
+        torrent.announce_list = None;
+        assert!(torrent.announce_tiers().is_empty());
     }
 
     #[test]

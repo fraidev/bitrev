@@ -15,8 +15,8 @@ use bit_rev::{
     peer_state::PeerStates,
     session::{DownloadState, PieceWork},
     tracker::{
-        self, announce, build_http_client, http_client, run_http_announce_loop,
-        HttpAnnounceContext, TrackerError,
+        self, announce, build_http_client, http_client, run_announce_loop, AnnounceContext,
+        TrackerError, TrackerTiers,
     },
 };
 use serde::Serialize;
@@ -240,12 +240,22 @@ fn incomplete_download() -> Arc<TorrentDownloadedState> {
     })
 }
 
-fn announce_ctx(url: String, download: Arc<TorrentDownloadedState>) -> HttpAnnounceContext {
-    HttpAnnounceContext {
+fn announce_ctx(url: String, download: Arc<TorrentDownloadedState>) -> AnnounceContext {
+    announce_ctx_with_tiers(vec![vec![url.clone()]], url, download)
+}
+
+fn announce_ctx_with_tiers(
+    tiers: Vec<Vec<String>>,
+    announce: String,
+    download: Arc<TorrentDownloadedState>,
+) -> AnnounceContext {
+    let mut meta = test_meta(announce);
+    meta.torrent_file.announce_list = Some(tiers.clone());
+    AnnounceContext {
         client: test_http_client(),
-        torrent_meta: test_meta(url.clone()),
+        torrent_meta: meta,
         peer_id: *b"-BR0100-0123456789ab",
-        tracker_url: url,
+        tiers: TrackerTiers::from_tiers_unshuffled(tiers),
         announce_key: 0xDF45_C574,
         port: 6881,
         download_state: Arc::new(Mutex::new(DownloadState::Downloading)),
@@ -342,7 +352,7 @@ async fn announce_loop_respects_interval_and_echoes_tracker_id() {
     let peers_for_loop = peer_states.clone();
 
     let loop_task = tokio::spawn(async move {
-        run_http_announce_loop(ctx, loop_shutdown, |peers| {
+        run_announce_loop(ctx, loop_shutdown, |peers| {
             let peer_states = peers_for_loop.clone();
             async move {
                 for peer in peers {
@@ -400,7 +410,7 @@ async fn announce_loop_retries_failure_reason_with_backoff() {
     let loop_shutdown = shutdown.clone();
     let ctx = announce_ctx(url, incomplete_download());
     let loop_task = tokio::spawn(async move {
-        run_http_announce_loop(ctx, loop_shutdown, |_| async {}).await;
+        run_announce_loop(ctx, loop_shutdown, |_| async {}).await;
     });
 
     let first = rx.recv().await.expect("failed started announce");
@@ -433,7 +443,7 @@ async fn announce_loop_sends_stopped_on_shutdown() {
     let loop_shutdown = shutdown.clone();
     let ctx = announce_ctx(url, incomplete_download());
     let loop_task = tokio::spawn(async move {
-        run_http_announce_loop(ctx, loop_shutdown, |_| async {}).await;
+        run_announce_loop(ctx, loop_shutdown, |_| async {}).await;
     });
 
     let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -453,4 +463,221 @@ async fn announce_loop_sends_stopped_on_shutdown() {
 
     let _ = tokio::time::timeout(Duration::from_secs(2), loop_task).await;
     handle.abort();
+}
+
+fn ok_announce_peer(ip: [u8; 4], port: u16, interval: i64) -> Vec<u8> {
+    ser::to_bytes(&TestAnnounce {
+        interval,
+        min_interval: None,
+        tracker_id: None,
+        warning_message: None,
+        peers: ByteBuf::from(compact_peer(ip, port)),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn announce_loop_falls_back_to_second_tier() {
+    let (dead_url, mut dead_rx, dead_handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 500,
+        body: b"dead".to_vec(),
+    }])
+    .await;
+    let (live_url, mut live_rx, live_handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 200,
+        body: ok_announce_peer([10, 0, 0, 2], 6882, 1800),
+    }])
+    .await;
+
+    let peer_states = Arc::new(PeerStates::default());
+    let shutdown = CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let ctx = announce_ctx_with_tiers(
+        vec![vec![dead_url], vec![live_url]],
+        "http://legacy.example/announce".into(),
+        incomplete_download(),
+    );
+    let peers_for_loop = peer_states.clone();
+    let loop_task = tokio::spawn(async move {
+        run_announce_loop(ctx, loop_shutdown, |peers| {
+            let peer_states = peers_for_loop.clone();
+            async move {
+                for peer in peers {
+                    peer_states.add_if_not_seen(peer);
+                }
+            }
+        })
+        .await;
+    });
+
+    let dead_req = tokio::time::timeout(Duration::from_secs(2), dead_rx.recv())
+        .await
+        .expect("dead tracker timed out")
+        .expect("dead tracker request");
+    assert_eq!(dead_req.query_param("event"), Some("started"));
+
+    let live_req = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("live tracker timed out")
+        .expect("live tracker request");
+    assert_eq!(live_req.query_param("event"), Some("started"));
+    settle_io().await;
+
+    assert_eq!(peer_states.states.len(), 1);
+    assert!(peer_states
+        .states
+        .contains_key(&"10.0.0.2:6882".parse().unwrap()));
+
+    shutdown.cancel();
+    settle_io().await;
+    let _ = loop_task.await;
+    dead_handle.abort();
+    live_handle.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn announce_loop_promotes_successful_url_in_tier() {
+    let (fail_url, mut fail_rx, fail_handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 200,
+        body: failure_announce("unavailable"),
+    }])
+    .await;
+    let (ok_url, mut ok_rx, ok_handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 200,
+        body: ok_announce_peer([10, 0, 0, 3], 6883, 1800),
+    }])
+    .await;
+
+    let shutdown = CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let ctx = announce_ctx_with_tiers(
+        vec![vec![fail_url, ok_url]],
+        "http://legacy.example/announce".into(),
+        incomplete_download(),
+    );
+    let loop_task = tokio::spawn(async move {
+        run_announce_loop(ctx, loop_shutdown, |_| async {}).await;
+    });
+
+    let first_fail = fail_rx.recv().await.expect("first failing announce");
+    assert_eq!(first_fail.query_param("event"), Some("started"));
+    let first_ok = ok_rx.recv().await.expect("first successful announce");
+    assert_eq!(first_ok.query_param("event"), Some("started"));
+    settle_io().await;
+    assert!(fail_rx.try_recv().is_err());
+    assert!(ok_rx.try_recv().is_err());
+
+    tokio::time::advance(Duration::from_secs(1801)).await;
+    let second_ok = ok_rx.recv().await.expect("promoted re-announce");
+    assert_eq!(second_ok.query_param("event"), None);
+    settle_io().await;
+    assert!(
+        fail_rx.try_recv().is_err(),
+        "failed URL must not be tried after promotion"
+    );
+
+    shutdown.cancel();
+    settle_io().await;
+    let _ = loop_task.await;
+    fail_handle.abort();
+    ok_handle.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn announce_loop_retries_from_top_after_all_fail_backoff() {
+    let (first_url, mut first_rx, first_handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 500,
+        body: b"down".to_vec(),
+    }])
+    .await;
+    let (second_url, mut second_rx, second_handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 500,
+        body: b"down".to_vec(),
+    }])
+    .await;
+
+    let shutdown = CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let ctx = announce_ctx_with_tiers(
+        vec![vec![first_url], vec![second_url]],
+        "http://legacy.example/announce".into(),
+        incomplete_download(),
+    );
+    let loop_task = tokio::spawn(async move {
+        run_announce_loop(ctx, loop_shutdown, |_| async {}).await;
+    });
+
+    first_rx.recv().await.expect("first tier attempt");
+    second_rx.recv().await.expect("second tier attempt");
+    settle_io().await;
+
+    tokio::time::advance(Duration::from_secs(14)).await;
+    settle_io().await;
+    assert!(
+        first_rx.try_recv().is_err(),
+        "retried before backoff elapsed"
+    );
+    assert!(
+        second_rx.try_recv().is_err(),
+        "retried before backoff elapsed"
+    );
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    first_rx.recv().await.expect("retry starts at first tier");
+    second_rx
+        .recv()
+        .await
+        .expect("retry continues to second tier");
+
+    shutdown.cancel();
+    settle_io().await;
+    let _ = loop_task.await;
+    first_handle.abort();
+    second_handle.abort();
+}
+
+#[tokio::test]
+async fn announce_loop_skips_unknown_scheme() {
+    let (live_url, mut live_rx, live_handle) = spawn_scripted_tracker(vec![MockResponse {
+        status: 200,
+        body: ok_announce_peer([10, 0, 0, 4], 6884, 1800),
+    }])
+    .await;
+
+    let peer_states = Arc::new(PeerStates::default());
+    let shutdown = CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let ctx = announce_ctx_with_tiers(
+        vec![
+            vec!["wss://tracker.example/announce".into()],
+            vec![live_url],
+        ],
+        "http://legacy.example/announce".into(),
+        incomplete_download(),
+    );
+    let peers_for_loop = peer_states.clone();
+    let loop_task = tokio::spawn(async move {
+        run_announce_loop(ctx, loop_shutdown, |peers| {
+            let peer_states = peers_for_loop.clone();
+            async move {
+                for peer in peers {
+                    peer_states.add_if_not_seen(peer);
+                }
+            }
+        })
+        .await;
+    });
+
+    let live_req = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("live tracker timed out")
+        .expect("live tracker request");
+    assert_eq!(live_req.query_param("event"), Some("started"));
+    settle_io().await;
+    assert_eq!(peer_states.states.len(), 1);
+
+    shutdown.cancel();
+    settle_io().await;
+    let _ = loop_task.await;
+    live_handle.abort();
 }
