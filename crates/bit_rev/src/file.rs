@@ -262,6 +262,14 @@ impl AnnounceEvent {
             Self::Completed => "completed",
         }
     }
+
+    pub fn as_udp(self) -> u32 {
+        match self {
+            Self::Completed => 1,
+            Self::Started => 2,
+            Self::Stopped => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +370,13 @@ mod tests {
             info_hash,
             piece_hashes: vec![info_hash],
         }
+    }
+
+    #[test]
+    fn announce_event_udp_codes() {
+        assert_eq!(AnnounceEvent::Completed.as_udp(), 1);
+        assert_eq!(AnnounceEvent::Started.as_udp(), 2);
+        assert_eq!(AnnounceEvent::Stopped.as_udp(), 3);
     }
 
     fn sample_params(event: Option<AnnounceEvent>) -> AnnounceParams {

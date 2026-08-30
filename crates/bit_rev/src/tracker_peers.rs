@@ -1,8 +1,8 @@
 use rand::Rng;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
-use tokio::{select, sync::Semaphore, time::sleep};
+use tokio::{select, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::{
     file::TorrentMeta,
@@ -11,7 +11,6 @@ use crate::{
         FullPiece, PeerConnection, PeerHandler, PieceWorkState, TorrentDownloadedState,
     },
     peer_state::PeerStates,
-    protocol_udp::request_udp_peers,
     session::{DownloadState, PieceResult, PieceWork},
     tracker::{self, HttpAnnounceContext, TrackerError},
 };
@@ -84,22 +83,8 @@ impl TrackerPeers {
         let info_hash = self.torrent_meta.info_hash;
         let peer_id = self.peer_id;
 
-        let all_tracker_urls = all_trackers(&self.torrent_meta.clone());
-        let tcp_trackers: Vec<String> = all_tracker_urls
-            .iter()
-            .filter(|t| !t.starts_with("udp://"))
-            .cloned()
-            .collect();
-        let udp_trackers: Vec<String> = all_tracker_urls
-            .iter()
-            .filter(|t| t.starts_with("udp://"))
-            .cloned()
-            .collect();
-
-        debug!(
-            "Connecting to trackers: TCP: {:?}, UDP: {:?}",
-            tcp_trackers, udp_trackers
-        );
+        let all_tracker_urls = all_trackers(&self.torrent_meta);
+        debug!(trackers = ?all_tracker_urls, "connecting to trackers");
         let torrent_meta = self.torrent_meta.clone();
         let peer_states = self.peer_states.clone();
         let piece_tx = self.piece_tx.clone();
@@ -121,7 +106,7 @@ impl TrackerPeers {
                 .collect(),
         });
 
-        for tracker_url in tcp_trackers {
+        for tracker_url in all_tracker_urls {
             let ctx = HttpAnnounceContext {
                 client: http_client.clone(),
                 torrent_meta: torrent_meta.clone(),
@@ -139,7 +124,7 @@ impl TrackerPeers {
             let torrent_downloaded_state = torrent_downloaded_state.clone();
             let shutdown = cancel.clone();
             tokio::spawn(async move {
-                tracker::run_http_announce_loop(ctx, shutdown, |new_peers| {
+                tracker::run_announce_loop(ctx, shutdown, |new_peers| {
                     let peer_states = peer_states.clone();
                     let piece_tx = piece_tx.clone();
                     let have_broadcast = have_broadcast.clone();
@@ -162,74 +147,6 @@ impl TrackerPeers {
                     }
                 })
                 .await;
-            });
-        }
-
-        if !udp_trackers.is_empty() {
-            let udp_cancel = cancel;
-            tokio::spawn(async move {
-                loop {
-                    if udp_cancel.is_cancelled() {
-                        break;
-                    }
-                    while {
-                        let state = *download_state.lock().unwrap();
-                        state != DownloadState::Downloading
-                    } {
-                        if udp_cancel.is_cancelled() {
-                            return;
-                        }
-                        sleep(std::time::Duration::from_millis(100)).await;
-                    }
-
-                    for tracker in udp_trackers.clone() {
-                        let torrent_meta = torrent_meta.clone();
-                        let peer_states = peer_states.clone();
-                        let piece_tx = piece_tx.clone();
-                        let have_broadcast = have_broadcast.clone();
-                        let torrent_downloaded_state = torrent_downloaded_state.clone();
-                        let download_state = download_state.clone();
-                        tokio::spawn(async move {
-                            match request_udp_peers(&tracker, &torrent_meta, &peer_id, 6881).await {
-                                Ok(udp_response) => {
-                                    debug!(
-                                        "Received UDP response from tracker {}: {:?}",
-                                        tracker, udp_response
-                                    );
-                                    let new_peers: Vec<_> = udp_response
-                                        .peers
-                                        .into_iter()
-                                        .map(|p| p.to_socket_addr())
-                                        .collect();
-
-                                    process_peers(
-                                        new_peers,
-                                        PeerProcessorConfig {
-                                            info_hash,
-                                            peer_id,
-                                            peer_states: peer_states.clone(),
-                                            piece_tx: piece_tx.clone(),
-                                            have_broadcast: have_broadcast.clone(),
-                                            torrent_downloaded_state: torrent_downloaded_state
-                                                .clone(),
-                                            download_state: download_state.clone(),
-                                        },
-                                    )
-                                    .await;
-                                }
-                                Err(e) => error!(
-                                    "Failed to request peers from UDP tracker {}: {}",
-                                    tracker, e
-                                ),
-                            }
-                        });
-                    }
-
-                    tokio::select! {
-                        _ = udp_cancel.cancelled() => break,
-                        _ = sleep(std::time::Duration::from_secs(30)) => {}
-                    }
-                }
             });
         }
     }

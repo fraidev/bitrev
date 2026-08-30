@@ -12,6 +12,7 @@ use crate::{
     file::{self, AnnounceEvent, AnnounceParams, TorrentMeta},
     peer::BencodeResponse,
     peer_connection::TorrentDownloadedState,
+    protocol_udp::{self, AnnounceLimits, UdpTracker},
     session::DownloadState,
 };
 
@@ -37,6 +38,8 @@ pub enum TrackerError {
     Decode(String),
     #[error("tracker stopped announce timed out")]
     StoppedTimeout,
+    #[error(transparent)]
+    Udp(#[from] protocol_udp::UdpTrackerError),
 }
 
 pub fn http_client() -> reqwest::Client {
@@ -133,6 +136,17 @@ enum Wake {
 pub async fn run_http_announce_loop<F, Fut>(
     ctx: HttpAnnounceContext,
     shutdown: CancellationToken,
+    on_peers: F,
+) where
+    F: FnMut(Vec<std::net::SocketAddr>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    run_announce_loop(ctx, shutdown, on_peers).await;
+}
+
+pub async fn run_announce_loop<F, Fut>(
+    ctx: HttpAnnounceContext,
+    shutdown: CancellationToken,
     mut on_peers: F,
 ) where
     F: FnMut(Vec<std::net::SocketAddr>) -> Fut,
@@ -143,6 +157,8 @@ pub async fn run_http_announce_loop<F, Fut>(
     let mut tracker_id: Option<Vec<u8>> = None;
     let mut backoff: Option<Duration> = None;
     let mut joined = false;
+    let mut udp = protocol_udp::is_udp_url(&ctx.tracker_url)
+        .then(|| UdpTracker::new(ctx.tracker_url.clone()));
 
     loop {
         if !wait_until_downloading(&ctx.download_state, &shutdown).await {
@@ -155,15 +171,13 @@ pub async fn run_http_announce_loop<F, Fut>(
             sent_completed,
         );
         let params = current_announce_params(&ctx, event, tracker_id.clone());
-        let url =
-            file::build_tracker_url(&ctx.torrent_meta, &ctx.peer_id, &ctx.tracker_url, &params);
 
         joined = true;
-        let result = announce(&ctx.client, &url).await;
+        let result = dispatch_announce(&ctx, &params, udp.as_mut()).await;
         if shutdown.is_cancelled() {
-            if let Ok(resp) = result {
+            if let Ok(resp) = &result {
                 if let Some(id) = resp.tracker_id.as_ref() {
-                    tracker_id = Some(id.to_vec());
+                    tracker_id = Some(id.clone());
                 }
             }
             break;
@@ -178,21 +192,20 @@ pub async fn run_http_announce_loop<F, Fut>(
                 if event == Some(AnnounceEvent::Completed) {
                     sent_completed = true;
                 }
-                if let Some(id) = resp.tracker_id.as_ref() {
-                    tracker_id = Some(id.to_vec());
+                if let Some(id) = resp.tracker_id {
+                    tracker_id = Some(id);
                 }
-                match resp.get_peers() {
+                match resp.peers {
                     Ok(peers) => on_peers(peers).await,
                     Err(e) => {
                         debug!(
                             tracker = %ctx.tracker_url,
                             error = %e,
-                            "failed to parse peers from HTTP tracker"
+                            "failed to parse peers from tracker"
                         );
                     }
                 }
-                let interval = resp.interval.unwrap_or(DEFAULT_INTERVAL_SECS);
-                let delay = reannounce_delay(interval, resp.min_interval);
+                let delay = reannounce_delay(resp.interval, resp.min_interval);
                 match wait_reannounce(
                     delay,
                     &shutdown,
@@ -206,7 +219,7 @@ pub async fn run_http_announce_loop<F, Fut>(
                 }
             }
             Err(e) => {
-                debug!(tracker = %ctx.tracker_url, error = %e, "HTTP tracker announce failed");
+                debug!(tracker = %ctx.tracker_url, error = %e, "tracker announce failed");
                 let delay = next_backoff(backoff);
                 backoff = Some(delay);
                 match wait_reannounce(
@@ -225,8 +238,42 @@ pub async fn run_http_announce_loop<F, Fut>(
     }
 
     if joined {
-        send_stopped(&ctx, tracker_id).await;
+        send_stopped(&ctx, tracker_id, udp.as_mut()).await;
     }
+}
+
+struct DispatchedAnnounce {
+    peers: Result<Vec<std::net::SocketAddr>, String>,
+    interval: u64,
+    min_interval: Option<u64>,
+    tracker_id: Option<Vec<u8>>,
+}
+
+async fn dispatch_announce(
+    ctx: &HttpAnnounceContext,
+    params: &AnnounceParams,
+    udp: Option<&mut UdpTracker>,
+) -> Result<DispatchedAnnounce, TrackerError> {
+    if let Some(tracker) = udp {
+        let resp = tracker
+            .announce(&ctx.torrent_meta.info_hash, &ctx.peer_id, params)
+            .await?;
+        return Ok(DispatchedAnnounce {
+            peers: Ok(resp.peers),
+            interval: u64::from(resp.interval),
+            min_interval: None,
+            tracker_id: None,
+        });
+    }
+
+    let url = file::build_tracker_url(&ctx.torrent_meta, &ctx.peer_id, &ctx.tracker_url, params);
+    let resp = announce(&ctx.client, &url).await?;
+    Ok(DispatchedAnnounce {
+        peers: resp.get_peers().map_err(|e| e.to_string()),
+        interval: resp.interval.unwrap_or(DEFAULT_INTERVAL_SECS),
+        min_interval: resp.min_interval,
+        tracker_id: resp.tracker_id.as_ref().map(|id| id.to_vec()),
+    })
 }
 
 fn next_announce_event(
@@ -261,7 +308,11 @@ fn current_announce_params(
     }
 }
 
-async fn send_stopped(ctx: &HttpAnnounceContext, tracker_id: Option<Vec<u8>>) {
+async fn send_stopped(
+    ctx: &HttpAnnounceContext,
+    tracker_id: Option<Vec<u8>>,
+    udp: Option<&mut UdpTracker>,
+) {
     let params = AnnounceParams {
         uploaded: 0,
         downloaded: ctx.torrent_downloaded_state.downloaded_bytes(),
@@ -272,12 +323,29 @@ async fn send_stopped(ctx: &HttpAnnounceContext, tracker_id: Option<Vec<u8>>) {
         key: ctx.announce_key,
         tracker_id,
     };
-    let url = file::build_tracker_url(&ctx.torrent_meta, &ctx.peer_id, &ctx.tracker_url, &params);
-    if let Err(e) = announce_with_timeout(&ctx.client, &url, STOPPED_TIMEOUT).await {
+    let result = if let Some(tracker) = udp {
+        tracker
+            .announce_with_limits(
+                &ctx.torrent_meta.info_hash,
+                &ctx.peer_id,
+                &params,
+                AnnounceLimits::STOPPED,
+            )
+            .await
+            .map(|_| ())
+            .map_err(TrackerError::from)
+    } else {
+        let url =
+            file::build_tracker_url(&ctx.torrent_meta, &ctx.peer_id, &ctx.tracker_url, &params);
+        announce_with_timeout(&ctx.client, &url, STOPPED_TIMEOUT)
+            .await
+            .map(|_| ())
+    };
+    if let Err(e) = result {
         debug!(
             tracker = %ctx.tracker_url,
             error = %e,
-            "HTTP tracker stopped announce failed"
+            "tracker stopped announce failed"
         );
     }
 }
