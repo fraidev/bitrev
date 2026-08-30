@@ -48,6 +48,7 @@ pub struct AnnounceOptions {
     pub downloaded: u64,
     pub left: u64,
     pub event: u32,
+    pub key: u32,
 }
 
 impl UdpTracker {
@@ -90,7 +91,6 @@ impl UdpTracker {
         let left = announce_options.left;
         let event = announce_options.event;
 
-        let key = rand::thread_rng().gen();
         let request = build_announce_request(AnnounceRequest {
             connection_id,
             transaction_id,
@@ -101,7 +101,7 @@ impl UdpTracker {
             uploaded,
             event,
             ip: 0,
-            key,
+            key: announce_options.key,
             num_want: -1,
             port,
         })?;
@@ -323,6 +323,7 @@ pub async fn request_udp_peers(
         downloaded,
         left,
         event,
+        key: rand::thread_rng().gen(),
     };
 
     tracker.announce(&announce_options).await
