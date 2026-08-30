@@ -86,6 +86,38 @@ pub fn get_full_file_path(torrent: &Torrent, file_info: &TorrentFileInfo) -> std
 mod tests {
     use super::*;
     use crate::identity;
+    use crate::torrent::{Torrent, TorrentFileInfo};
+
+    fn torrent(files: &[i64], piece_length: i64) -> Torrent {
+        let mut offset = 0i64;
+        let files = files
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let f = TorrentFileInfo {
+                    path: vec![format!("f{i}")],
+                    length: len,
+                    offset,
+                };
+                offset += len;
+                f
+            })
+            .collect();
+        Torrent {
+            info_hash: [0; 20],
+            piece_hashes: vec![],
+            piece_length,
+            length: offset,
+            files,
+            name: "t".into(),
+        }
+    }
+
+    fn assert_mapping(m: &PieceFileMapping, file_index: usize, file_offset: usize, length: usize) {
+        assert_eq!(m.file_index, file_index);
+        assert_eq!(m.file_offset, file_offset);
+        assert_eq!(m.length, length);
+    }
 
     #[test]
     fn peer_id_matches_bep20_for_current_version() {
@@ -104,5 +136,46 @@ mod tests {
         let b = generate_peer_id();
         assert_eq!(&a[..8], &b[..8]);
         assert_ne!(&a[8..], &b[8..]);
+    }
+
+    #[test]
+    fn map_single_file_first_and_last_short_piece() {
+        let t = torrent(&[100], 40);
+        let piece0 = map_piece_to_files(&t, 0);
+        assert_eq!(piece0.len(), 1);
+        assert_mapping(&piece0[0], 0, 0, 40);
+
+        let piece2 = map_piece_to_files(&t, 2);
+        assert_eq!(piece2.len(), 1);
+        assert_mapping(&piece2[0], 0, 80, 20);
+    }
+
+    #[test]
+    fn map_piece_spanning_two_files() {
+        let t = torrent(&[30, 30], 40);
+        let piece0 = map_piece_to_files(&t, 0);
+        assert_eq!(piece0.len(), 2);
+        assert_mapping(&piece0[0], 0, 0, 30);
+        assert_mapping(&piece0[1], 1, 0, 10);
+    }
+
+    #[test]
+    fn map_piece_spanning_three_files() {
+        let t = torrent(&[10, 10, 10], 25);
+        let piece0 = map_piece_to_files(&t, 0);
+        assert_eq!(piece0.len(), 3);
+        assert_mapping(&piece0[0], 0, 0, 10);
+        assert_mapping(&piece0[1], 1, 0, 10);
+        assert_mapping(&piece0[2], 2, 0, 5);
+    }
+
+    #[test]
+    fn map_piece_includes_zero_length_file() {
+        let t = torrent(&[20, 0, 20], 30);
+        let piece0 = map_piece_to_files(&t, 0);
+        assert_eq!(piece0.len(), 3);
+        assert_mapping(&piece0[0], 0, 0, 20);
+        assert_mapping(&piece0[1], 1, 0, 0);
+        assert_mapping(&piece0[2], 2, 0, 10);
     }
 }

@@ -656,3 +656,158 @@ impl PeerConnection {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn piece(index: u32, length: u32) -> PieceWorkState {
+        PieceWorkState {
+            piece_work: PieceWork {
+                index,
+                length,
+                hash: [0; 20],
+            },
+            chuncks: Mutex::new(vec![]),
+            downloaded: AtomicBool::new(false),
+            reserved: Mutex::new(None),
+        }
+    }
+
+    fn state(n: u32, piece_len: u32) -> TorrentDownloadedState {
+        TorrentDownloadedState {
+            semaphore: Semaphore::new(0),
+            pieces: (0..n).map(|i| piece(i, piece_len)).collect(),
+        }
+    }
+
+    fn peer(port: u16) -> PeerAddr {
+        (std::net::Ipv4Addr::LOCALHOST, port).into()
+    }
+
+    #[tokio::test]
+    async fn get_and_reserve_piece_assigns_distinct_peers_then_steals_without_overwrite() {
+        let s = state(3, 16);
+        let p1 = peer(6881);
+        let p2 = peer(6882);
+        let p3 = peer(6883);
+        let p4 = peer(6884);
+
+        let a = s.get_and_reserve_piece(p1).await.unwrap();
+        assert_eq!(a.piece_work.index, 0);
+        assert_eq!(*a.reserved.lock().unwrap(), Some(p1));
+
+        let b = s.get_and_reserve_piece(p2).await.unwrap();
+        assert_eq!(b.piece_work.index, 1);
+        assert_eq!(*b.reserved.lock().unwrap(), Some(p2));
+
+        let c = s.get_and_reserve_piece(p3).await.unwrap();
+        assert_eq!(c.piece_work.index, 2);
+        assert_eq!(*c.reserved.lock().unwrap(), Some(p3));
+
+        let stolen = s.get_and_reserve_piece(p4).await.unwrap();
+        assert_eq!(stolen.piece_work.index, 0);
+        assert_eq!(*stolen.reserved.lock().unwrap(), Some(p1));
+        assert_eq!(*s.pieces[0].reserved.lock().unwrap(), Some(p1));
+        assert_eq!(*s.pieces[1].reserved.lock().unwrap(), Some(p2));
+        assert_eq!(*s.pieces[2].reserved.lock().unwrap(), Some(p3));
+    }
+
+    #[tokio::test]
+    async fn remove_reserved_clears_only_that_peer() {
+        let s = state(3, 16);
+        let p1 = peer(6881);
+        let p2 = peer(6882);
+        let p3 = peer(6883);
+
+        s.get_and_reserve_piece(p1).await.unwrap();
+        s.get_and_reserve_piece(p2).await.unwrap();
+        s.get_and_reserve_piece(p3).await.unwrap();
+
+        s.remove_reserved(p2);
+
+        assert_eq!(*s.pieces[0].reserved.lock().unwrap(), Some(p1));
+        assert!(s.pieces[1].reserved.lock().unwrap().is_none());
+        assert_eq!(*s.pieces[2].reserved.lock().unwrap(), Some(p3));
+    }
+
+    #[test]
+    fn set_chuncks_then_downloaded_when_lengths_sum() {
+        let s = state(2, 16);
+
+        s.set_chuncks(0, 0, vec![0u8; 8]);
+        assert!(s.set_downloaded_if_all_chunks(0).is_none());
+        assert!(!s.pieces[0].downloaded.load(Ordering::Relaxed));
+        assert!(!s.is_complete());
+
+        s.set_chuncks(0, 8, vec![1u8; 8]);
+        let done = s.set_downloaded_if_all_chunks(0);
+        assert!(done.is_some());
+        assert_eq!(done.unwrap().piece_work.index, 0);
+        assert!(s.pieces[0].downloaded.load(Ordering::Relaxed));
+        assert!(!s.is_complete());
+
+        s.set_chuncks(1, 0, vec![2u8; 16]);
+        assert!(s.set_downloaded_if_all_chunks(1).is_some());
+        assert!(s.pieces[1].downloaded.load(Ordering::Relaxed));
+        assert!(s.is_complete());
+    }
+
+    #[test]
+    fn remove_downloaded_clears_chunks_and_flag() {
+        let s = state(1, 16);
+        s.set_chuncks(0, 0, vec![7u8; 16]);
+        assert!(s.set_downloaded_if_all_chunks(0).is_some());
+        assert!(s.pieces[0].downloaded.load(Ordering::Relaxed));
+        assert_eq!(s.pieces[0].chuncks.lock().unwrap().len(), 1);
+
+        s.remove_downloaded(0);
+        assert!(!s.pieces[0].downloaded.load(Ordering::Relaxed));
+        assert!(s.pieces[0].chuncks.lock().unwrap().is_empty());
+        assert!(!s.is_complete());
+    }
+
+    #[tokio::test]
+    async fn concurrent_reservation_completes_each_piece_once() {
+        const N: u16 = 16;
+        const M: u32 = 8;
+        const PIECE_LEN: u32 = 16;
+
+        let s = Arc::new(state(M, PIECE_LEN));
+        let mut set = tokio::task::JoinSet::new();
+
+        for i in 0..N {
+            let s = Arc::clone(&s);
+            let peer = peer(6881 + i);
+            set.spawn(async move {
+                let mut completed = 0u32;
+                while let Some(pw) = s.get_and_reserve_piece(peer).await {
+                    let reserved_by_me = pw.reserved.lock().unwrap().as_ref() == Some(&peer);
+                    if reserved_by_me {
+                        let index = pw.piece_work.index;
+                        s.set_chuncks(index, 0, vec![0u8; PIECE_LEN as usize]);
+                        s.set_downloaded_if_all_chunks(index);
+                        completed += 1;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                completed
+            });
+        }
+
+        let mut total_completed = 0u32;
+        while let Some(res) = set.join_next().await {
+            total_completed += res.unwrap();
+        }
+
+        assert_eq!(total_completed, M);
+        assert!(s.is_complete());
+        for pw in s.pieces.iter() {
+            assert!(pw.downloaded.load(Ordering::Relaxed));
+            let reserved = pw.reserved.lock().unwrap();
+            assert!(reserved.is_some());
+        }
+    }
+}

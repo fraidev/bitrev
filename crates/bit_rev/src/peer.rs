@@ -165,4 +165,85 @@ mod tests {
         );
         assert!(decoded.get_peers().unwrap().is_empty());
     }
+
+    fn compact_v4_response(buf: &[u8]) -> BencodeResponse {
+        BencodeResponse {
+            peers: Some(Value::Bytes(buf.to_vec())),
+            peers6: None,
+            interval: None,
+            min_interval: None,
+            failure_reason: None,
+            warning_message: None,
+            tracker_id: None,
+            complete: None,
+            incomplete: None,
+        }
+    }
+
+    fn compact_v6_response(buf: &[u8]) -> BencodeResponse {
+        BencodeResponse {
+            peers: None,
+            peers6: Some(ByteBuf::from(buf.to_vec())),
+            interval: None,
+            min_interval: None,
+            failure_reason: None,
+            warning_message: None,
+            tracker_id: None,
+            complete: None,
+            incomplete: None,
+        }
+    }
+
+    #[test]
+    fn compact_peers_decode_multiple_addresses() {
+        let buf = [
+            127, 0, 0, 1, 0x1A, 0xE1, 192, 168, 1, 2, 0x1A, 0xE9, 10, 0, 0, 5, 0x00, 0x50,
+        ];
+        let response = compact_v4_response(&buf);
+        assert_eq!(
+            response.get_peers().unwrap(),
+            vec![
+                "127.0.0.1:6881".parse().unwrap(),
+                "192.168.1.2:6889".parse().unwrap(),
+                "10.0.0.5:80".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_peers_odd_length_is_error() {
+        for len in [5, 7] {
+            let buf = vec![0u8; len];
+            let err = compact_v4_response(&buf).get_peers().unwrap_err();
+            assert!(
+                err.to_string().contains("invalid compact peers length"),
+                "len={len}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_peers_empty_is_empty_vec() {
+        let response = compact_v4_response(&[]);
+        assert!(response.get_peers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compact_peers6_one_address() {
+        let mut buf = [0u8; 18];
+        buf[15] = 1;
+        buf[16] = 0x1A;
+        buf[17] = 0xE1;
+        let response = compact_v6_response(&buf);
+        assert_eq!(
+            response.get_peers().unwrap(),
+            vec!["[::1]:6881".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn compact_peers6_odd_length_is_error() {
+        let err = compact_v6_response(&[0u8; 17]).get_peers().unwrap_err();
+        assert!(err.to_string().contains("invalid compact peers6 length"));
+    }
 }
