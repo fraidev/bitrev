@@ -41,6 +41,13 @@ pub struct Info {
     pub root_hash: Option<String>,
 }
 
+impl Info {
+    /// BEP-0027: `private=1` is private; missing or `0` is public.
+    pub fn is_private(&self) -> bool {
+        matches!(self.private, Some(flag) if flag != 0)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TorrentFile {
     pub info: Info,
@@ -569,6 +576,7 @@ mod tests {
             meta.torrent_file.announce.as_deref(),
             Some("http://bttracker.debian.org:6969/announce")
         );
+        assert!(!info.is_private());
     }
 
     #[test]
@@ -705,6 +713,66 @@ mod tests {
         assert_eq!(
             meta.torrent_file.announce.as_deref(),
             Some("http://tracker.example/announce")
+        );
+    }
+
+    fn fixture_path(name: &str) -> String {
+        format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn from_filename_parses_private_fixture() {
+        const PRIVATE_INFO_HASH_HEX: &str = "f40c245c537eb8d8f3519fe1993632a806b6b571";
+
+        let meta = from_filename(&fixture_path("private.torrent")).expect("parse private fixture");
+        assert_eq!(meta.torrent_file.info.name, "private.bin");
+        assert_eq!(meta.torrent_file.info.private, Some(1));
+        assert!(meta.torrent_file.info.is_private());
+        assert_eq!(meta.info_hash, decode_info_hash(PRIVATE_INFO_HASH_HEX));
+
+        let torrent = crate::torrent::Torrent::new(&meta).expect("torrent");
+        assert!(torrent.is_private());
+        assert!(!torrent.allows_dht());
+        assert!(!torrent.allows_pex());
+        assert!(!torrent.allows_lsd());
+    }
+
+    #[test]
+    fn from_filename_private_zero_is_public() {
+        let meta =
+            from_filename(&fixture_path("private-zero.torrent")).expect("parse private=0 fixture");
+        assert_eq!(meta.torrent_file.info.private, Some(0));
+        assert!(!meta.torrent_file.info.is_private());
+        let torrent = crate::torrent::Torrent::new(&meta).expect("torrent");
+        assert!(!torrent.is_private());
+        assert!(torrent.allows_dht());
+    }
+
+    #[test]
+    fn from_filename_info_hash_includes_unknown_info_keys() {
+        // extra-field and unknown-key live inside info and are not on Info.
+        // Hashing a re-encoded struct would drop them and change the info hash.
+        const EXTRA_INFO_HASH_HEX: &str = "6a90441e947dcc1910191a8a5f710399dbe90d6f";
+
+        let path = fixture_path("extra-info-keys.torrent");
+        let bytes = std::fs::read(&path).expect("read extra-info-keys fixture");
+        let meta = from_bytes(&bytes).expect("parse extra-info-keys fixture");
+
+        assert_eq!(meta.torrent_file.info.name, "tiny.bin");
+        assert!(meta.torrent_file.info.private.is_none());
+        assert!(!meta.torrent_file.info.is_private());
+        assert_eq!(meta.info_hash, decode_info_hash(EXTRA_INFO_HASH_HEX));
+
+        let raw_info = raw_info_dict(&bytes).expect("raw info");
+        let mut hasher = sha1_smol::Sha1::new();
+        hasher.update(raw_info);
+        assert_eq!(meta.info_hash, hasher.digest().bytes());
+
+        let reencoded = ser::to_bytes(&meta.torrent_file.info).expect("re-encode info");
+        assert_ne!(
+            reencoded.as_slice(),
+            raw_info,
+            "re-encoding must drop unknown info keys, proving from_bytes hashes the original bytes"
         );
     }
 }

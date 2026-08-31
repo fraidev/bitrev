@@ -7,6 +7,7 @@ use crate::tracker_peers::TrackerPeers;
 use crate::utils;
 use dashmap::DashMap;
 use flume::Receiver;
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadState {
@@ -147,6 +148,18 @@ impl Session {
         add_torrent: AddTorrentOptions,
     ) -> anyhow::Result<AddTorrentResult> {
         let torrent = Torrent::new(&add_torrent.torrent_meta.clone())?;
+        if torrent.is_private() {
+            let disabled: Vec<&str> = torrent
+                .disabled_discovery_sources()
+                .iter()
+                .map(|source| source.as_str())
+                .collect();
+            info!(
+                name = %torrent.name,
+                disabled = %disabled.join(", "),
+                "private torrent: non-tracker peer sources are disabled"
+            );
+        }
         let torrent_meta = add_torrent.torrent_meta.clone();
         let (pr_tx, pr_rx) = flume::bounded::<PieceResult>(torrent.piece_hashes.len());
         let have_broadcast = Arc::new(tokio::sync::broadcast::channel(128).0);

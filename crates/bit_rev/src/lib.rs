@@ -1,4 +1,5 @@
 pub mod bitfield;
+pub mod discovery;
 pub mod file;
 pub mod handshake;
 pub mod identity;

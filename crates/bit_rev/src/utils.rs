@@ -110,6 +110,7 @@ mod tests {
             length: offset,
             files,
             name: "t".into(),
+            private: false,
         }
     }
 
