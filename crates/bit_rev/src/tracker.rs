@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use crate::{
     file::{self, AnnounceEvent, AnnounceParams, TorrentMeta},
+    identity::TrackerIdentity,
     peer::BencodeResponse,
     peer_connection::TorrentDownloadedState,
     protocol_udp::{self, AnnounceLimits, UdpTracker},
@@ -125,6 +126,19 @@ pub struct HttpAnnounceContext {
     pub port: u16,
     pub download_state: Arc<Mutex<DownloadState>>,
     pub torrent_downloaded_state: Arc<TorrentDownloadedState>,
+}
+
+impl HttpAnnounceContext {
+    /// Move to a different tracker URL and mint a fresh announce `key` (BEP-0027).
+    pub fn switch_tracker(&mut self, url: impl Into<String>) -> bool {
+        let mut identity = TrackerIdentity::with_key(self.tracker_url.clone(), self.announce_key);
+        let switched = identity.switch_url(url);
+        if switched {
+            self.tracker_url = identity.url().to_string();
+            self.announce_key = identity.key();
+        }
+        switched
+    }
 }
 
 enum Wake {
@@ -437,5 +451,32 @@ mod tests {
         let second = http_client();
         drop((first, second));
         let _ = build_http_client();
+    }
+
+    #[test]
+    fn switch_tracker_rotates_announce_key() {
+        let mut ctx = HttpAnnounceContext {
+            client: build_http_client(),
+            torrent_meta: crate::file::from_bytes(
+                b"d8:announce31:http://tracker.example/announce4:infod6:lengthi4e4:name8:tiny.bin12:piece lengthi16384e6:pieces20:01234567890123456789ee",
+            )
+            .expect("meta"),
+            peer_id: *b"-BR0100-0123456789ab",
+            tracker_url: "http://a.example/announce".into(),
+            announce_key: 42,
+            port: 6881,
+            download_state: Arc::new(Mutex::new(DownloadState::Downloading)),
+            torrent_downloaded_state: Arc::new(TorrentDownloadedState {
+                semaphore: tokio::sync::Semaphore::new(1),
+                pieces: vec![],
+            }),
+        };
+
+        assert!(!ctx.switch_tracker("http://a.example/announce"));
+        assert_eq!(ctx.announce_key, 42);
+
+        assert!(ctx.switch_tracker("http://b.example/announce"));
+        assert_eq!(ctx.tracker_url, "http://b.example/announce");
+        assert_ne!(ctx.announce_key, 42);
     }
 }

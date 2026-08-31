@@ -1,11 +1,12 @@
-use rand::Rng;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use tokio::{select, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
+    discovery::{DiscoverySource, SourceDenied, SourceRegistry},
     file::TorrentMeta,
+    identity::TrackerIdentity,
     peer::BencodeResponse,
     peer_connection::{
         FullPiece, PeerConnection, PeerHandler, PieceWorkState, TorrentDownloadedState,
@@ -25,7 +26,7 @@ pub struct TrackerPeers {
     pub pr_rx: flume::Receiver<PieceResult>,
     pub have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
     pub download_state: Arc<Mutex<DownloadState>>,
-    announce_key: u32,
+    sources: Arc<Mutex<SourceRegistry>>,
     cancel: CancellationToken,
 }
 
@@ -40,6 +41,7 @@ impl TrackerPeers {
         download_state: Arc<Mutex<DownloadState>>,
     ) -> TrackerPeers {
         let (sender, receiver) = flume::unbounded();
+        let sources = SourceRegistry::new(torrent_meta.torrent_file.info.is_private());
         TrackerPeers {
             torrent_meta,
             peer_id,
@@ -49,9 +51,17 @@ impl TrackerPeers {
             peer_states,
             have_broadcast,
             download_state,
-            announce_key: rand::thread_rng().gen(),
+            sources: Arc::new(Mutex::new(sources)),
             cancel: CancellationToken::new(),
         }
+    }
+
+    pub fn register_source(&self, source: DiscoverySource) -> Result<(), SourceDenied> {
+        self.sources.lock().unwrap().register(source)
+    }
+
+    pub fn allows_source(&self, source: DiscoverySource) -> bool {
+        self.sources.lock().unwrap().allows(source)
     }
 
     pub fn shutdown(&self) {
@@ -90,7 +100,6 @@ impl TrackerPeers {
         let piece_tx = self.piece_tx.clone();
         let have_broadcast = self.have_broadcast.clone();
         let download_state = self.download_state.clone();
-        let announce_key = self.announce_key;
         let cancel = self.cancel.clone();
         let http_client = tracker::http_client();
         let torrent_downloaded_state = Arc::new(TorrentDownloadedState {
@@ -106,13 +115,20 @@ impl TrackerPeers {
                 .collect(),
         });
 
+        if let Err(denied) = self.register_source(DiscoverySource::Tracker) {
+            debug!(error = %denied, "refused tracker source");
+            return;
+        }
+
         for tracker_url in all_tracker_urls {
+            // One key per tracker URL. Issue #19 should call switch_url on fallback.
+            let identity = TrackerIdentity::new(tracker_url);
             let ctx = HttpAnnounceContext {
                 client: http_client.clone(),
                 torrent_meta: torrent_meta.clone(),
                 peer_id,
-                tracker_url,
-                announce_key,
+                tracker_url: identity.url().to_string(),
+                announce_key: identity.key(),
                 port: 6881,
                 download_state: download_state.clone(),
                 torrent_downloaded_state: torrent_downloaded_state.clone(),
@@ -249,4 +265,48 @@ fn all_trackers(torrent_meta: &TorrentMeta) -> Vec<String> {
 
 pub async fn request_peers(uri: &str) -> Result<BencodeResponse, TrackerError> {
     tracker::announce(&tracker::http_client(), uri).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::from_filename;
+
+    fn fixture_meta(name: &str) -> TorrentMeta {
+        from_filename(&format!(
+            "{}/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("parse fixture")
+    }
+
+    fn tracker_peers(meta: TorrentMeta) -> TrackerPeers {
+        let (_, pr_rx) = flume::unbounded();
+        TrackerPeers::new(
+            meta,
+            15,
+            *b"-BR0100-0123456789ab",
+            Arc::new(PeerStates::default()),
+            Arc::new(tokio::sync::broadcast::channel(8).0),
+            pr_rx,
+            Arc::new(Mutex::new(DownloadState::Init)),
+        )
+    }
+
+    #[test]
+    fn private_torrent_refuses_non_tracker_source() {
+        let peers = tracker_peers(fixture_meta("private.torrent"));
+        assert!(peers.register_source(DiscoverySource::Tracker).is_ok());
+        assert!(peers.register_source(DiscoverySource::Dht).is_err());
+        assert!(peers.register_source(DiscoverySource::Pex).is_err());
+        assert!(peers.register_source(DiscoverySource::Lsd).is_err());
+        assert!(!peers.allows_source(DiscoverySource::Dht));
+    }
+
+    #[test]
+    fn public_torrent_accepts_dht() {
+        let peers = tracker_peers(fixture_meta("private-zero.torrent"));
+        assert!(peers.register_source(DiscoverySource::Dht).is_ok());
+        assert!(peers.allows_source(DiscoverySource::Dht));
+    }
 }
