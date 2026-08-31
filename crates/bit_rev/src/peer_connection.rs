@@ -1,6 +1,8 @@
 use std::{
+    collections::VecDeque,
+    future,
     sync::{
-        atomic::{AtomicBool, AtomicU32},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -16,11 +18,13 @@ use tracing::{debug, error, trace};
 
 use crate::{
     bitfield::Bitfield,
-    message::{self, Message, WriterRequest},
+    message::{self, validate_request, BlockRequest, Message, WriterRequest, MAX_UPLOAD_QUEUE},
     peer::PeerAddr,
-    peer_state::{PeerState, PeerStates},
+    peer_state::PeerStates,
     protocol::{Protocol, ProtocolError},
     session::{DownloadState, PieceWork},
+    storage::Storage,
+    torrent::Torrent,
     utils,
 };
 
@@ -50,6 +54,47 @@ impl TorrentDownloadedState {
             .filter(|pw| !pw.downloaded.load(std::sync::atomic::Ordering::Relaxed))
             .map(|pw| u64::from(pw.piece_work.length))
             .sum()
+    }
+
+    pub fn has_piece(&self, index: u32) -> bool {
+        self.pieces
+            .get(index as usize)
+            .map(|pw| pw.downloaded.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    pub fn piece_length(&self, index: u32) -> Option<u32> {
+        self.pieces
+            .get(index as usize)
+            .map(|pw| pw.piece_work.length)
+    }
+
+    pub fn piece_count(&self) -> usize {
+        self.pieces.len()
+    }
+
+    pub fn mark_all_downloaded(&self) {
+        for pw in &self.pieces {
+            pw.downloaded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn mark_downloaded(&self, index: u32) {
+        if let Some(pw) = self.pieces.get(index as usize) {
+            pw.downloaded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn our_bitfield(&self) -> Bitfield {
+        let mut bitfield = Bitfield::with_piece_count(self.pieces.len());
+        for (i, pw) in self.pieces.iter().enumerate() {
+            if pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
+                bitfield.set_piece(i);
+            }
+        }
+        bitfield
     }
 
     pub fn missing_pieces(&self) -> Vec<u32> {
@@ -231,6 +276,19 @@ impl PieceWorkState {
     }
 }
 
+pub struct PeerHandlerConfig {
+    pub peer: PeerAddr,
+    pub piece_tx: flume::Sender<FullPiece>,
+    pub peer_writer_tx: flume::Sender<WriterRequest>,
+    pub peers_state: Arc<PeerStates>,
+    pub torrent_downloaded_state: Arc<TorrentDownloadedState>,
+    pub download_state: Arc<Mutex<DownloadState>>,
+    pub storage: Arc<Storage>,
+    pub uploaded: Arc<AtomicU64>,
+    pub torrent: Arc<Torrent>,
+    pub choke_notify: Arc<Notify>,
+}
+
 pub struct PeerHandler {
     unchoke_notify: Notify,
     on_bitfield_notify: Notify,
@@ -243,44 +301,32 @@ pub struct PeerHandler {
     peer: PeerAddr,
     torrent_downloaded_state: Arc<TorrentDownloadedState>,
     download_state: Arc<Mutex<DownloadState>>,
+    storage: Arc<Storage>,
+    uploaded: Arc<AtomicU64>,
+    _torrent: Arc<Torrent>,
+    choke_notify: Arc<Notify>,
+    upload_queue: Mutex<VecDeque<BlockRequest>>,
 }
 
 impl PeerHandler {
-    pub fn new(
-        peer: PeerAddr,
-        unchoked_notify: Notify,
-        piece_tx: flume::Sender<FullPiece>,
-        peer_writer_tx: flume::Sender<WriterRequest>,
-        peers_state: Arc<PeerStates>,
-        //pieces: Vec<PieceWork>,
-        torrent_downloaded_state: Arc<TorrentDownloadedState>,
-        download_state: Arc<Mutex<DownloadState>>,
-    ) -> Self {
+    pub fn from_config(config: PeerHandlerConfig) -> Self {
         Self {
-            unchoke_notify: unchoked_notify,
+            unchoke_notify: Notify::new(),
             on_bitfield_notify: Notify::new(),
             downloaded: AtomicU32::new(0),
             chocked: AtomicBool::new(true),
-            peers_state,
+            peers_state: config.peers_state,
             requests_sem: Semaphore::new(0),
-            piece_tx,
-            peer_writer_tx,
-            peer,
-            torrent_downloaded_state,
-            download_state,
-            //torrent_downloaded_state: Arc::new(TorrentDownloadedState {
-            //
-            //    semaphore: Semaphore::new(1),
-            //    pieces: pieces
-            //        .into_iter()
-            //        .map(|pw| PieceWorkState {
-            //            piece_work: pw,
-            //            chuncks: Mutex::new(vec![]),
-            //            downloaded: AtomicBool::new(false),
-            //            reserverd: AtomicBool::new(false),
-            //        })
-            //        .collect(),
-            //}),
+            piece_tx: config.piece_tx,
+            peer_writer_tx: config.peer_writer_tx,
+            peer: config.peer,
+            torrent_downloaded_state: config.torrent_downloaded_state,
+            download_state: config.download_state,
+            storage: config.storage,
+            uploaded: config.uploaded,
+            _torrent: config.torrent,
+            choke_notify: config.choke_notify,
+            upload_queue: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -305,15 +351,113 @@ impl PeerHandler {
         self.get_download_state() == DownloadState::Downloading
     }
 
+    fn peer_has_needed_piece(&self) -> bool {
+        let Some(state) = self.peers_state.states.get(&self.peer) else {
+            return false;
+        };
+        self.torrent_downloaded_state
+            .pieces
+            .iter()
+            .enumerate()
+            .any(|(i, pw)| !pw.downloaded.load(Ordering::Relaxed) && state.bitfield.has_piece(i))
+    }
+
+    fn am_choking(&self) -> bool {
+        self.peers_state
+            .states
+            .get(&self.peer)
+            .map(|s| s.stats.am_choking.load(Ordering::Relaxed))
+            .unwrap_or(true)
+    }
+
+    fn on_incoming_request(&self, payload: Vec<u8>) -> Result<(), anyhow::Error> {
+        let req = BlockRequest::from_payload(&payload)
+            .ok_or_else(|| anyhow::anyhow!("truncated request from peer"))?;
+        let piece_length = self
+            .torrent_downloaded_state
+            .piece_length(req.index)
+            .ok_or_else(|| anyhow::anyhow!("request for unknown piece {}", req.index))?;
+        let have_piece = self.torrent_downloaded_state.has_piece(req.index);
+        validate_request(&req, piece_length, have_piece)
+            .map_err(|e| anyhow::anyhow!("invalid request {:?}: {:?}", req, e))?;
+
+        if self.am_choking() {
+            debug!("ignoring request while choking {:?}", req);
+            return Ok(());
+        }
+
+        let mut queue = self.upload_queue.lock().unwrap();
+        if queue.len() >= MAX_UPLOAD_QUEUE {
+            debug!("upload queue full, dropping request {:?}", req);
+            return Ok(());
+        }
+        queue.push_back(req);
+        drop(queue);
+        if let Some(state) = self.peers_state.states.get(&self.peer) {
+            state.stats.upload_notify.notify_waiters();
+        }
+        Ok(())
+    }
+
+    pub async fn task_peer_uploader(&self) -> Result<(), anyhow::Error> {
+        loop {
+            let stats = self
+                .peers_state
+                .states
+                .get(&self.peer)
+                .map(|s| s.stats.clone());
+            if let Some(stats) = stats {
+                stats.upload_notify.notified().await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
+            loop {
+                if self.am_choking() {
+                    self.upload_queue.lock().unwrap().clear();
+                    break;
+                }
+                let req = self.upload_queue.lock().unwrap().pop_front();
+                let Some(req) = req else {
+                    break;
+                };
+                let data = self
+                    .storage
+                    .read_block(req.index, req.begin, req.length)
+                    .await?;
+                let length = data.len() as u64;
+                if self
+                    .peer_writer_tx
+                    .send(WriterRequest::Message(message::format_piece(
+                        req.index, req.begin, data,
+                    )))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                self.uploaded.fetch_add(length, Ordering::Relaxed);
+                if let Some(state) = self.peers_state.states.get(&self.peer) {
+                    state
+                        .stats
+                        .bytes_uploaded
+                        .fetch_add(length, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     // The job of this is to request chunks and also to keep peer alive.
     // The moment this ends, the peer is disconnected.
     pub async fn task_peer_chunk_requester(&self) -> Result<(), anyhow::Error> {
-        let notfied = self.on_bitfield_notify.notified();
-        let user_state = self.peers_state.states.get(&self.peer);
-        if let Some(state) = user_state {
-            if state.bitfield.is_empty() {
-                notfied.await;
-            }
+        let needs_bitfield = self
+            .peers_state
+            .states
+            .get(&self.peer)
+            .map(|state| state.bitfield.is_empty())
+            .unwrap_or(true);
+        if needs_bitfield {
+            self.on_bitfield_notify.notified().await;
         }
 
         let mut update_interest = {
@@ -327,6 +471,9 @@ impl PeerHandler {
                         trace!("sending not interested");
                         WriterRequest::Message(Message::NotInterested)
                     })?;
+                    if let Some(mut state) = h.peers_state.states.get_mut(&h.peer) {
+                        state.set_am_interested(new_value);
+                    }
                     current = new_value;
                 }
                 Ok(())
@@ -334,9 +481,18 @@ impl PeerHandler {
         };
 
         loop {
-            // Wait while not downloading
             while !self.is_downloading() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            if self.torrent_downloaded_state.is_complete() || !self.peer_has_needed_piece() {
+                update_interest(self, false)?;
+                if self.torrent_downloaded_state.is_complete() {
+                    trace!("torrent complete, staying connected to seed");
+                    future::pending::<()>().await;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
             }
 
             update_interest(self, true)?;
@@ -349,8 +505,9 @@ impl PeerHandler {
             trace!("unchoke received");
 
             if self.torrent_downloaded_state.is_complete() {
-                trace!("TORRENT IS COMPLETE");
-                return Ok(());
+                update_interest(self, false)?;
+                trace!("torrent complete, staying connected to seed");
+                future::pending::<()>().await;
             }
 
             let piece = self
@@ -359,8 +516,12 @@ impl PeerHandler {
                 .await;
 
             if piece.is_none() {
-                trace!("no more pieces to download");
-                return Ok(());
+                update_interest(self, false)?;
+                if self.torrent_downloaded_state.is_complete() {
+                    future::pending::<()>().await;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
             }
 
             let piece = piece.unwrap().piece_work;
@@ -407,21 +568,33 @@ impl PeerHandler {
         match message {
             Message::Choke => {
                 debug!("peer choked us");
-                self.chocked
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.chocked.store(true, Ordering::Relaxed);
+                if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+                    state.set_peer_choking(true);
+                }
             }
             Message::Unchoke => {
                 debug!("peer unchoked us");
-                self.chocked
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.chocked.store(false, Ordering::Relaxed);
+                if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+                    state.set_peer_choking(false);
+                }
                 self.unchoke_notify.notify_waiters();
                 self.requests_sem.add_permits(128);
             }
             Message::Interested => {
                 debug!("peer is interested");
+                if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+                    state.set_peer_interested(true);
+                }
+                self.choke_notify.notify_waiters();
             }
             Message::NotInterested => {
                 debug!("peer is not interested");
+                if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+                    state.set_peer_interested(false);
+                }
+                self.choke_notify.notify_waiters();
             }
             Message::Have(h) => {
                 let p_state = self.peers_state.states.get_mut(&self.peer);
@@ -433,28 +606,24 @@ impl PeerHandler {
             }
             Message::Bitfield(vec) => {
                 debug!("peer sent bitfield");
-                let p_state = self.peers_state.states.get_mut(&self.peer);
-
-                if let Some(mut ps) = p_state {
+                if let Some(mut ps) = self.peers_state.states.get_mut(&self.peer) {
                     ps.bitfield = Bitfield::new(vec);
-                } else {
-                    self.peers_state.states.insert(
-                        self.peer,
-                        PeerState {
-                            bitfield: Bitfield::new(vec),
-                            peer_interested: false,
-                        },
-                    );
                 }
 
                 self.on_bitfield_notify.notify_waiters();
             }
-            Message::Request(_) => {
-                debug!("peer requested piece, not implemented");
+            Message::Request(payload) => {
+                self.on_incoming_request(payload)?;
             }
             Message::Piece(piece_chunk) => {
                 self.downloaded
-                    .fetch_add(piece_chunk.length, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(piece_chunk.length, Ordering::Relaxed);
+                if let Some(state) = self.peers_state.states.get(&self.peer) {
+                    state
+                        .stats
+                        .bytes_downloaded
+                        .fetch_add(piece_chunk.length as u64, Ordering::Relaxed);
+                }
                 self.requests_sem.add_permits(1);
                 self.torrent_downloaded_state.set_chuncks(
                     piece_chunk.index,
@@ -493,9 +662,14 @@ impl PeerHandler {
                     piece_chunk.length
                 );
             }
-            Message::Cancel(_) => {
-                debug!("peer canceled request");
-                //trace!("peer canceled request");
+            Message::Cancel(payload) => {
+                if let Some(req) = BlockRequest::from_payload(&payload) {
+                    self.upload_queue
+                        .lock()
+                        .unwrap()
+                        .retain(|queued| *queued != req);
+                    debug!("peer canceled request {:?}", req);
+                }
             }
             message => {
                 debug!("received unsupported message {:?}, ignoring", message);
@@ -533,7 +707,7 @@ impl PeerConnection {
     pub async fn manage_peer_incoming(
         &self,
         peer_writer_rx: flume::Receiver<WriterRequest>,
-        mut have_broadcast: tokio::sync::broadcast::Receiver<u32>,
+        have_broadcast: tokio::sync::broadcast::Receiver<u32>,
     ) -> anyhow::Result<()> {
         let connect = async {
             TcpStream::connect(self.peer)
@@ -548,10 +722,42 @@ impl PeerConnection {
 
         let protocol = Arc::new(Protocol::connect(self.peer, self.info_hash, self.peer_id).await?);
         let _handshake = protocol.complete_handshake(&mut stream).await?;
-        protocol.send_unchoke(&mut stream).await?;
-        protocol.send_interested(&mut stream).await?;
+        self.send_initial_bitfield(&protocol, &mut stream).await?;
+        self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
+            .await
+    }
 
-        // manage peer
+    pub async fn manage_incoming_stream(
+        &self,
+        mut stream: TcpStream,
+        peer_writer_rx: flume::Receiver<WriterRequest>,
+        have_broadcast: tokio::sync::broadcast::Receiver<u32>,
+    ) -> anyhow::Result<()> {
+        let protocol = Arc::new(Protocol::connect(self.peer, self.info_hash, self.peer_id).await?);
+        self.send_initial_bitfield(&protocol, &mut stream).await?;
+        self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
+            .await
+    }
+
+    async fn send_initial_bitfield(
+        &self,
+        protocol: &Protocol,
+        stream: &mut TcpStream,
+    ) -> anyhow::Result<()> {
+        let bitfield = self.handler.torrent_downloaded_state.our_bitfield();
+        if !bitfield.is_empty() {
+            protocol.send_bitfield(stream, bitfield.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    async fn manage_established(
+        &self,
+        mut stream: TcpStream,
+        protocol: Arc<Protocol>,
+        peer_writer_rx: flume::Receiver<WriterRequest>,
+        mut have_broadcast: tokio::sync::broadcast::Receiver<u32>,
+    ) -> anyhow::Result<()> {
         let (mut read, mut write) = stream.split();
 
         let writer = {
@@ -657,6 +863,92 @@ impl PeerConnection {
     }
 }
 
+pub struct SpawnPeerParams {
+    pub peer: PeerAddr,
+    pub info_hash: [u8; 20],
+    pub peer_id: [u8; 20],
+    pub piece_tx: flume::Sender<FullPiece>,
+    pub have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
+    pub torrent_downloaded_state: Arc<TorrentDownloadedState>,
+    pub peer_states: Arc<PeerStates>,
+    pub download_state: Arc<Mutex<DownloadState>>,
+    pub storage: Arc<Storage>,
+    pub uploaded: Arc<AtomicU64>,
+    pub torrent: Arc<Torrent>,
+    pub choke_notify: Arc<Notify>,
+    pub incoming: Option<TcpStream>,
+    pub global_peers: Arc<std::sync::atomic::AtomicUsize>,
+    pub max_peers_per_torrent: usize,
+    pub max_peers_global: usize,
+}
+
+pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
+    let global = params.global_peers.load(Ordering::Relaxed);
+    if global >= params.max_peers_global {
+        debug!(peer = %params.peer, "global connection cap reached");
+        return false;
+    }
+    if params.peer_states.len() >= params.max_peers_per_torrent {
+        debug!(peer = %params.peer, "per-torrent connection cap reached");
+        return false;
+    }
+
+    let (peer_writer_tx, peer_writer_rx) = flume::unbounded();
+    if !params
+        .peer_states
+        .insert_live(params.peer, peer_writer_tx.clone())
+    {
+        return false;
+    }
+    params.global_peers.fetch_add(1, Ordering::Relaxed);
+
+    tokio::spawn(async move {
+        let handler = Arc::new(PeerHandler::from_config(PeerHandlerConfig {
+            peer: params.peer,
+            piece_tx: params.piece_tx,
+            peer_writer_tx,
+            peers_state: params.peer_states.clone(),
+            torrent_downloaded_state: params.torrent_downloaded_state,
+            download_state: params.download_state,
+            storage: params.storage,
+            uploaded: params.uploaded,
+            torrent: params.torrent,
+            choke_notify: params.choke_notify,
+        }));
+        let connection = PeerConnection::new(
+            params.peer,
+            params.info_hash,
+            params.peer_id,
+            handler.clone(),
+        );
+        let requester = handler.task_peer_chunk_requester();
+        let uploader = handler.task_peer_uploader();
+        let have_rx = params.have_broadcast.subscribe();
+        let result = match params.incoming {
+            Some(stream) => {
+                tokio::select! {
+                    r = connection.manage_incoming_stream(stream, peer_writer_rx, have_rx) => r,
+                    r = requester => r,
+                    r = uploader => r,
+                }
+            }
+            None => {
+                tokio::select! {
+                    r = connection.manage_peer_incoming(peer_writer_rx, have_rx) => r,
+                    r = requester => r,
+                    r = uploader => r,
+                }
+            }
+        };
+        if let Err(e) = result {
+            debug!("error managing peer: {:#}", e);
+        }
+        handler.on_peer_died();
+        params.global_peers.fetch_sub(1, Ordering::Relaxed);
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +1044,22 @@ mod tests {
         assert!(s.set_downloaded_if_all_chunks(1).is_some());
         assert!(s.pieces[1].downloaded.load(Ordering::Relaxed));
         assert!(s.is_complete());
+    }
+
+    #[test]
+    fn has_piece_and_bitfield_follow_downloaded_flags() {
+        let s = state(3, 16);
+        assert!(!s.has_piece(0));
+        assert_eq!(s.piece_length(1), Some(16));
+        assert_eq!(s.piece_count(), 3);
+        s.mark_downloaded(1);
+        assert!(s.has_piece(1));
+        let bf = s.our_bitfield();
+        assert!(!bf.has_piece(0));
+        assert!(bf.has_piece(1));
+        s.mark_all_downloaded();
+        assert!(s.is_complete());
+        assert!(s.has_piece(0) && s.has_piece(2));
     }
 
     #[test]
