@@ -123,41 +123,27 @@ impl TorrentDownloadedState {
     }
 
     pub async fn get_and_reserve_piece(&self, peer: PeerAddr) -> Option<&PieceWorkState> {
-        //loop {
-        //    if let Ok(acq) = self.semaphore.try_acquire() {
-        //        break acq.forget();
-        //    } else {
-        //        sleep(Duration::from_secs(1)).await;
-        //    }
-        //}
+        self.get_and_reserve_piece_if(peer, |_| true).await
+    }
 
+    pub async fn get_and_reserve_piece_if(
+        &self,
+        peer: PeerAddr,
+        has_piece: impl Fn(u32) -> bool,
+    ) -> Option<&PieceWorkState> {
         for pw in self.pieces.iter() {
             if pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
-
-            //if pw
-            //    .reserverd
-            //    .swap(true, std::sync::atomic::Ordering::Relaxed)
-            //{
-            //    continue;
-            //}
+            if !has_piece(pw.piece_work.index) {
+                continue;
+            }
 
             let mut reserved = pw.reserved.lock().unwrap();
-
-            //if let Some(p) = reserved.as_ref() {
-            //    if *p == peer {
-            //        self.semaphore.add_permits(1);
-            //        return Some(pw);
-            //    }
-            //}
-
             if reserved.is_some() {
                 continue;
             }
 
-            //pw.reserverd
-            //    .store(true, std::sync::atomic::Ordering::Relaxed);
             reserved.replace(peer);
             drop(reserved);
             self.semaphore.add_permits(1);
@@ -167,6 +153,9 @@ impl TorrentDownloadedState {
 
         for pw in self.pieces.iter() {
             if pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            if !has_piece(pw.piece_work.index) {
                 continue;
             }
 
@@ -212,6 +201,7 @@ impl TorrentDownloadedState {
         }
         self.get_and_reserve_piece(peer).await
     }
+
     pub fn remove_downloaded(&self, index: u32) {
         for pw in self.pieces.iter() {
             if pw.piece_work.index == index {
@@ -222,17 +212,24 @@ impl TorrentDownloadedState {
         }
     }
 
+    pub fn release_piece(&self, index: u32) {
+        if let Some(pw) = self.pieces.get(index as usize) {
+            *pw.reserved.lock().unwrap() = None;
+            if !pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
+                pw.chuncks.lock().unwrap().clear();
+            }
+        }
+    }
+
     pub fn remove_reserved(&self, peer: PeerAddr) {
         for pw in self.pieces.iter() {
-            //if pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
-            //    continue;
-            //}
-
             let mut reserved = pw.reserved.lock().unwrap();
             if let Some(p) = reserved.as_ref() {
                 if *p == peer {
                     reserved.take();
-                    //self.semaphore.add_permits(1);
+                    if !pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
+                        pw.chuncks.lock().unwrap().clear();
+                    }
                 }
             }
         }
@@ -245,6 +242,9 @@ impl TorrentDownloadedState {
         let mut reserved = pw.reserved.lock().unwrap();
         if reserved.as_ref() == Some(&peer) {
             reserved.take();
+            if !pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
+                pw.chuncks.lock().unwrap().clear();
+            }
             true
         } else {
             false
@@ -770,11 +770,22 @@ impl PeerHandler {
                 future::pending::<()>().await;
             }
 
-            let preferred = self.preferred_piece_indices();
-            let piece = self
+            let has_piece = |index: u32| self.peer_has_piece(index);
+            let preferred: Vec<u32> = self
+                .preferred_piece_indices()
+                .into_iter()
+                .filter(|&index| has_piece(index))
+                .collect();
+            let piece = if let Some(pw) = self
                 .torrent_downloaded_state
-                .get_and_reserve_piece_preferring(self.peer, &preferred)
-                .await;
+                .reserve_first_available(self.peer, &preferred)
+            {
+                Some(pw)
+            } else {
+                self.torrent_downloaded_state
+                    .get_and_reserve_piece_if(self.peer, has_piece)
+                    .await
+            };
 
             if piece.is_none() {
                 update_interest(self, false)?;
@@ -943,8 +954,8 @@ impl PeerHandler {
                         trace!("piece index {} is corrupted", piece_chunk.index);
                         self.torrent_downloaded_state
                             .remove_downloaded(piece_chunk.index);
-                        //self.torrent_downloaded_state.remove_reserved(self.peer);
-                        //return Ok(());
+                        self.torrent_downloaded_state
+                            .release_piece(piece_chunk.index);
                     }
                 }
 
@@ -1394,6 +1405,47 @@ mod tests {
             .unwrap();
         assert_eq!(pw.piece_work.index, 2);
         assert_eq!(*pw.reserved.lock().unwrap(), Some(p1));
+    }
+
+    #[tokio::test]
+    async fn get_and_reserve_piece_if_skips_pieces_the_peer_lacks() {
+        let s = state(3, 16);
+        let p1 = peer(6881);
+        let taken = s
+            .get_and_reserve_piece_if(p1, |index| index == 2)
+            .await
+            .unwrap();
+        assert_eq!(taken.piece_work.index, 2);
+        assert_eq!(*s.pieces[2].reserved.lock().unwrap(), Some(p1));
+        assert!(s.pieces[0].reserved.lock().unwrap().is_none());
+        assert!(s.pieces[1].reserved.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn release_piece_clears_reservation_and_incomplete_chunks() {
+        let s = state(1, 16);
+        let p1 = peer(6881);
+        s.get_and_reserve_piece(p1).await.unwrap();
+        s.set_chuncks(0, 0, vec![1u8; 8]);
+
+        s.release_piece(0);
+
+        assert!(s.pieces[0].reserved.lock().unwrap().is_none());
+        assert!(s.pieces[0].chuncks.lock().unwrap().is_empty());
+        assert!(!s.pieces[0].downloaded.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn remove_reserved_clears_incomplete_chunks() {
+        let s = state(1, 16);
+        let p1 = peer(6881);
+        s.get_and_reserve_piece(p1).await.unwrap();
+        s.set_chuncks(0, 0, vec![1u8; 8]);
+
+        s.remove_reserved(p1);
+
+        assert!(s.pieces[0].reserved.lock().unwrap().is_none());
+        assert!(s.pieces[0].chuncks.lock().unwrap().is_empty());
     }
 
     #[test]
