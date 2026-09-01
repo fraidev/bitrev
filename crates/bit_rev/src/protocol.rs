@@ -20,10 +20,6 @@ pub enum ProtocolError {
     Io(std::io::Error),
     #[error("Info hash is not equal")]
     InfoHashIsNotEqual,
-    #[error("Expected bitfield id")]
-    ExpectedBitfieldId,
-    #[error("Message is none")]
-    MessageIsNone,
 }
 
 #[derive(Debug, Clone)]
@@ -208,7 +204,7 @@ impl Protocol {
         stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
     ) -> Result<Handshake, ProtocolError> {
         let timeout = tokio::time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), async {
-            let handshake = Handshake::new(self.info_hash, self.peer_id);
+            let handshake = Handshake::outgoing(self.info_hash, self.peer_id);
             let handshake_bytes = handshake.serialize();
             stream
                 .write_all(&handshake_bytes)
@@ -244,17 +240,27 @@ impl Protocol {
         }
     }
 
+    pub async fn send_message(
+        &self,
+        mut stream: impl AsyncWriteExt + Unpin,
+        msg: Message,
+    ) -> Result<(), ProtocolError> {
+        let msg_bytes = message::serialize(Some(msg));
+        stream
+            .write_all(&msg_bytes)
+            .await
+            .map_err(ProtocolError::Io)
+    }
+
     pub async fn recv_bitfield(
         &self,
         stream: &mut (impl AsyncReadExt + Unpin),
     ) -> Result<Vec<u8>, ProtocolError> {
         let func = async {
             match self.read(stream).await? {
-                None => Err(ProtocolError::MessageIsNone),
-                Some(msg) => match msg {
-                    Message::Bitfield(b) => Ok(b),
-                    _ => Err(ProtocolError::ExpectedBitfieldId),
-                },
+                Some(Message::Bitfield(b)) => Ok(b),
+                // BEP-0003: a peer may omit the bitfield, meaning it has no pieces.
+                Some(_) | None => Ok(Vec::new()),
             }
         };
         match tokio::time::timeout(Duration::from_secs(6), func).await {
@@ -307,6 +313,49 @@ mod tests {
         assert_eq!(handshake.info_hash, INFO_HASH);
         assert_eq!(handshake.peer_id, REMOTE_PEER_ID);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_handshake_advertises_fast_extension() {
+        let proto = protocol().await;
+        let (mut client, mut server) = tokio::io::duplex(256);
+
+        let server_task = tokio::spawn(async move {
+            let mut client_hs = [0u8; 68];
+            server.read_exact(&mut client_hs).await.unwrap();
+            assert_eq!(client_hs[27] & crate::handshake::FAST_EXTENSION_FLAG, 0x04);
+            assert_eq!(&client_hs[20..27], &[0u8; 7]);
+            let reply = Handshake::new(INFO_HASH, REMOTE_PEER_ID).serialize();
+            server.write_all(&reply).await.unwrap();
+        });
+
+        proto.complete_handshake(&mut client).await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_bitfield_allows_omitted_or_non_bitfield_first() {
+        let proto = protocol().await;
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&[0, 0, 0, 0]).await.unwrap();
+        drop(writer);
+        let empty = proto.recv_bitfield(&mut reader).await.unwrap();
+        assert!(empty.is_empty());
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let interested = message::serialize(Some(Message::Interested));
+        writer.write_all(&interested).await.unwrap();
+        drop(writer);
+        let empty = proto.recv_bitfield(&mut reader).await.unwrap();
+        assert!(empty.is_empty());
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let bitfield = message::serialize(Some(Message::Bitfield(vec![0b1010_0000])));
+        writer.write_all(&bitfield).await.unwrap();
+        drop(writer);
+        let got = proto.recv_bitfield(&mut reader).await.unwrap();
+        assert_eq!(got, vec![0b1010_0000]);
     }
 
     #[tokio::test]

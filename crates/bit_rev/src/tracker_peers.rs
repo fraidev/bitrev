@@ -225,6 +225,7 @@ async fn process_peers(
             torrent: runtime.torrent.clone(),
             choke_notify: runtime.choke_notify.clone(),
             incoming: None,
+            incoming_fast_extension: None,
             global_peers: runtime.global_peers.clone(),
             max_peers_per_torrent: runtime.max_peers_per_torrent,
             max_peers_global: runtime.max_peers_global,

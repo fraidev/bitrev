@@ -1,3 +1,4 @@
+pub mod allowed_fast;
 pub mod bitfield;
 pub mod choke;
 pub mod discovery;

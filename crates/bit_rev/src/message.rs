@@ -11,7 +11,11 @@ pub enum MessageId {
     MsgRequest = 6,
     MsgPiece = 7,
     MsgCancel = 8,
-    MsgReject = 16,
+    MsgSuggestPiece = 13,
+    MsgHaveAll = 14,
+    MsgHaveNone = 15,
+    MsgRejectRequest = 16,
+    MsgAllowedFast = 17,
     MsgHashRequest = 21,
     MsgHashes = 22,
     MsgHashReject = 23,
@@ -35,7 +39,11 @@ pub enum Message {
     Request(Vec<u8>),
     Piece(PieceChunk),
     Cancel(Vec<u8>),
-    Reject,
+    SuggestPiece(u32),
+    HaveAll,
+    HaveNone,
+    RejectRequest { index: u32, begin: u32, length: u32 },
+    AllowedFast(u32),
     HashRequest,
     Hashes(Vec<u8>),
     HashReject,
@@ -66,7 +74,22 @@ impl From<MessageInner> for Message {
                 })
             }
             MessageId::MsgCancel => Message::Cancel(inner.payload[0..12].to_vec()),
-            MessageId::MsgReject => Message::Reject,
+            MessageId::MsgSuggestPiece => {
+                Message::SuggestPiece(u32::from_be_bytes(inner.payload[0..4].try_into().unwrap()))
+            }
+            MessageId::MsgHaveAll => Message::HaveAll,
+            MessageId::MsgHaveNone => Message::HaveNone,
+            MessageId::MsgRejectRequest => {
+                let req = BlockRequest::from_payload(&inner.payload).unwrap();
+                Message::RejectRequest {
+                    index: req.index,
+                    begin: req.begin,
+                    length: req.length,
+                }
+            }
+            MessageId::MsgAllowedFast => {
+                Message::AllowedFast(u32::from_be_bytes(inner.payload[0..4].try_into().unwrap()))
+            }
             MessageId::MsgHashRequest => Message::HashRequest,
             MessageId::MsgHashes => Message::Hashes(inner.payload),
             MessageId::MsgHashReject => Message::HashReject,
@@ -92,7 +115,11 @@ impl Display for MessageInner {
             MessageId::MsgRequest => "REQUEST",
             MessageId::MsgPiece => "PIECE",
             MessageId::MsgCancel => "CANCEL",
-            MessageId::MsgReject => "REJECT",
+            MessageId::MsgSuggestPiece => "SUGGEST_PIECE",
+            MessageId::MsgHaveAll => "HAVE_ALL",
+            MessageId::MsgHaveNone => "HAVE_NONE",
+            MessageId::MsgRejectRequest => "REJECT_REQUEST",
+            MessageId::MsgAllowedFast => "ALLOWED_FAST",
             MessageId::MsgHashRequest => "HASH_REQUEST",
             MessageId::MsgHashes => "HASHES",
             MessageId::MsgHashReject => "HASH_REJECT",
@@ -110,7 +137,7 @@ pub enum MessageError {
 pub const MAX_INCOMING_REQUEST_LENGTH: u32 = 128 * 1024;
 pub const MAX_UPLOAD_QUEUE: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockRequest {
     pub index: u32,
     pub begin: u32,
@@ -187,6 +214,27 @@ pub fn format_have(index: u32) -> Message {
     let mut payload = Vec::with_capacity(4);
     payload.extend_from_slice(&index.to_be_bytes());
     Message::Have(index)
+}
+
+pub fn format_reject_request(index: u32, begin: u32, length: u32) -> Message {
+    Message::RejectRequest {
+        index,
+        begin,
+        length,
+    }
+}
+
+impl Message {
+    pub fn is_fast_extension(&self) -> bool {
+        matches!(
+            self,
+            Message::SuggestPiece(_)
+                | Message::HaveAll
+                | Message::HaveNone
+                | Message::RejectRequest { .. }
+                | Message::AllowedFast(_)
+        )
+    }
 }
 
 //pub fn parse_piece(buf: &mut [u8]) -> Result<Piece, MessageError> {
@@ -285,7 +333,27 @@ pub fn serialize(msg: Option<Message>) -> Vec<u8> {
                     (MessageId::MsgPiece, payload)
                 }
                 Message::Cancel(payload) => (MessageId::MsgCancel, payload),
-                Message::Reject => (MessageId::MsgReject, vec![]),
+                Message::SuggestPiece(index) => {
+                    (MessageId::MsgSuggestPiece, index.to_be_bytes().to_vec())
+                }
+                Message::HaveAll => (MessageId::MsgHaveAll, vec![]),
+                Message::HaveNone => (MessageId::MsgHaveNone, vec![]),
+                Message::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                } => (
+                    MessageId::MsgRejectRequest,
+                    BlockRequest {
+                        index,
+                        begin,
+                        length,
+                    }
+                    .to_payload(),
+                ),
+                Message::AllowedFast(index) => {
+                    (MessageId::MsgAllowedFast, index.to_be_bytes().to_vec())
+                }
                 Message::HashRequest => (MessageId::MsgHashRequest, vec![]),
                 Message::Hashes(payload) => (MessageId::MsgHashes, payload),
                 Message::HashReject => (MessageId::MsgHashReject, vec![]),
@@ -326,7 +394,11 @@ pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Option<Message> {
         6 => MessageId::MsgRequest,
         7 => MessageId::MsgPiece,
         8 => MessageId::MsgCancel,
-        16 => MessageId::MsgReject,
+        13 => MessageId::MsgSuggestPiece,
+        14 => MessageId::MsgHaveAll,
+        15 => MessageId::MsgHaveNone,
+        16 => MessageId::MsgRejectRequest,
+        17 => MessageId::MsgAllowedFast,
         21 => MessageId::MsgHashRequest,
         22 => MessageId::MsgHashes,
         23 => MessageId::MsgHashReject,
@@ -334,8 +406,16 @@ pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Option<Message> {
     };
 
     match message_id {
-        MessageId::MsgHave if payload.len() < 4 => return None,
-        MessageId::MsgRequest | MessageId::MsgCancel if payload.len() < 12 => return None,
+        MessageId::MsgHave | MessageId::MsgSuggestPiece | MessageId::MsgAllowedFast
+            if payload.len() < 4 =>
+        {
+            return None
+        }
+        MessageId::MsgRequest | MessageId::MsgCancel | MessageId::MsgRejectRequest
+            if payload.len() < 12 =>
+        {
+            return None
+        }
         MessageId::MsgPiece if payload.len() < 8 => return None,
         _ => {}
     }
@@ -542,7 +622,15 @@ mod tests {
             Message::Cancel(vec![
                 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
             ]),
-            Message::Reject,
+            Message::SuggestPiece(42),
+            Message::HaveAll,
+            Message::HaveNone,
+            Message::RejectRequest {
+                index: 4,
+                begin: 567,
+                length: 4321,
+            },
+            Message::AllowedFast(7),
             Message::HashRequest,
             Message::Hashes(vec![0x01, 0x02, 0x03]),
             Message::HashReject,
@@ -556,6 +644,34 @@ mod tests {
         // Keep-alive serializes to a zero length prefix. read maps length 0 to None.
         assert_eq!(serialize(Some(Message::KeepAlive)), vec![0, 0, 0, 0]);
         assert_eq!(round_trip(Message::KeepAlive), None);
+    }
+
+    #[test]
+    fn fast_extension_wire_bytes() {
+        assert_eq!(
+            serialize(Some(Message::HaveAll)),
+            vec![0x00, 0x00, 0x00, 0x01, 14]
+        );
+        assert_eq!(
+            serialize(Some(Message::HaveNone)),
+            vec![0x00, 0x00, 0x00, 0x01, 15]
+        );
+        assert_eq!(
+            serialize(Some(Message::SuggestPiece(42))),
+            vec![0x00, 0x00, 0x00, 0x05, 13, 0x00, 0x00, 0x00, 0x2a]
+        );
+        assert_eq!(
+            serialize(Some(Message::AllowedFast(7))),
+            vec![0x00, 0x00, 0x00, 0x05, 17, 0x00, 0x00, 0x00, 0x07]
+        );
+
+        let reject = format_reject_request(4, 567, 4321);
+        let Message::Request(request_payload) = format_request(4, 567, 4321) else {
+            panic!("format_request should produce Request");
+        };
+        let mut expected = vec![0x00, 0x00, 0x00, 0x0d, 16];
+        expected.extend_from_slice(&request_payload);
+        assert_eq!(serialize(Some(reject)), expected);
     }
 
     #[test]
@@ -576,6 +692,15 @@ mod tests {
             // Request payload shorter than 12 bytes
             (&[0, 0, 0, 9], &[6, 0, 0, 0, 1, 0, 0, 0, 0]),
             (&[0, 0, 0, 12], &[6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]),
+            // SuggestPiece payload shorter than 4 bytes
+            (&[0, 0, 0, 5], &[13]),
+            (&[0, 0, 0, 2], &[13, 0]),
+            // AllowedFast payload shorter than 4 bytes
+            (&[0, 0, 0, 5], &[17]),
+            (&[0, 0, 0, 2], &[17, 0]),
+            // RejectRequest payload shorter than 12 bytes
+            (&[0, 0, 0, 9], &[16, 0, 0, 0, 1, 0, 0, 0, 0]),
+            (&[0, 0, 0, 12], &[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]),
         ];
 
         for (length_buf, message_buf) in cases {
