@@ -1,11 +1,22 @@
 use thiserror::Error;
 
+/// Fast extension (BEP-0006): reserved[7] |= 0x04
+pub const FAST_EXTENSION_FLAG: u8 = 0x04;
+/// Extension protocol (BEP-0010): reserved[5] |= 0x10
+pub const EXTENSION_PROTOCOL_FLAG: u8 = 0x10;
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Handshake {
     pub pstr: String,
     pub reserved: [u8; 8],
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HandshakeCapabilities {
+    pub fast_extension: bool,
+    pub extension_protocol: bool,
 }
 
 #[derive(Error, Debug, PartialEq, Eq, Clone)]
@@ -23,6 +34,35 @@ impl Handshake {
             reserved: [0u8; 8],
             info_hash,
             peer_id,
+        }
+    }
+
+    pub fn outgoing(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+        let mut handshake = Self::new(info_hash, peer_id);
+        handshake.enable_fast_extension();
+        handshake
+    }
+
+    pub fn supports_fast_extension(&self) -> bool {
+        self.reserved[7] & FAST_EXTENSION_FLAG != 0
+    }
+
+    pub fn enable_fast_extension(&mut self) {
+        self.reserved[7] |= FAST_EXTENSION_FLAG;
+    }
+
+    pub fn supports_extension_protocol(&self) -> bool {
+        self.reserved[5] & EXTENSION_PROTOCOL_FLAG != 0
+    }
+
+    pub fn enable_extension_protocol(&mut self) {
+        self.reserved[5] |= EXTENSION_PROTOCOL_FLAG;
+    }
+
+    pub fn capabilities(&self) -> HandshakeCapabilities {
+        HandshakeCapabilities {
+            fast_extension: self.supports_fast_extension(),
+            extension_protocol: self.supports_extension_protocol(),
         }
     }
 
@@ -213,5 +253,52 @@ mod tests {
         assert_eq!(handshake.reserved[0], 0b1000_0001);
         assert_eq!(handshake.reserved[1], 0b1000_0000);
         assert_eq!(handshake.reserved[7], 0b0000_0001);
+    }
+
+    #[test]
+    fn new_handshake_has_zeroed_reserved() {
+        let handshake = Handshake::new(HASH_INFO, PEER_ID);
+        assert_eq!(handshake.reserved, [0u8; 8]);
+        assert!(!handshake.supports_fast_extension());
+        assert!(!handshake.supports_extension_protocol());
+        assert_eq!(handshake.capabilities(), HandshakeCapabilities::default());
+    }
+
+    #[test]
+    fn outgoing_sets_only_fast_extension_bit() {
+        let handshake = Handshake::outgoing(HASH_INFO, PEER_ID);
+        assert_eq!(handshake.reserved[7], FAST_EXTENSION_FLAG);
+        assert_eq!(&handshake.reserved[..7], &[0u8; 7]);
+        assert!(handshake.supports_fast_extension());
+        assert!(!handshake.supports_extension_protocol());
+        assert_eq!(
+            handshake.capabilities(),
+            HandshakeCapabilities {
+                fast_extension: true,
+                extension_protocol: false,
+            }
+        );
+    }
+
+    #[test]
+    fn enable_fast_extension_round_trip() {
+        let mut handshake = Handshake::new(HASH_INFO, PEER_ID);
+        assert!(!handshake.supports_fast_extension());
+        handshake.enable_fast_extension();
+        assert!(handshake.supports_fast_extension());
+        assert_eq!(handshake.reserved[7], FAST_EXTENSION_FLAG);
+        handshake.enable_fast_extension();
+        assert_eq!(handshake.reserved[7], FAST_EXTENSION_FLAG);
+    }
+
+    #[test]
+    fn enable_extension_protocol_round_trip() {
+        let mut handshake = Handshake::new(HASH_INFO, PEER_ID);
+        assert!(!handshake.supports_extension_protocol());
+        handshake.enable_extension_protocol();
+        assert!(handshake.supports_extension_protocol());
+        assert_eq!(handshake.reserved[5], EXTENSION_PROTOCOL_FLAG);
+        handshake.enable_extension_protocol();
+        assert_eq!(handshake.reserved[5], EXTENSION_PROTOCOL_FLAG);
     }
 }

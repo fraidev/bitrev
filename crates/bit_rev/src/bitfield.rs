@@ -15,6 +15,14 @@ impl Bitfield {
         }
     }
 
+    pub fn filled(piece_count: usize) -> Bitfield {
+        let mut bitfield = Self::with_piece_count(piece_count);
+        for index in 0..piece_count {
+            bitfield.set_piece(index);
+        }
+        bitfield
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -134,5 +142,15 @@ mod tests {
         bitfield.set_piece(9);
         assert!(bitfield.has_piece(9));
         assert!(!bitfield.has_piece(0));
+    }
+
+    #[test]
+    fn filled_sets_only_piece_count_bits() {
+        let bitfield = Bitfield::filled(10);
+        for index in 0..10 {
+            assert!(bitfield.has_piece(index));
+        }
+        assert!(!bitfield.has_piece(10));
+        assert_eq!(bitfield.as_bytes(), &[0b1111_1111, 0b1100_0000]);
     }
 }

@@ -411,6 +411,7 @@ impl Session {
             torrent: torrent.torrent.clone(),
             choke_notify: torrent.choke_notify.clone(),
             incoming: None,
+            incoming_fast_extension: None,
             global_peers: self.global_peers.clone(),
             max_peers_per_torrent: self.options.max_peers_per_torrent,
             max_peers_global: self.options.max_peers_global,
@@ -779,6 +780,7 @@ fn choke_all_peers(peer_states: &PeerStates) {
             if let Some(tx) = &state.writer_tx {
                 let _ = tx.send(WriterRequest::Message(Message::Choke));
             }
+            state.stats.upload_notify.notify_waiters();
         }
     }
 }
@@ -806,7 +808,7 @@ async fn handle_incoming(
         debug!(%addr, "incoming peer for unknown info hash");
         return;
     };
-    let reply = Handshake::new(handshake.info_hash, peer_id);
+    let reply = Handshake::outgoing(handshake.info_hash, peer_id);
     if let Err(e) = Protocol::write_handshake(&mut stream, &reply).await {
         debug!(%addr, error = %e, "failed to write handshake reply");
         return;
@@ -816,6 +818,7 @@ async fn handle_incoming(
         peer: addr,
         info_hash: handshake.info_hash,
         peer_id,
+        incoming_fast_extension: Some(handshake.supports_fast_extension()),
         piece_tx: torrent.piece_tx.clone(),
         have_broadcast: torrent.have_broadcast.clone(),
         torrent_downloaded_state: torrent.downloaded_state.clone(),
@@ -921,6 +924,7 @@ fn apply_choke(
                 if let Some(tx) = &state.writer_tx {
                     let _ = tx.send(WriterRequest::Message(Message::Choke));
                 }
+                state.stats.upload_notify.notify_waiters();
             }
             ChokeAction::Unchoke => {
                 state.set_am_choking(false);

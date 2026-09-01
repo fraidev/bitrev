@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     future,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -17,8 +17,12 @@ use tokio::{
 use tracing::{debug, error, trace};
 
 use crate::{
+    allowed_fast::{generate_allowed_fast_for_ip, DEFAULT_ALLOWED_FAST_SET_SIZE},
     bitfield::Bitfield,
-    message::{self, validate_request, BlockRequest, Message, WriterRequest, MAX_UPLOAD_QUEUE},
+    message::{
+        self, format_reject_request, validate_request, BlockRequest, Message, RequestError,
+        WriterRequest, MAX_UPLOAD_QUEUE,
+    },
     peer::PeerAddr,
     peer_state::PeerStates,
     protocol::{Protocol, ProtocolError},
@@ -171,6 +175,43 @@ impl TorrentDownloadedState {
 
         None
     }
+
+    pub fn try_reserve_piece(&self, index: u32, peer: PeerAddr) -> Option<&PieceWorkState> {
+        let pw = self.pieces.get(index as usize)?;
+        if pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let mut reserved = pw.reserved.lock().unwrap();
+        if reserved.is_some() {
+            return None;
+        }
+        reserved.replace(peer);
+        Some(pw)
+    }
+
+    pub fn reserve_first_available(
+        &self,
+        peer: PeerAddr,
+        candidates: &[u32],
+    ) -> Option<&PieceWorkState> {
+        for &index in candidates {
+            if let Some(pw) = self.try_reserve_piece(index, peer) {
+                return Some(pw);
+            }
+        }
+        None
+    }
+
+    pub async fn get_and_reserve_piece_preferring(
+        &self,
+        peer: PeerAddr,
+        preferred: &[u32],
+    ) -> Option<&PieceWorkState> {
+        if let Some(pw) = self.reserve_first_available(peer, preferred) {
+            return Some(pw);
+        }
+        self.get_and_reserve_piece(peer).await
+    }
     pub fn remove_downloaded(&self, index: u32) {
         for pw in self.pieces.iter() {
             if pw.piece_work.index == index {
@@ -194,6 +235,19 @@ impl TorrentDownloadedState {
                     //self.semaphore.add_permits(1);
                 }
             }
+        }
+    }
+
+    pub fn release_reservation(&self, index: u32, peer: PeerAddr) -> bool {
+        let Some(pw) = self.pieces.get(index as usize) else {
+            return false;
+        };
+        let mut reserved = pw.reserved.lock().unwrap();
+        if reserved.as_ref() == Some(&peer) {
+            reserved.take();
+            true
+        } else {
+            false
         }
     }
 
@@ -306,6 +360,11 @@ pub struct PeerHandler {
     _torrent: Arc<Torrent>,
     choke_notify: Arc<Notify>,
     upload_queue: Mutex<VecDeque<BlockRequest>>,
+    fast_extension: AtomicBool,
+    peer_allowed_fast: Mutex<HashSet<u32>>,
+    our_allowed_fast: Mutex<HashSet<u32>>,
+    suggested_pieces: Mutex<Vec<u32>>,
+    outstanding_requests: Mutex<HashSet<BlockRequest>>,
 }
 
 impl PeerHandler {
@@ -327,7 +386,98 @@ impl PeerHandler {
             _torrent: config.torrent,
             choke_notify: config.choke_notify,
             upload_queue: Mutex::new(VecDeque::new()),
+            fast_extension: AtomicBool::new(false),
+            peer_allowed_fast: Mutex::new(HashSet::new()),
+            our_allowed_fast: Mutex::new(HashSet::new()),
+            suggested_pieces: Mutex::new(Vec::new()),
+            outstanding_requests: Mutex::new(HashSet::new()),
         }
+    }
+
+    fn fast_extension(&self) -> bool {
+        self.fast_extension.load(Ordering::Relaxed)
+    }
+
+    fn set_fast_extension(&self, enabled: bool) {
+        self.fast_extension.store(enabled, Ordering::Relaxed);
+        if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+            state.fast_extension = enabled;
+        }
+    }
+
+    fn require_fast(&self) -> Result<(), anyhow::Error> {
+        if !self.fast_extension() {
+            anyhow::bail!("fast extension message without negotiation");
+        }
+        Ok(())
+    }
+
+    fn send_reject(&self, req: BlockRequest) {
+        if !self.fast_extension() {
+            return;
+        }
+        let _ = self
+            .peer_writer_tx
+            .send(WriterRequest::Message(format_reject_request(
+                req.index, req.begin, req.length,
+            )));
+    }
+
+    fn reject_upload_queue(&self, keep_allowed_fast: bool) {
+        let mut queue = self.upload_queue.lock().unwrap();
+        if !self.fast_extension() {
+            queue.clear();
+            return;
+        }
+        let allowed = self.our_allowed_fast.lock().unwrap().clone();
+        let mut keep = VecDeque::new();
+        while let Some(req) = queue.pop_front() {
+            if keep_allowed_fast && allowed.contains(&req.index) {
+                keep.push_back(req);
+            } else {
+                let _ = self
+                    .peer_writer_tx
+                    .send(WriterRequest::Message(format_reject_request(
+                        req.index, req.begin, req.length,
+                    )));
+            }
+        }
+        *queue = keep;
+    }
+
+    fn requeue_outstanding(&self) {
+        let outstanding: Vec<BlockRequest> =
+            self.outstanding_requests.lock().unwrap().drain().collect();
+        let mut pieces = HashSet::new();
+        for req in outstanding {
+            pieces.insert(req.index);
+            self.requests_sem.add_permits(1);
+        }
+        for index in pieces {
+            self.torrent_downloaded_state
+                .release_reservation(index, self.peer);
+        }
+    }
+
+    fn on_reject_request(&self, req: BlockRequest) -> Result<(), anyhow::Error> {
+        let known = self.outstanding_requests.lock().unwrap().remove(&req);
+        if !known {
+            anyhow::bail!("reject for request that was never sent");
+        }
+        self.torrent_downloaded_state
+            .release_reservation(req.index, self.peer);
+        self.requests_sem.add_permits(1);
+        Ok(())
+    }
+
+    fn is_allowed_fast_for_peer(&self, index: u32) -> bool {
+        self.our_allowed_fast.lock().unwrap().contains(&index)
+    }
+
+    fn preferred_piece_indices(&self) -> Vec<u32> {
+        let mut preferred = self.suggested_pieces.lock().unwrap().clone();
+        preferred.extend(self.peer_allowed_fast.lock().unwrap().iter().copied());
+        preferred
     }
 
     pub fn on_peer_died(&self) {
@@ -378,17 +528,34 @@ impl PeerHandler {
             .piece_length(req.index)
             .ok_or_else(|| anyhow::anyhow!("request for unknown piece {}", req.index))?;
         let have_piece = self.torrent_downloaded_state.has_piece(req.index);
-        validate_request(&req, piece_length, have_piece)
-            .map_err(|e| anyhow::anyhow!("invalid request {:?}: {:?}", req, e))?;
+        match validate_request(&req, piece_length, have_piece) {
+            Ok(()) => {}
+            Err(RequestError::MissingPiece) if self.fast_extension() => {
+                self.send_reject(req);
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("invalid request {:?}: {:?}", req, e));
+            }
+        }
 
-        if !self.is_downloading() || self.am_choking() {
-            debug!("ignoring request while paused or choking {:?}", req);
+        if !self.is_downloading() {
+            debug!("rejecting request while paused {:?}", req);
+            self.send_reject(req);
+            return Ok(());
+        }
+
+        if self.am_choking() && !(self.fast_extension() && self.is_allowed_fast_for_peer(req.index))
+        {
+            debug!("ignoring request while choking {:?}", req);
+            self.send_reject(req);
             return Ok(());
         }
 
         let mut queue = self.upload_queue.lock().unwrap();
         if queue.len() >= MAX_UPLOAD_QUEUE {
             debug!("upload queue full, dropping request {:?}", req);
+            self.send_reject(req);
             return Ok(());
         }
         queue.push_back(req);
@@ -402,7 +569,7 @@ impl PeerHandler {
     pub async fn task_peer_uploader(&self) -> Result<(), anyhow::Error> {
         loop {
             if !self.is_downloading() {
-                self.upload_queue.lock().unwrap().clear();
+                self.reject_upload_queue(false);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -420,18 +587,36 @@ impl PeerHandler {
             }
 
             loop {
-                if !self.is_downloading() || self.am_choking() {
-                    self.upload_queue.lock().unwrap().clear();
+                if !self.is_downloading() {
+                    self.reject_upload_queue(false);
                     break;
+                }
+                if self.am_choking() {
+                    self.reject_upload_queue(true);
+                    if self.upload_queue.lock().unwrap().is_empty() {
+                        break;
+                    }
                 }
                 let req = self.upload_queue.lock().unwrap().pop_front();
                 let Some(req) = req else {
                     break;
                 };
-                let data = self
+                if self.am_choking() && !self.is_allowed_fast_for_peer(req.index) {
+                    self.send_reject(req);
+                    continue;
+                }
+                let data = match self
                     .storage
                     .read_block(req.index, req.begin, req.length)
-                    .await?;
+                    .await
+                {
+                    Ok(data) => data,
+                    Err(e) => {
+                        debug!("failed to read block {:?}: {:#}", req, e);
+                        self.send_reject(req);
+                        continue;
+                    }
+                };
                 let length = data.len() as u64;
                 if self
                     .peer_writer_tx
@@ -453,19 +638,73 @@ impl PeerHandler {
         }
     }
 
+    fn peer_has_piece(&self, index: u32) -> bool {
+        self.peers_state
+            .states
+            .get(&self.peer)
+            .map(|state| state.bitfield.has_piece(index as usize))
+            .unwrap_or(false)
+    }
+
+    fn needed_allowed_fast_pieces(&self) -> Vec<u32> {
+        self.peer_allowed_fast
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&index| {
+                !self.torrent_downloaded_state.has_piece(index) && self.peer_has_piece(index)
+            })
+            .collect()
+    }
+
+    async fn request_piece_blocks(&self, piece: PieceWork) -> Result<(), anyhow::Error> {
+        let mut offset: u32 = 0;
+        while offset < piece.length {
+            if !self.is_downloading() {
+                return Ok(());
+            }
+
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), self.requests_sem.acquire())
+                    .await
+                {
+                    Ok(acq) => break acq?.forget(),
+                    Err(_) => continue,
+                };
+            }
+            let block_size = utils::calculate_block_size(piece.length, offset);
+            let req = BlockRequest {
+                index: piece.index,
+                begin: offset,
+                length: block_size,
+            };
+            self.outstanding_requests.lock().unwrap().insert(req);
+
+            debug!(
+                "requesting piece index {} start {} length {}",
+                piece.index, offset, block_size
+            );
+            if self
+                .peer_writer_tx
+                .send(WriterRequest::Message(message::format_request(
+                    piece.index,
+                    offset,
+                    block_size,
+                )))
+                .is_err()
+            {
+                error!("error sending request to peer");
+                return Ok(());
+            }
+            offset += block_size;
+        }
+        Ok(())
+    }
+
     // The job of this is to request chunks and also to keep peer alive.
     // The moment this ends, the peer is disconnected.
     pub async fn task_peer_chunk_requester(&self) -> Result<(), anyhow::Error> {
-        let needs_bitfield = self
-            .peers_state
-            .states
-            .get(&self.peer)
-            .map(|state| state.bitfield.is_empty())
-            .unwrap_or(true);
-        if needs_bitfield {
-            self.on_bitfield_notify.notified().await;
-        }
-
         let mut update_interest = {
             let mut current = false;
             move |h: &PeerHandler, new_value: bool| -> anyhow::Result<()> {
@@ -494,7 +733,11 @@ impl PeerHandler {
                 }
             }
 
-            if self.torrent_downloaded_state.is_complete() || !self.peer_has_needed_piece() {
+            let choked = self.chocked.load(Ordering::Relaxed);
+            let can_request_fast = choked && !self.needed_allowed_fast_pieces().is_empty();
+            if self.torrent_downloaded_state.is_complete()
+                || (!self.peer_has_needed_piece() && !can_request_fast)
+            {
                 update_interest(self, false)?;
                 if self.torrent_downloaded_state.is_complete() {
                     trace!("torrent complete, staying connected to seed");
@@ -506,12 +749,20 @@ impl PeerHandler {
 
             update_interest(self, true)?;
 
-            trace!("waiting for unchoke");
-
-            if self.chocked.load(std::sync::atomic::Ordering::Relaxed) {
+            if choked {
+                let allowed = self.needed_allowed_fast_pieces();
+                if let Some(piece) = self
+                    .torrent_downloaded_state
+                    .reserve_first_available(self.peer, &allowed)
+                {
+                    let piece = piece.piece_work;
+                    self.request_piece_blocks(piece).await?;
+                    continue;
+                }
+                trace!("waiting for unchoke");
                 self.unchoke_notify.notified().await;
+                continue;
             }
-            trace!("unchoke received");
 
             if self.torrent_downloaded_state.is_complete() {
                 update_interest(self, false)?;
@@ -519,9 +770,10 @@ impl PeerHandler {
                 future::pending::<()>().await;
             }
 
+            let preferred = self.preferred_piece_indices();
             let piece = self
                 .torrent_downloaded_state
-                .get_and_reserve_piece(self.peer)
+                .get_and_reserve_piece_preferring(self.peer, &preferred)
                 .await;
 
             if piece.is_none() {
@@ -534,41 +786,7 @@ impl PeerHandler {
             }
 
             let piece = piece.unwrap().piece_work;
-
-            let mut offset: u32 = 0;
-            while offset < piece.length {
-                if !self.is_downloading() {
-                    update_interest(self, false)?;
-                    while !self.is_downloading() {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-
-                loop {
-                    match (tokio::time::timeout(
-                        Duration::from_secs(5),
-                        self.requests_sem.acquire(),
-                    ))
-                    .await
-                    {
-                        Ok(acq) => break acq?.forget(),
-                        Err(_) => continue,
-                    };
-                }
-                let block_size = utils::calculate_block_size(piece.length, offset);
-
-                let r = message::format_request(piece.index, offset, block_size);
-
-                debug!(
-                    "requesting piece index {} start {} length {}",
-                    piece.index, offset, block_size
-                );
-                if self.peer_writer_tx.send(WriterRequest::Message(r)).is_err() {
-                    error!("error sending request to peer");
-                    return Ok(());
-                }
-                offset += block_size;
-            }
+            self.request_piece_blocks(piece).await?;
         }
     }
 
@@ -579,6 +797,9 @@ impl PeerHandler {
                 self.chocked.store(true, Ordering::Relaxed);
                 if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
                     state.set_peer_choking(true);
+                }
+                if !self.fast_extension() {
+                    self.requeue_outstanding();
                 }
             }
             Message::Unchoke => {
@@ -623,7 +844,72 @@ impl PeerHandler {
             Message::Request(payload) => {
                 self.on_incoming_request(payload)?;
             }
+            Message::SuggestPiece(index) => {
+                self.require_fast()?;
+                debug!("peer suggested piece {}", index);
+                let mut suggested = self.suggested_pieces.lock().unwrap();
+                if !suggested.contains(&index) {
+                    suggested.push(index);
+                }
+                if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+                    if !state.suggested_pieces.contains(&index) {
+                        state.suggested_pieces.push(index);
+                    }
+                }
+            }
+            Message::HaveAll => {
+                self.require_fast()?;
+                debug!("peer sent have all");
+                let count = self.torrent_downloaded_state.piece_count();
+                if let Some(mut ps) = self.peers_state.states.get_mut(&self.peer) {
+                    ps.bitfield = Bitfield::filled(count);
+                }
+                self.on_bitfield_notify.notify_waiters();
+            }
+            Message::HaveNone => {
+                self.require_fast()?;
+                debug!("peer sent have none");
+                let count = self.torrent_downloaded_state.piece_count();
+                if let Some(mut ps) = self.peers_state.states.get_mut(&self.peer) {
+                    ps.bitfield = Bitfield::with_piece_count(count);
+                }
+                self.on_bitfield_notify.notify_waiters();
+            }
+            Message::RejectRequest {
+                index,
+                begin,
+                length,
+            } => {
+                self.require_fast()?;
+                debug!(
+                    "peer rejected request index {} begin {} length {}",
+                    index, begin, length
+                );
+                self.on_reject_request(BlockRequest {
+                    index,
+                    begin,
+                    length,
+                })?;
+            }
+            Message::AllowedFast(index) => {
+                self.require_fast()?;
+                debug!("peer allowed fast piece {}", index);
+                self.peer_allowed_fast.lock().unwrap().insert(index);
+                if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+                    state.peer_allowed_fast.insert(index);
+                }
+                self.on_bitfield_notify.notify_waiters();
+                self.unchoke_notify.notify_waiters();
+            }
             Message::Piece(piece_chunk) => {
+                self.outstanding_requests
+                    .lock()
+                    .unwrap()
+                    .remove(&BlockRequest {
+                        index: piece_chunk.index,
+                        begin: piece_chunk.start,
+                        length: piece_chunk.length,
+                    });
                 self.downloaded
                     .fetch_add(piece_chunk.length, Ordering::Relaxed);
                 if let Some(state) = self.peers_state.states.get(&self.peer) {
@@ -729,8 +1015,11 @@ impl PeerConnection {
         }?;
 
         let protocol = Arc::new(Protocol::connect(self.peer, self.info_hash, self.peer_id).await?);
-        let _handshake = protocol.complete_handshake(&mut stream).await?;
+        let handshake = protocol.complete_handshake(&mut stream).await?;
+        self.handler
+            .set_fast_extension(handshake.supports_fast_extension());
         self.send_initial_bitfield(&protocol, &mut stream).await?;
+        self.send_allowed_fast(&protocol, &mut stream).await?;
         self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
             .await
     }
@@ -743,6 +1032,7 @@ impl PeerConnection {
     ) -> anyhow::Result<()> {
         let protocol = Arc::new(Protocol::connect(self.peer, self.info_hash, self.peer_id).await?);
         self.send_initial_bitfield(&protocol, &mut stream).await?;
+        self.send_allowed_fast(&protocol, &mut stream).await?;
         self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
             .await
     }
@@ -753,8 +1043,47 @@ impl PeerConnection {
         stream: &mut TcpStream,
     ) -> anyhow::Result<()> {
         let bitfield = self.handler.torrent_downloaded_state.our_bitfield();
-        if !bitfield.is_empty() {
+        if self.handler.fast_extension() {
+            let msg = if self.handler.torrent_downloaded_state.is_complete() {
+                Message::HaveAll
+            } else if bitfield.is_empty() {
+                Message::HaveNone
+            } else {
+                Message::Bitfield(bitfield.as_bytes().to_vec())
+            };
+            protocol.send_message(stream, msg).await?;
+        } else if !bitfield.is_empty() {
             protocol.send_bitfield(stream, bitfield.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_allowed_fast(
+        &self,
+        protocol: &Protocol,
+        stream: &mut TcpStream,
+    ) -> anyhow::Result<()> {
+        if !self.handler.fast_extension() {
+            return Ok(());
+        }
+        let piece_count = self.handler.torrent_downloaded_state.piece_count() as u32;
+        let set = generate_allowed_fast_for_ip(
+            self.peer.ip(),
+            &self.info_hash,
+            piece_count,
+            DEFAULT_ALLOWED_FAST_SET_SIZE,
+        );
+        {
+            let mut ours = self.handler.our_allowed_fast.lock().unwrap();
+            ours.extend(set.iter().copied());
+        }
+        if let Some(mut state) = self.handler.peers_state.states.get_mut(&self.peer) {
+            state.our_allowed_fast.extend(set.iter().copied());
+        }
+        for index in set {
+            protocol
+                .send_message(&mut *stream, Message::AllowedFast(index))
+                .await?;
         }
         Ok(())
     }
@@ -885,6 +1214,7 @@ pub struct SpawnPeerParams {
     pub torrent: Arc<Torrent>,
     pub choke_notify: Arc<Notify>,
     pub incoming: Option<TcpStream>,
+    pub incoming_fast_extension: Option<bool>,
     pub global_peers: Arc<std::sync::atomic::AtomicUsize>,
     pub max_peers_per_torrent: usize,
     pub max_peers_global: usize,
@@ -923,6 +1253,9 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             torrent: params.torrent,
             choke_notify: params.choke_notify,
         }));
+        if let Some(fast) = params.incoming_fast_extension {
+            handler.set_fast_extension(fast);
+        }
         let connection = PeerConnection::new(
             params.peer,
             params.info_hash,
@@ -1030,6 +1363,37 @@ mod tests {
         assert_eq!(*s.pieces[0].reserved.lock().unwrap(), Some(p1));
         assert!(s.pieces[1].reserved.lock().unwrap().is_none());
         assert_eq!(*s.pieces[2].reserved.lock().unwrap(), Some(p3));
+    }
+
+    #[tokio::test]
+    async fn rejected_request_releases_reservation_for_other_peers() {
+        let s = state(2, 16);
+        let p1 = peer(6881);
+        let p2 = peer(6882);
+
+        s.get_and_reserve_piece(p1).await.unwrap();
+        assert_eq!(*s.pieces[0].reserved.lock().unwrap(), Some(p1));
+        assert!(s.release_reservation(0, p1));
+        assert!(s.pieces[0].reserved.lock().unwrap().is_none());
+
+        let next = s.get_and_reserve_piece(p2).await.unwrap();
+        assert_eq!(next.piece_work.index, 0);
+        assert_eq!(*next.reserved.lock().unwrap(), Some(p2));
+        assert!(!s.release_reservation(0, p1));
+        assert_eq!(*s.pieces[0].reserved.lock().unwrap(), Some(p2));
+    }
+
+    #[tokio::test]
+    async fn preferring_reserves_suggested_piece_first() {
+        let s = state(3, 16);
+        let p1 = peer(6881);
+        let preferred = [2u32, 1];
+        let pw = s
+            .get_and_reserve_piece_preferring(p1, &preferred)
+            .await
+            .unwrap();
+        assert_eq!(pw.piece_work.index, 2);
+        assert_eq!(*pw.reserved.lock().unwrap(), Some(p1));
     }
 
     #[test]

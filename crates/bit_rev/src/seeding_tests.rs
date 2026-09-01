@@ -276,6 +276,63 @@ async fn seeder_disconnects_on_out_of_bounds_request() {
 }
 
 #[tokio::test]
+async fn seeder_disconnects_on_fast_message_without_negotiation() {
+    let data = generated_payload(16_384);
+    let (session, addr, meta) = start_seeder(&data, 16_384).await;
+    let (mut stream, proto) = handshake_with(addr, meta.info_hash, *b"-LC0001-nofast000001").await;
+    drain_until_bitfield(&proto, &mut stream).await;
+
+    write_msg(&mut stream, Message::HaveAll).await;
+
+    expect_disconnect(&proto, &mut stream).await;
+    drop(session);
+}
+
+#[tokio::test]
+async fn seeder_sends_have_all_when_fast_negotiated() {
+    let data = generated_payload(16_384);
+    let (session, addr, meta) = start_seeder(&data, 16_384).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect seeder");
+    let local = Handshake::outgoing(meta.info_hash, *b"-LC0001-fastset00001");
+    stream.write_all(&local.serialize()).await.unwrap();
+    let proto = Protocol::connect(addr, meta.info_hash, *b"-LC0001-fastset00001")
+        .await
+        .unwrap();
+    let reply = Protocol::read_handshake(&mut stream).await.unwrap();
+    assert!(reply.supports_fast_extension());
+
+    let mut saw_have_all = false;
+    let mut allowed = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let msg = tokio::time::timeout(Duration::from_millis(500), proto.read(&mut stream)).await;
+        let Ok(Ok(Some(msg))) = msg else {
+            if saw_have_all {
+                break;
+            }
+            continue;
+        };
+        match msg {
+            Message::HaveAll => saw_have_all = true,
+            Message::AllowedFast(index) => allowed.push(index),
+            Message::Bitfield(_) => panic!("expected have-all, got bitfield"),
+            Message::KeepAlive => {}
+            other if !saw_have_all => panic!("expected have-all first, got {other:?}"),
+            _ => break,
+        }
+        if saw_have_all && !allowed.is_empty() {
+            break;
+        }
+    }
+    assert!(saw_have_all, "seeder should send have-all when seeding");
+    assert!(
+        !allowed.is_empty(),
+        "seeder should advertise an allowed-fast set"
+    );
+    drop(session);
+}
+
+#[tokio::test]
 async fn incoming_unknown_info_hash_is_closed() {
     let data = generated_payload(16_384);
     let (session, addr, _meta) = start_seeder(&data, 16_384).await;

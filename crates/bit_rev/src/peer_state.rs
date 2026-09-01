@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,6 +55,10 @@ pub struct PeerState {
     pub connected_at: Instant,
     pub last_unchoked: Option<Instant>,
     pub is_optimistic: bool,
+    pub fast_extension: bool,
+    pub peer_allowed_fast: HashSet<u32>,
+    pub our_allowed_fast: HashSet<u32>,
+    pub suggested_pieces: Vec<u32>,
     pub stats: Arc<PeerLiveStats>,
     pub writer_tx: Option<flume::Sender<WriterRequest>>,
 }
@@ -100,6 +105,10 @@ impl PeerState {
             connected_at: Instant::now(),
             last_unchoked: None,
             is_optimistic: false,
+            fast_extension: false,
+            peer_allowed_fast: HashSet::new(),
+            our_allowed_fast: HashSet::new(),
+            suggested_pieces: Vec::new(),
             stats: Arc::new(PeerLiveStats::default()),
             writer_tx: None,
         }
