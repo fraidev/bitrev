@@ -178,6 +178,7 @@ dependencies = [
  "serde_bencode",
  "serde_bytes",
  "sha1_smol",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "tokio-util",

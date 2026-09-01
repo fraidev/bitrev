@@ -28,3 +28,6 @@ util = { path = "../util" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util.workspace = true
 serde_bytes.workspace = true
+serde.workspace = true
+serde_bencode.workspace = true
+tempfile = "3.10"
