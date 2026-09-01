@@ -5,11 +5,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::file::{self, TorrentMeta};
 use crate::handshake::Handshake;
+use crate::message::{Message, WriterRequest};
 use crate::peer_connection::{
     try_spawn_peer, PieceWorkState, SpawnPeerParams, TorrentDownloadedState,
 };
 use crate::peer_state::PeerStates;
 use crate::protocol::Protocol;
+use crate::resume::{self, ResumeSnapshot};
+
+pub use crate::resume::ResumeStatus;
 use crate::storage::Storage;
 use crate::torrent::Torrent;
 use crate::tracker_peers::TrackerPeers;
@@ -45,12 +49,15 @@ pub struct PieceResult {
 pub const DEFAULT_LISTEN_PORT: u16 = 6881;
 pub const DEFAULT_MAX_PEERS_PER_TORRENT: usize = 55;
 pub const DEFAULT_MAX_PEERS_GLOBAL: usize = 200;
+pub const RESUME_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
     pub listen_port: u16,
     pub max_peers_per_torrent: usize,
     pub max_peers_global: usize,
+    /// Directory for resume data and cached torrents. `None` disables persistence.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl Default for SessionOptions {
@@ -59,6 +66,7 @@ impl Default for SessionOptions {
             listen_port: DEFAULT_LISTEN_PORT,
             max_peers_per_torrent: DEFAULT_MAX_PEERS_PER_TORRENT,
             max_peers_global: DEFAULT_MAX_PEERS_GLOBAL,
+            state_dir: Some(util::paths::state_dir()),
         }
     }
 }
@@ -75,6 +83,10 @@ pub struct TorrentSession {
     pub torrent: Arc<Torrent>,
     pub torrent_meta: TorrentMeta,
     pub choke_notify: Arc<Notify>,
+    pub output_dir: PathBuf,
+    pub added_at: i64,
+    pub completed_at: Arc<Mutex<Option<i64>>>,
+    pub torrent_cache_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +110,7 @@ pub struct AddTorrentOptions {
     torrent_meta: TorrentMeta,
     output_dir: Option<PathBuf>,
     seed: bool,
+    verify: bool,
 }
 
 impl AddTorrentOptions {
@@ -106,6 +119,7 @@ impl AddTorrentOptions {
             torrent_meta,
             output_dir: None,
             seed: false,
+            verify: false,
         }
     }
 
@@ -121,6 +135,11 @@ impl AddTorrentOptions {
 
     pub fn seed(mut self, seed: bool) -> Self {
         self.seed = seed;
+        self
+    }
+
+    pub fn verify(mut self, verify: bool) -> Self {
+        self.verify = verify;
         self
     }
 }
@@ -141,6 +160,8 @@ pub struct AddTorrentResult {
     pub torrent: Torrent,
     pub torrent_meta: TorrentMeta,
     pub pr_rx: Receiver<PieceResult>,
+    pub resume_status: ResumeStatus,
+    pub already_have: Vec<PieceResult>,
 }
 
 impl Session {
@@ -280,11 +301,11 @@ impl Session {
             *state = DownloadState::Paused;
         }
         for entry in self.torrents.iter() {
-            entry
-                .value()
-                .tracker
-                .set_download_state(DownloadState::Paused);
+            let torrent = entry.value();
+            torrent.tracker.set_download_state(DownloadState::Paused);
+            choke_all_peers(&torrent.peer_states);
         }
+        self.spawn_flush_resume();
     }
 
     pub fn resume(&self) {
@@ -293,11 +314,13 @@ impl Session {
             *state = DownloadState::Downloading;
         }
         for entry in self.torrents.iter() {
-            entry
-                .value()
+            let torrent = entry.value();
+            torrent
                 .tracker
                 .set_download_state(DownloadState::Downloading);
+            torrent.choke_notify.notify_waiters();
         }
+        self.spawn_flush_resume();
     }
 
     pub fn get_download_state(&self) -> DownloadState {
@@ -321,6 +344,81 @@ impl Session {
         for entry in self.torrents.iter() {
             entry.value().tracker.shutdown();
         }
+    }
+
+    pub async fn flush_resume(&self) {
+        let Some(state_dir) = self.options.state_dir.as_ref() else {
+            return;
+        };
+        let torrents: Vec<Arc<TorrentSession>> = self
+            .torrents
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        for torrent in torrents {
+            if let Err(e) = persist_torrent(state_dir, &torrent) {
+                warn!(
+                    name = %torrent.torrent.name,
+                    error = %e,
+                    "failed to flush resume data"
+                );
+            }
+        }
+    }
+
+    pub async fn shutdown_graceful(&self) {
+        self.flush_resume().await;
+        self.shutdown();
+    }
+
+    fn spawn_flush_resume(&self) {
+        let Some(state_dir) = self.options.state_dir.clone() else {
+            return;
+        };
+        let torrents: Vec<Arc<TorrentSession>> = self
+            .torrents
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        tokio::spawn(async move {
+            for torrent in torrents {
+                if let Err(e) = persist_torrent(&state_dir, &torrent) {
+                    warn!(
+                        name = %torrent.torrent.name,
+                        error = %e,
+                        "failed to persist resume data"
+                    );
+                }
+            }
+        });
+    }
+
+    pub fn connect_peer(&self, info_hash: &[u8; 20], addr: SocketAddr) -> bool {
+        let Some(torrent) = self.torrents.get(info_hash).map(|entry| entry.clone()) else {
+            return false;
+        };
+        try_spawn_peer(SpawnPeerParams {
+            peer: addr,
+            info_hash: *info_hash,
+            peer_id: self.peer_id,
+            piece_tx: torrent.piece_tx.clone(),
+            have_broadcast: torrent.have_broadcast.clone(),
+            torrent_downloaded_state: torrent.downloaded_state.clone(),
+            peer_states: torrent.peer_states.clone(),
+            download_state: torrent.download_state.clone(),
+            storage: torrent.storage.clone(),
+            uploaded: torrent.uploaded.clone(),
+            torrent: torrent.torrent.clone(),
+            choke_notify: torrent.choke_notify.clone(),
+            incoming: None,
+            global_peers: self.global_peers.clone(),
+            max_peers_per_torrent: self.options.max_peers_per_torrent,
+            max_peers_global: self.options.max_peers_global,
+        })
+    }
+
+    pub fn torrent_session(&self, info_hash: &[u8; 20]) -> Option<Arc<TorrentSession>> {
+        self.torrents.get(info_hash).map(|entry| entry.clone())
     }
 
     pub fn remove_torrent(&self, info_hash: &[u8; 20]) {
@@ -351,13 +449,58 @@ impl Session {
         let output_dir = add_torrent
             .output_dir
             .unwrap_or_else(|| PathBuf::from(&torrent.name));
+
+        let torrent_cache_path = if let Some(state_dir) = self.options.state_dir.as_ref() {
+            resume::cache_torrent_file(state_dir, &torrent.info_hash, &torrent_meta.torrent_file)
+        } else {
+            PathBuf::new()
+        };
+
+        let resume_file = self
+            .options
+            .state_dir
+            .as_ref()
+            .map(|dir| resume::resume_path(dir, &torrent.info_hash));
+        let loaded_resume = match resume_file.as_ref() {
+            Some(path) => resume::load_optional(path)?,
+            None => None,
+        };
+        let loaded_resume = loaded_resume.filter(|data| match data.info_hash() {
+            Some(hash) if hash == torrent.info_hash => true,
+            _ => {
+                warn!("resume file info hash does not match torrent, starting fresh");
+                false
+            }
+        });
+        let resume_existed = resume_file.as_ref().is_some_and(|path| path.exists());
+        let resume_unreadable = resume_existed && loaded_resume.is_none();
+
+        let fast_path = match &loaded_resume {
+            Some(data) if !add_torrent.verify => {
+                resume::files_match(&data.files, &torrent, &output_dir)
+            }
+            _ => false,
+        };
+
         let storage = Storage::open(&torrent, &output_dir).await?;
 
         let (pr_tx, pr_rx) = flume::bounded::<PieceResult>(torrent.piece_hashes.len().max(1));
         let have_broadcast = Arc::new(tokio::sync::broadcast::channel(128).0);
         let peer_states = Arc::new(PeerStates::default());
-        let uploaded = Arc::new(AtomicU64::new(0));
+        let uploaded = Arc::new(AtomicU64::new(
+            loaded_resume
+                .as_ref()
+                .map(|data| data.uploaded.max(0) as u64)
+                .unwrap_or(0),
+        ));
         let choke_notify = Arc::new(Notify::new());
+        let added_at = loaded_resume
+            .as_ref()
+            .map(|data| data.added_at)
+            .unwrap_or_else(resume::now_unix);
+        let completed_at = Arc::new(Mutex::new(
+            loaded_resume.as_ref().and_then(|data| data.completed_at()),
+        ));
 
         let pieces_of_work = (0..torrent.piece_hashes.len())
             .map(|index| {
@@ -382,9 +525,42 @@ impl Session {
                 })
                 .collect(),
         });
-        if add_torrent.seed {
+
+        let resume_status = if add_torrent.seed {
             downloaded_state.mark_all_downloaded();
+            ResumeStatus::Fresh
+        } else if let Some(data) = &loaded_resume {
+            if fast_path {
+                resume::apply_bitfield(&downloaded_state, &data.bitfield());
+                ResumeStatus::FastPath
+            } else {
+                resume::verify_existing_pieces(&storage, &downloaded_state).await;
+                ResumeStatus::SlowPath
+            }
+        } else if resume_unreadable {
+            ResumeStatus::Corrupt
+        } else {
+            ResumeStatus::Fresh
+        };
+
+        let already_have: Vec<PieceResult> = downloaded_state
+            .pieces
+            .iter()
+            .filter(|pw| pw.downloaded.load(Ordering::Relaxed))
+            .map(|pw| PieceResult {
+                index: pw.piece_work.index,
+                length: pw.piece_work.length,
+            })
+            .collect();
+
+        if downloaded_state.is_complete() {
+            let mut done = completed_at.lock().unwrap();
+            if done.is_none() {
+                *done = Some(resume::now_unix());
+            }
         }
+
+        let start_paused = loaded_resume.as_ref().is_some_and(|data| data.is_paused());
 
         let tracker_stream = TrackerPeers::new(
             torrent_meta.clone(),
@@ -428,6 +604,14 @@ impl Session {
         let piece_rx = tracker_stream.piece_rx.clone();
         let storage_writer = storage.clone();
         let downloaded_writer = downloaded_state.clone();
+        let persist_state_dir = self.options.state_dir.clone();
+        let persist_output_dir = output_dir.clone();
+        let persist_torrent = torrent.clone();
+        let persist_uploaded = uploaded.clone();
+        let persist_download_state = self.download_state.clone();
+        let persist_added_at = added_at;
+        let persist_completed_at = completed_at.clone();
+        let persist_cache_path = torrent_cache_path.clone();
         tokio::spawn(async move {
             loop {
                 let piece = match piece_rx.recv_async().await {
@@ -438,6 +622,28 @@ impl Session {
                     debug!(index = piece.index, error = %e, "failed to write piece");
                     downloaded_writer.remove_downloaded(piece.index);
                     continue;
+                }
+                if downloaded_writer.is_complete() {
+                    let mut done = persist_completed_at.lock().unwrap();
+                    if done.is_none() {
+                        *done = Some(resume::now_unix());
+                    }
+                }
+                if let Some(state_dir) = persist_state_dir.as_ref() {
+                    if let Err(e) = persist_from_parts(
+                        state_dir,
+                        &persist_torrent.info_hash,
+                        &persist_output_dir,
+                        &persist_torrent,
+                        &downloaded_writer,
+                        persist_uploaded.load(Ordering::Relaxed),
+                        *persist_download_state.lock().unwrap() == DownloadState::Paused,
+                        &persist_cache_path,
+                        persist_added_at,
+                        *persist_completed_at.lock().unwrap(),
+                    ) {
+                        debug!(error = %e, "failed to persist resume after piece write");
+                    }
                 }
                 let _ = have_broadcast_writer.send(piece.index);
                 if pr_tx
@@ -454,30 +660,126 @@ impl Session {
         });
 
         let piece_tx = tracker_stream.piece_tx.clone();
-        self.torrents.insert(
-            torrent.info_hash,
-            Arc::new(TorrentSession {
-                tracker: tracker_stream,
-                storage,
-                downloaded_state,
-                peer_states,
-                piece_tx,
-                have_broadcast,
-                download_state: self.download_state.clone(),
-                uploaded,
-                torrent: torrent.clone(),
-                torrent_meta: torrent_meta.clone(),
-                choke_notify,
-            }),
-        );
+        let torrent_session = Arc::new(TorrentSession {
+            tracker: tracker_stream,
+            storage,
+            downloaded_state,
+            peer_states,
+            piece_tx,
+            have_broadcast,
+            download_state: self.download_state.clone(),
+            uploaded,
+            torrent: torrent.clone(),
+            torrent_meta: torrent_meta.clone(),
+            choke_notify,
+            output_dir,
+            added_at,
+            completed_at,
+            torrent_cache_path,
+        });
+        self.torrents
+            .insert(torrent.info_hash, torrent_session.clone());
 
-        self.start_downloading();
+        if let Some(state_dir) = self.options.state_dir.clone() {
+            spawn_resume_timer(torrent_session, state_dir, self.cancel.clone());
+        }
+
+        if start_paused {
+            self.pause();
+        } else {
+            self.start_downloading();
+        }
 
         Ok(AddTorrentResult {
             torrent: (*torrent).clone(),
             torrent_meta,
             pr_rx,
+            resume_status,
+            already_have,
         })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_from_parts(
+    state_dir: &std::path::Path,
+    info_hash: &[u8; 20],
+    output_dir: &std::path::Path,
+    torrent: &Torrent,
+    downloaded_state: &TorrentDownloadedState,
+    uploaded: u64,
+    paused: bool,
+    torrent_path: &std::path::Path,
+    added_at: i64,
+    completed_at: Option<i64>,
+) -> Result<PathBuf, resume::ResumeError> {
+    resume::persist(
+        state_dir,
+        ResumeSnapshot {
+            info_hash,
+            output_dir,
+            torrent,
+            downloaded_state,
+            uploaded,
+            paused,
+            torrent_path,
+            added_at,
+            completed_at,
+        },
+    )
+}
+
+fn persist_torrent(
+    state_dir: &std::path::Path,
+    torrent: &TorrentSession,
+) -> Result<PathBuf, resume::ResumeError> {
+    persist_from_parts(
+        state_dir,
+        &torrent.torrent.info_hash,
+        &torrent.output_dir,
+        &torrent.torrent,
+        &torrent.downloaded_state,
+        torrent.uploaded.load(Ordering::Relaxed),
+        *torrent.download_state.lock().unwrap() == DownloadState::Paused,
+        &torrent.torrent_cache_path,
+        torrent.added_at,
+        *torrent.completed_at.lock().unwrap(),
+    )
+}
+
+fn spawn_resume_timer(torrent: Arc<TorrentSession>, state_dir: PathBuf, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RESUME_FLUSH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let torrent_cancel = torrent.tracker.cancel_token();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = torrent_cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let downloading =
+                        *torrent.download_state.lock().unwrap() == DownloadState::Downloading;
+                    if downloading {
+                        if let Err(e) = persist_torrent(&state_dir, &torrent) {
+                            debug!(error = %e, "periodic resume persist failed");
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn choke_all_peers(peer_states: &PeerStates) {
+    for mut state in peer_states.states.iter_mut() {
+        if !state.stats.am_choking.load(Ordering::Relaxed) {
+            state.set_am_choking(true);
+            state.is_optimistic = false;
+            if let Some(tx) = &state.writer_tx {
+                let _ = tx.send(WriterRequest::Message(Message::Choke));
+            }
+        }
     }
 }
 

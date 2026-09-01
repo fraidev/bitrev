@@ -709,6 +709,12 @@ mod tests {
         }
     }
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     async fn recv_from_mock(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
         let mut buf = vec![0u8; 512];
         let (len, from) = socket.recv_from(&mut buf).await.expect("mock recv");
@@ -901,7 +907,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn announce_round_trip_peers_and_interval() {
+        let _lock = lock_tests();
         let mock = bind_mock(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await;
         let url = tracker_url(mock.local_addr().unwrap());
         let params = sample_params(Some(AnnounceEvent::Started));
@@ -945,7 +953,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn transaction_mismatch_is_ignored_until_matching_packet() {
+        let _lock = lock_tests();
         let mock = bind_mock(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await;
         let url = tracker_url(mock.local_addr().unwrap());
         let params = sample_params(None);
@@ -1001,7 +1011,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn error_packet_is_typed_error() {
+        let _lock = lock_tests();
         let mock = bind_mock(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await;
         let url = tracker_url(mock.local_addr().unwrap());
         let params = sample_params(Some(AnnounceEvent::Started));
@@ -1038,7 +1050,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn expired_connection_id_reconnects() {
+        let _lock = lock_tests();
         tokio::time::pause();
         let mock = bind_mock(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await;
         let url = tracker_url(mock.local_addr().unwrap());
@@ -1103,7 +1117,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn server_rejects_old_connection_id_then_client_reconnects() {
+        let _lock = lock_tests();
         tokio::time::pause();
         let mock = bind_mock(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await;
         let url = tracker_url(mock.local_addr().unwrap());
@@ -1168,7 +1184,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn announce_over_ipv6_parses_18_byte_peers() {
+        let _lock = lock_tests();
         let mock = match UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
             Ipv6Addr::LOCALHOST,
             0,
@@ -1215,7 +1233,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn retransmit_on_dropped_announce() {
+        let _lock = lock_tests();
         tokio::time::pause();
         let mock = bind_mock(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await;
         let url = tracker_url(mock.local_addr().unwrap());

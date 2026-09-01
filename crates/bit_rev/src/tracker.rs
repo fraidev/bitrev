@@ -148,6 +148,7 @@ impl HttpAnnounceContext {
 enum Wake {
     IntervalElapsed,
     Completed,
+    Paused,
     Shutdown,
 }
 
@@ -229,10 +230,18 @@ pub async fn run_announce_loop<F, Fut>(
                     &shutdown,
                     &ctx.torrent_downloaded_state,
                     sent_completed,
+                    &ctx.download_state,
                 )
                 .await
                 {
                     Wake::Shutdown => break,
+                    Wake::Paused => {
+                        let params = current_announce_params(&ctx, None, tracker_id.clone());
+                        let _ = dispatch_announce(&ctx, &params, udp.as_mut()).await;
+                        if !wait_until_downloading(&ctx.download_state, &shutdown).await {
+                            break;
+                        }
+                    }
                     Wake::Completed | Wake::IntervalElapsed => {}
                 }
             }
@@ -245,10 +254,16 @@ pub async fn run_announce_loop<F, Fut>(
                     &shutdown,
                     &ctx.torrent_downloaded_state,
                     sent_completed,
+                    &ctx.download_state,
                 )
                 .await
                 {
                     Wake::Shutdown => break,
+                    Wake::Paused => {
+                        if !wait_until_downloading(&ctx.download_state, &shutdown).await {
+                            break;
+                        }
+                    }
                     Wake::Completed | Wake::IntervalElapsed => {}
                 }
             }
@@ -390,6 +405,7 @@ async fn wait_reannounce(
     shutdown: &CancellationToken,
     torrent_downloaded_state: &TorrentDownloadedState,
     sent_completed: bool,
+    download_state: &Arc<Mutex<DownloadState>>,
 ) -> Wake {
     if shutdown.is_cancelled() {
         return Wake::Shutdown;
@@ -408,6 +424,9 @@ async fn wait_reannounce(
             _ = shutdown.cancelled() => return Wake::Shutdown,
             _ = &mut sleep => return Wake::IntervalElapsed,
             _ = tick.tick() => {
+                if *download_state.lock().unwrap() == DownloadState::Paused {
+                    return Wake::Paused;
+                }
                 if !sent_completed && torrent_downloaded_state.is_complete() {
                     return Wake::Completed;
                 }

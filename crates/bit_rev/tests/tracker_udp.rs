@@ -29,6 +29,12 @@ const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
 const ACTION_ERROR: u32 = 3;
 
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn test_meta(announce: String) -> TorrentMeta {
     TorrentMeta {
         torrent_file: TorrentFile {
@@ -239,7 +245,9 @@ async fn settle() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn announce_loop_round_trips_started_and_interval() {
+    let _lock = lock_tests();
     let (url, mut rx, handle) = spawn_udp_mock(vec![AnnounceReply::Peers { interval: 1800 }]).await;
     let peer_states = Arc::new(PeerStates::default());
     let shutdown = CancellationToken::new();
@@ -276,7 +284,9 @@ async fn announce_loop_round_trips_started_and_interval() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn announce_loop_respects_interval_and_sends_stopped() {
+    let _lock = lock_tests();
     tokio::time::pause();
     let (url, mut rx, handle) = spawn_udp_mock(vec![AnnounceReply::Peers { interval: 1800 }]).await;
     let shutdown = CancellationToken::new();
@@ -312,7 +322,9 @@ async fn announce_loop_respects_interval_and_sends_stopped() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn announce_loop_retries_error_packet_with_backoff() {
+    let _lock = lock_tests();
     tokio::time::pause();
     let (url, mut rx, handle) = spawn_udp_mock(vec![
         AnnounceReply::Error,
@@ -346,7 +358,9 @@ async fn announce_loop_retries_error_packet_with_backoff() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn announce_loop_reuses_connection_id_until_expiry() {
+    let _lock = lock_tests();
     let (url, mut rx, handle) = spawn_udp_mock(vec![
         AnnounceReply::Peers { interval: 1800 },
         AnnounceReply::Peers { interval: 1800 },

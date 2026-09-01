@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 lazy_static::lazy_static! {
     pub static ref HOME: PathBuf = dirs::home_dir().expect("failed to determine home directory");
+    /// Client state directory. Hardcoded until the config system (issue #21) lands.
+    pub static ref STATE_DIR: PathBuf = HOME.join(".bitrev");
     pub static ref CONFIG_DIR: PathBuf = HOME.join(".config").join("bit_rev");
     pub static ref CONVERSATIONS_DIR: PathBuf = CONFIG_DIR.join("conversations");
     pub static ref EMBEDDINGS_DIR: PathBuf = CONFIG_DIR.join("embeddings");
@@ -38,6 +40,21 @@ lazy_static::lazy_static! {
     pub static ref TASKS: PathBuf = CONFIG_DIR.join("tasks.json");
     pub static ref LOG: PathBuf = LOGS_DIR.join("BitRev.log");
     pub static ref OLD_LOG: PathBuf = LOGS_DIR.join("BitRev.log.old");
+}
+
+/// Default client state directory (`~/.bitrev`).
+pub fn state_dir() -> PathBuf {
+    STATE_DIR.clone()
+}
+
+/// Resume files: `<state_dir>/resume/<info_hash_hex>.resume`.
+pub fn resume_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("resume")
+}
+
+/// Cached torrent metainfo: `<state_dir>/torrents/<info_hash_hex>.torrent`.
+pub fn torrents_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("torrents")
 }
 
 pub trait PathExt {
@@ -379,6 +396,19 @@ mod tests {
                 "For special case input str '{input}', got a parse mismatch"
             );
         }
+    }
+
+    #[test]
+    fn state_dir_is_home_bitrev() {
+        assert_eq!(state_dir(), HOME.join(".bitrev"));
+        assert_eq!(
+            resume_dir(&state_dir()),
+            HOME.join(".bitrev").join("resume")
+        );
+        assert_eq!(
+            torrents_dir(&state_dir()),
+            HOME.join(".bitrev").join("torrents")
+        );
     }
 
     #[test]

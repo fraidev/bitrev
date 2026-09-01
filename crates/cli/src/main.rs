@@ -14,18 +14,46 @@ async fn main() {
     #[cfg(feature = "tokio-console")]
     console_subscriber::init();
 
-    let filename = std::env::args().nth(1).expect("No torrent path given");
-    let output = std::env::args().nth(2);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let verify = args.iter().any(|arg| arg == "--verify");
+    let positional: Vec<&str> = args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    let filename = positional.first().copied().expect("No torrent path given");
+    let output = positional.get(1).map(|s| (*s).to_string());
 
-    if let Err(err) = download_file(&filename, output).await {
+    if let Err(err) = download_file(filename, output, verify).await {
         eprintln!("Error: {:?}", err);
     }
 }
 
-pub async fn download_file(filename: &str, out_file: Option<String>) -> anyhow::Result<()> {
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}
+
+pub async fn download_file(
+    filename: &str,
+    out_file: Option<String>,
+    verify: bool,
+) -> anyhow::Result<()> {
     let session = Session::new();
 
-    let mut add_opts = AddTorrentOptions::from(filename);
+    let mut add_opts = AddTorrentOptions::from(filename).verify(verify);
     if let Some(output) = out_file {
         add_opts = add_opts.output_dir(output);
     }
@@ -58,14 +86,37 @@ pub async fn download_file(filename: &str, out_file: Option<String>) -> anyhow::
     });
 
     let mut hashset = std::collections::HashSet::new();
-    while hashset.len() < torrent.piece_hashes.len() {
-        let pr = add_torrent_result.pr_rx.recv_async().await?;
+    for pr in &add_torrent_result.already_have {
         hashset.insert(pr.index);
         total_downloaded.fetch_add(pr.length as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
-    session.shutdown();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let download = async {
+        while hashset.len() < torrent.piece_hashes.len() {
+            let pr = add_torrent_result.pr_rx.recv_async().await?;
+            hashset.insert(pr.index);
+            total_downloaded.fetch_add(pr.length as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        anyhow::Ok(())
+    };
+
+    tokio::select! {
+        result = download => {
+            result?;
+            session.shutdown_graceful().await;
+        }
+        _ = shutdown_signal() => {
+            eprintln!("Shutting down...");
+            session.shutdown_graceful().await;
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    eprintln!("Forced exit");
+                    std::process::exit(130);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(8)) => {}
+            }
+        }
+    }
 
     Ok(())
 }
