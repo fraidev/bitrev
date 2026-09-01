@@ -107,13 +107,80 @@ pub enum MessageError {
     InvalidPayload(String),
 }
 
-pub fn format_request(index: u32, start: u32, length: u32) -> Message {
-    let mut payload = Vec::with_capacity(12);
-    payload.extend_from_slice(&index.to_be_bytes());
-    payload.extend_from_slice(&start.to_be_bytes());
-    payload.extend_from_slice(&length.to_be_bytes());
+pub const MAX_INCOMING_REQUEST_LENGTH: u32 = 128 * 1024;
+pub const MAX_UPLOAD_QUEUE: usize = 8;
 
-    Message::Request(payload)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRequest {
+    pub index: u32,
+    pub begin: u32,
+    pub length: u32,
+}
+
+impl BlockRequest {
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 12 {
+            return None;
+        }
+        Some(Self {
+            index: u32::from_be_bytes(payload[0..4].try_into().ok()?),
+            begin: u32::from_be_bytes(payload[4..8].try_into().ok()?),
+            length: u32::from_be_bytes(payload[8..12].try_into().ok()?),
+        })
+    }
+
+    pub fn to_payload(self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&self.index.to_be_bytes());
+        payload.extend_from_slice(&self.begin.to_be_bytes());
+        payload.extend_from_slice(&self.length.to_be_bytes());
+        payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestError {
+    MissingPiece,
+    InvalidLength,
+    OutOfBounds,
+}
+
+pub fn validate_request(
+    req: &BlockRequest,
+    piece_length: u32,
+    have_piece: bool,
+) -> Result<(), RequestError> {
+    if !have_piece {
+        return Err(RequestError::MissingPiece);
+    }
+    if req.length == 0 || req.length > MAX_INCOMING_REQUEST_LENGTH {
+        return Err(RequestError::InvalidLength);
+    }
+    let end = req.begin.checked_add(req.length);
+    match end {
+        Some(end) if end <= piece_length => Ok(()),
+        _ => Err(RequestError::OutOfBounds),
+    }
+}
+
+pub fn format_request(index: u32, start: u32, length: u32) -> Message {
+    Message::Request(
+        BlockRequest {
+            index,
+            begin: start,
+            length,
+        }
+        .to_payload(),
+    )
+}
+
+pub fn format_piece(index: u32, begin: u32, data: Vec<u8>) -> Message {
+    Message::Piece(PieceChunk {
+        index,
+        start: begin,
+        length: data.len() as u32,
+        data,
+    })
 }
 
 pub fn format_have(index: u32) -> Message {
@@ -299,6 +366,86 @@ mod tests {
         let msg = format_request(index, start, length);
 
         assert!(matches!(msg, Message::Request(payload) if payload == expected));
+    }
+
+    #[test]
+    fn block_request_round_trip() {
+        let req = BlockRequest {
+            index: 4,
+            begin: 567,
+            length: 4321,
+        };
+        assert_eq!(BlockRequest::from_payload(&req.to_payload()), Some(req));
+        assert_eq!(BlockRequest::from_payload(&[0u8; 11]), None);
+    }
+
+    #[test]
+    fn validate_request_accepts_in_range() {
+        let req = BlockRequest {
+            index: 0,
+            begin: 0,
+            length: 16 * 1024,
+        };
+        assert_eq!(validate_request(&req, 32 * 1024, true), Ok(()));
+        let last = BlockRequest {
+            index: 0,
+            begin: 16 * 1024,
+            length: 16 * 1024,
+        };
+        assert_eq!(validate_request(&last, 32 * 1024, true), Ok(()));
+    }
+
+    #[test]
+    fn validate_request_rejects_oversized_and_out_of_bounds() {
+        let oversized = BlockRequest {
+            index: 0,
+            begin: 0,
+            length: MAX_INCOMING_REQUEST_LENGTH + 1,
+        };
+        assert_eq!(
+            validate_request(&oversized, 1024 * 1024, true),
+            Err(RequestError::InvalidLength)
+        );
+
+        let zero = BlockRequest {
+            index: 0,
+            begin: 0,
+            length: 0,
+        };
+        assert_eq!(
+            validate_request(&zero, 16 * 1024, true),
+            Err(RequestError::InvalidLength)
+        );
+
+        let past_end = BlockRequest {
+            index: 0,
+            begin: 16 * 1024,
+            length: 1,
+        };
+        assert_eq!(
+            validate_request(&past_end, 16 * 1024, true),
+            Err(RequestError::OutOfBounds)
+        );
+
+        let overflow = BlockRequest {
+            index: 0,
+            begin: u32::MAX,
+            length: 1,
+        };
+        assert_eq!(
+            validate_request(&overflow, u32::MAX, true),
+            Err(RequestError::OutOfBounds)
+        );
+
+        let missing = BlockRequest {
+            index: 3,
+            begin: 0,
+            length: 16,
+        };
+        assert_eq!(
+            validate_request(&missing, 16 * 1024, false),
+            Err(RequestError::MissingPiece)
+        );
     }
 
     #[test]

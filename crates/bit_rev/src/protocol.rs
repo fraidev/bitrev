@@ -128,6 +128,68 @@ impl Protocol {
             .map_err(ProtocolError::Io)
     }
 
+    pub async fn send_choke(
+        &self,
+        mut stream: impl AsyncWriteExt + Unpin,
+    ) -> Result<(), ProtocolError> {
+        let msg = message::Message::Choke;
+        let msg_bytes = message::serialize(Some(msg));
+        stream
+            .write_all(&msg_bytes)
+            .await
+            .map_err(ProtocolError::Io)
+    }
+
+    pub async fn send_bitfield(
+        &self,
+        mut stream: impl AsyncWriteExt + Unpin,
+        bitfield: &[u8],
+    ) -> Result<(), ProtocolError> {
+        let msg = message::Message::Bitfield(bitfield.to_vec());
+        let msg_bytes = message::serialize(Some(msg));
+        stream
+            .write_all(&msg_bytes)
+            .await
+            .map_err(ProtocolError::Io)
+    }
+
+    pub async fn read_handshake(
+        stream: &mut (impl AsyncReadExt + Unpin),
+    ) -> Result<Handshake, ProtocolError> {
+        let timeout = tokio::time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), async {
+            let protocol_str_len_buf = &mut [0u8; 1];
+            stream
+                .read_exact(protocol_str_len_buf)
+                .await
+                .map_err(ProtocolError::Io)?;
+            let protocol_str_len = protocol_str_len_buf[0] as usize;
+            let handshake_bytes = &mut vec![0u8; protocol_str_len + 48];
+            stream
+                .read_exact(handshake_bytes)
+                .await
+                .map_err(ProtocolError::Io)?;
+            Handshake::read(protocol_str_len, handshake_bytes.to_vec())
+                .map_err(ProtocolError::Handshake)
+        })
+        .await;
+
+        match timeout {
+            Ok(Ok(h)) => Ok(h),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(ProtocolError::Timeout(e)),
+        }
+    }
+
+    pub async fn write_handshake(
+        stream: &mut (impl AsyncWriteExt + Unpin),
+        handshake: &Handshake,
+    ) -> Result<(), ProtocolError> {
+        stream
+            .write_all(&handshake.serialize())
+            .await
+            .map_err(ProtocolError::Io)
+    }
+
     pub async fn send_have(
         &self,
         mut stream: impl AsyncWriteExt + Unpin,
@@ -293,6 +355,23 @@ mod tests {
         reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, expected);
         assert_eq!(buf[4], message::MessageId::MsgInterested as u8);
+    }
+
+    #[tokio::test]
+    async fn read_write_handshake_round_trip() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let expected = Handshake::new(INFO_HASH, REMOTE_PEER_ID);
+        let reply = expected.clone();
+
+        let server_task = tokio::spawn(async move {
+            Protocol::write_handshake(&mut server, &reply)
+                .await
+                .unwrap();
+        });
+
+        let got = Protocol::read_handshake(&mut client).await.unwrap();
+        assert_eq!(got, expected);
+        server_task.await.unwrap();
     }
 
     #[tokio::test]

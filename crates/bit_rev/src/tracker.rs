@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::Duration,
 };
 
@@ -126,6 +129,7 @@ pub struct HttpAnnounceContext {
     pub port: u16,
     pub download_state: Arc<Mutex<DownloadState>>,
     pub torrent_downloaded_state: Arc<TorrentDownloadedState>,
+    pub uploaded: Arc<AtomicU64>,
 }
 
 impl HttpAnnounceContext {
@@ -310,8 +314,7 @@ fn current_announce_params(
     tracker_id: Option<Vec<u8>>,
 ) -> AnnounceParams {
     AnnounceParams {
-        // TODO(#8): wire uploaded from the session upload counter once seeding exists
-        uploaded: 0,
+        uploaded: ctx.uploaded.load(Ordering::Relaxed),
         downloaded: ctx.torrent_downloaded_state.downloaded_bytes(),
         left: ctx.torrent_downloaded_state.left_bytes(),
         port: ctx.port,
@@ -328,7 +331,7 @@ async fn send_stopped(
     udp: Option<&mut UdpTracker>,
 ) {
     let params = AnnounceParams {
-        uploaded: 0,
+        uploaded: ctx.uploaded.load(Ordering::Relaxed),
         downloaded: ctx.torrent_downloaded_state.downloaded_bytes(),
         left: ctx.torrent_downloaded_state.left_bytes(),
         port: ctx.port,
@@ -470,6 +473,7 @@ mod tests {
                 semaphore: tokio::sync::Semaphore::new(1),
                 pieces: vec![],
             }),
+            uploaded: Arc::new(AtomicU64::new(0)),
         };
 
         assert!(!ctx.switch_tracker("http://a.example/announce"));

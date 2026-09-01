@@ -250,6 +250,7 @@ fn announce_ctx(url: String, download: Arc<TorrentDownloadedState>) -> HttpAnnou
         port: 6881,
         download_state: Arc::new(Mutex::new(DownloadState::Downloading)),
         torrent_downloaded_state: download,
+        uploaded: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
 }
 

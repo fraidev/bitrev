@@ -8,6 +8,17 @@ impl Bitfield {
         Bitfield { bytes }
     }
 
+    pub fn with_piece_count(count: usize) -> Bitfield {
+        let nbytes = count.div_ceil(8);
+        Bitfield {
+            bytes: vec![0u8; nbytes],
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     pub fn has_piece(&self, index: usize) -> bool {
         let byte_index = index / 8;
         let offset = index % 8;
@@ -113,5 +124,15 @@ mod tests {
         bitfield.set_piece(0);
         assert!(!bitfield.is_empty());
         assert!(Bitfield::new(vec![]).is_empty());
+    }
+
+    #[test]
+    fn with_piece_count_sizes_and_set() {
+        let mut bitfield = Bitfield::with_piece_count(10);
+        assert_eq!(bitfield.as_bytes().len(), 2);
+        assert!(bitfield.is_empty());
+        bitfield.set_piece(9);
+        assert!(bitfield.has_piece(9));
+        assert!(!bitfield.has_piece(0));
     }
 }
