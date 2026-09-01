@@ -75,6 +75,7 @@ async fn start_seeder(
 
     let session = Session::with_options(SessionOptions {
         listen_port: 0,
+        state_dir: None,
         ..SessionOptions::default()
     });
     let addr = tokio::time::timeout(Duration::from_secs(2), session.wait_listening())

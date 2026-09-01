@@ -381,8 +381,8 @@ impl PeerHandler {
         validate_request(&req, piece_length, have_piece)
             .map_err(|e| anyhow::anyhow!("invalid request {:?}: {:?}", req, e))?;
 
-        if self.am_choking() {
-            debug!("ignoring request while choking {:?}", req);
+        if !self.is_downloading() || self.am_choking() {
+            debug!("ignoring request while paused or choking {:?}", req);
             return Ok(());
         }
 
@@ -401,6 +401,12 @@ impl PeerHandler {
 
     pub async fn task_peer_uploader(&self) -> Result<(), anyhow::Error> {
         loop {
+            if !self.is_downloading() {
+                self.upload_queue.lock().unwrap().clear();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
             let stats = self
                 .peers_state
                 .states
@@ -414,7 +420,7 @@ impl PeerHandler {
             }
 
             loop {
-                if self.am_choking() {
+                if !self.is_downloading() || self.am_choking() {
                     self.upload_queue.lock().unwrap().clear();
                     break;
                 }
@@ -481,8 +487,11 @@ impl PeerHandler {
         };
 
         loop {
-            while !self.is_downloading() {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !self.is_downloading() {
+                update_interest(self, false)?;
+                while !self.is_downloading() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
 
             if self.torrent_downloaded_state.is_complete() || !self.peer_has_needed_piece() {
@@ -528,9 +537,8 @@ impl PeerHandler {
 
             let mut offset: u32 = 0;
             while offset < piece.length {
-                // Check download state before requesting each block
                 if !self.is_downloading() {
-                    // Wait while not downloading
+                    update_interest(self, false)?;
                     while !self.is_downloading() {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }

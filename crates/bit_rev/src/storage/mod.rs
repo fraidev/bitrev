@@ -1,5 +1,5 @@
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::fs::{File, OpenOptions};
@@ -24,6 +24,23 @@ pub struct Storage {
     files: Vec<Mutex<File>>,
 }
 
+/// Resolve the on-disk path for torrent file `file_index`.
+/// Single-file torrent: `output_dir` is the file path.
+/// Multi-file torrent: `output_dir` is the root directory.
+pub fn file_path(torrent: &Torrent, output_dir: &Path, file_index: usize) -> PathBuf {
+    if torrent.files.len() == 1 {
+        output_dir.to_path_buf()
+    } else {
+        let mut path = output_dir.to_path_buf();
+        if let Some(file_info) = torrent.files.get(file_index) {
+            for component in &file_info.path {
+                path.push(component);
+            }
+        }
+        path
+    }
+}
+
 impl Storage {
     /// Open (or create) files under `output_dir` without truncating existing data.
     /// Single-file torrent: `output_dir` is the file path (may be a file name, not a directory).
@@ -37,18 +54,10 @@ impl Storage {
         let output_dir = output_dir.as_ref();
         let mut files = Vec::with_capacity(torrent.files.len());
 
-        for file_info in &torrent.files {
-            let file_path = if torrent.files.len() == 1 {
-                output_dir.to_path_buf()
-            } else {
-                let mut path = output_dir.to_path_buf();
-                for component in &file_info.path {
-                    path.push(component);
-                }
-                path
-            };
+        for file_index in 0..torrent.files.len() {
+            let disk_path = file_path(torrent, output_dir, file_index);
 
-            if let Some(parent) = file_path.parent() {
+            if let Some(parent) = disk_path.parent() {
                 if !parent.as_os_str().is_empty() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
@@ -59,7 +68,7 @@ impl Storage {
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&file_path)
+                .open(&disk_path)
                 .await?;
             files.push(Mutex::new(file));
         }

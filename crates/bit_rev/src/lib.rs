@@ -10,6 +10,7 @@ pub mod peer_connection;
 pub mod peer_state;
 pub mod protocol;
 pub mod protocol_udp;
+pub mod resume;
 pub mod session;
 pub mod storage;
 pub mod torrent;
