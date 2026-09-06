@@ -19,10 +19,15 @@ pub struct HandshakeCapabilities {
     pub extension_protocol: bool,
 }
 
+/// Standard BitTorrent `pstrlen`. Larger values are rejected before allocation.
+pub const MAX_PSTR_LEN: usize = 19;
+
 #[derive(Error, Debug, PartialEq, Eq, Clone)]
 pub enum HandshakeError {
     #[error("Protocol length can't be zero")]
     ProtocolLengthCantBeZero,
+    #[error("Protocol length is invalid")]
+    InvalidProtocolLength,
     #[error("Handshake buffer is too short")]
     BufferTooShort,
 }

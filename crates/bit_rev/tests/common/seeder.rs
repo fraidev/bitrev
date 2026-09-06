@@ -8,7 +8,7 @@ use std::time::Duration;
 use bit_rev::bitfield::Bitfield;
 use bit_rev::handshake::Handshake;
 use bit_rev::message::{self, BlockRequest, Message};
-use bit_rev::protocol::Protocol;
+use bit_rev::protocol::{Frame, Protocol};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -232,9 +232,9 @@ async fn serve_peer(
             msg = proto.read(&mut stream) => msg,
         };
         let msg = match msg {
-            Ok(Some(msg)) => msg,
-            Ok(None) => continue,
-            Err(_) => break,
+            Ok(Frame::Message(msg)) => msg,
+            Ok(Frame::KeepAlive) | Ok(Frame::Unknown { .. }) => continue,
+            Ok(Frame::Eof) | Err(_) => break,
         };
         match msg {
             Message::Interested => {

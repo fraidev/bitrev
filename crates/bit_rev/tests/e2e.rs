@@ -225,6 +225,74 @@ async fn corrupt_piece_is_refetched() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_seeder_is_banned_and_download_completes() {
+    let fixture = Arc::new(TorrentFixture::single(
+        256 * 1024,
+        DEFAULT_PIECE_LENGTH,
+        0xBA11_0001,
+    ));
+    let corrupt = SeederPeer::start(
+        fixture.clone(),
+        SeederConfig::with_pieces([0])
+            .peer_id(unique_peer_id(1))
+            .corrupt(0),
+    )
+    .await;
+    let honest = SeederPeer::start(
+        fixture.clone(),
+        SeederConfig::all_pieces().peer_id(unique_peer_id(2)),
+    )
+    .await;
+
+    let tracker =
+        MockHttpTracker::start(vec![HttpAnnounceBody::peers(1800, vec![corrupt.addr])]).await;
+    let meta = fixture.meta_with_trackers(Some(tracker.url.clone()), None);
+    let download_dir = unique_temp_dir();
+    let session = test_session(None).await;
+    let output = fixture.session_output(download_dir.path());
+    let added = add_download(&session, meta, output.clone()).await;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(torrent) = session.torrent_session(&fixture.torrent_meta.info_hash) {
+                if torrent.peer_states.is_banned(corrupt.addr) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("corrupt seeder should be banned after hash failure");
+
+    assert!(
+        session.connect_peer(&fixture.torrent_meta.info_hash, honest.addr),
+        "failed to connect honest seeder"
+    );
+    wait_for_completion(
+        &added.pr_rx,
+        &added.torrent,
+        added.already_have.len(),
+        DOWNLOAD_TIMEOUT,
+    )
+    .await;
+
+    let torrent = session
+        .torrent_session(&fixture.torrent_meta.info_hash)
+        .expect("torrent session");
+    assert!(
+        torrent.peer_states.is_banned(corrupt.addr),
+        "corrupt seeder should stay banned"
+    );
+    assert!(torrent.peer_states.banned_count() >= 1);
+    assert!(!torrent.peer_states.is_banned(honest.addr));
+
+    session.shutdown();
+    fixture.assert_output_matches(&output);
+    assert!(honest.blocks_sent() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnect_mid_piece_is_retried() {
     let fixture = Arc::new(TorrentFixture::single(
         512 * 1024,

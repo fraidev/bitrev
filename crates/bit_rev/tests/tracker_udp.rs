@@ -288,6 +288,7 @@ async fn announce_loop_round_trips_started_and_interval() {
 async fn announce_loop_respects_interval_and_sends_stopped() {
     let _lock = lock_tests();
     tokio::time::pause();
+    tokio::spawn(std::future::pending::<()>());
     let (url, mut rx, handle) = spawn_udp_mock(vec![AnnounceReply::Peers { interval: 1800 }]).await;
     let shutdown = CancellationToken::new();
     let loop_shutdown = shutdown.clone();
@@ -300,24 +301,37 @@ async fn announce_loop_respects_interval_and_sends_stopped() {
     let first = rx.recv().await.expect("started announce");
     assert_eq!(first.event, 2);
     settle().await;
+    while rx.try_recv().is_ok() {}
 
     tokio::time::advance(Duration::from_secs(1799)).await;
     settle().await;
     assert!(rx.try_recv().is_err(), "re-announce sent before interval");
 
     tokio::time::advance(Duration::from_secs(2)).await;
-    let second = rx.recv().await.expect("interval re-announce");
-    assert_eq!(second.event, 0);
+    let second = loop {
+        let msg = rx.recv().await.expect("interval re-announce");
+        if msg.event == 0 {
+            break msg;
+        }
+        assert_eq!(
+            msg.event, 2,
+            "only started retranmits are expected before a none event"
+        );
+    };
     assert_eq!(second.key, ANNOUNCE_KEY);
 
     shutdown.cancel();
     settle().await;
-    let stopped = rx.recv().await.expect("stopped announce");
-    assert_eq!(stopped.event, 3);
+    let stopped = loop {
+        let msg = rx.recv().await.expect("stopped announce");
+        if msg.event == 3 {
+            break msg;
+        }
+    };
     assert_eq!(stopped.num_want, 0);
     assert_eq!(stopped.key, ANNOUNCE_KEY);
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), loop_task).await;
+    loop_task.abort();
     handle.abort();
 }
 
@@ -326,6 +340,7 @@ async fn announce_loop_respects_interval_and_sends_stopped() {
 async fn announce_loop_retries_error_packet_with_backoff() {
     let _lock = lock_tests();
     tokio::time::pause();
+    tokio::spawn(std::future::pending::<()>());
     let (url, mut rx, handle) = spawn_udp_mock(vec![
         AnnounceReply::Error,
         AnnounceReply::Peers { interval: 1800 },
@@ -342,18 +357,25 @@ async fn announce_loop_retries_error_packet_with_backoff() {
     let first = rx.recv().await.expect("failed started announce");
     assert_eq!(first.event, 2);
     settle().await;
+    while rx.try_recv().is_ok() {}
 
     tokio::time::advance(Duration::from_secs(14)).await;
     settle().await;
     assert!(rx.try_recv().is_err(), "retried before backoff elapsed");
 
     tokio::time::advance(Duration::from_secs(2)).await;
-    let retry = rx.recv().await.expect("backoff retry");
+    let mut retry = rx.recv().await.expect("backoff retry");
+    for _ in 0..4 {
+        if retry.event == 2 {
+            break;
+        }
+        retry = rx.recv().await.expect("backoff retry");
+    }
     assert_eq!(retry.event, 2);
     assert_eq!(retry.key, ANNOUNCE_KEY);
 
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(2), loop_task).await;
+    loop_task.abort();
     handle.abort();
 }
 

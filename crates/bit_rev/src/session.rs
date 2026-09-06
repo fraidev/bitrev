@@ -192,6 +192,10 @@ impl Session {
         session
     }
 
+    pub fn global_peer_count(&self) -> usize {
+        self.global_peers.load(Ordering::Relaxed)
+    }
+
     pub fn listen_port(&self) -> u16 {
         self.listen_addr
             .lock()
@@ -851,6 +855,10 @@ async fn handle_incoming(
         debug!(%addr, "incoming peer for unknown info hash");
         return;
     };
+    if torrent.peer_states.is_banned(addr) {
+        debug!(%addr, "refusing banned incoming peer");
+        return;
+    }
     let reply = Handshake::outgoing(handshake.info_hash, ctx.peer_id);
     if let Err(e) = Protocol::write_handshake(&mut stream, &reply).await {
         debug!(%addr, error = %e, "failed to write handshake reply");

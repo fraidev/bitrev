@@ -25,8 +25,7 @@ pub enum MessageId {
 #[derive(Debug)]
 pub enum WriterRequest {
     Message(Message),
-    //ReadChunkRequest(ChunkInfo),
-    //Disconnect(anyhow::Result<()>),
+    Disconnect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,8 +140,53 @@ pub enum MessageError {
     InvalidPayload(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    Truncated,
+    UnknownId(u8),
+    InvalidLengthPrefix,
+}
+
 pub const MAX_INCOMING_REQUEST_LENGTH: u32 = 128 * 1024;
 pub const MAX_UPLOAD_QUEUE: usize = 8;
+pub const MAX_CHOKED_REQUESTS: u32 = 8;
+pub const MAX_QUEUE_OVERFLOWS: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestStormError {
+    Choked,
+    Queue,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RequestStorm {
+    pub choked_requests: u32,
+    pub queue_overflows: u32,
+}
+
+impl RequestStorm {
+    pub fn on_choked_request(&mut self) -> Result<(), RequestStormError> {
+        self.choked_requests = self.choked_requests.saturating_add(1);
+        if self.choked_requests > MAX_CHOKED_REQUESTS {
+            Err(RequestStormError::Choked)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn on_queue_overflow(&mut self) -> Result<(), RequestStormError> {
+        self.queue_overflows = self.queue_overflows.saturating_add(1);
+        if self.queue_overflows > MAX_QUEUE_OVERFLOWS {
+            Err(RequestStormError::Queue)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn reset_choked(&mut self) {
+        self.choked_requests = 0;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockRequest {
@@ -391,15 +435,17 @@ pub fn serialize(msg: Option<Message>) -> Vec<u8> {
     }
 }
 
-pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Option<Message> {
-    let length_buf: [u8; 4] = length_buf.try_into().ok()?;
+pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Result<Message, DecodeError> {
+    let length_buf: [u8; 4] = length_buf
+        .try_into()
+        .map_err(|_| DecodeError::InvalidLengthPrefix)?;
     let length = u32::from_be_bytes(length_buf);
     if length == 0 {
-        return None;
+        return Ok(Message::KeepAlive);
     }
     let length = length as usize;
     if message_buf.is_empty() || message_buf.len() < length {
-        return None;
+        return Err(DecodeError::Truncated);
     }
 
     let id = message_buf[0];
@@ -424,32 +470,30 @@ pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Option<Message> {
         21 => MessageId::MsgHashRequest,
         22 => MessageId::MsgHashes,
         23 => MessageId::MsgHashReject,
-        _ => return None,
+        _ => return Err(DecodeError::UnknownId(id)),
     };
 
     match message_id {
         MessageId::MsgHave | MessageId::MsgSuggestPiece | MessageId::MsgAllowedFast
             if payload.len() < 4 =>
         {
-            return None
+            return Err(DecodeError::Truncated)
         }
         MessageId::MsgRequest | MessageId::MsgCancel | MessageId::MsgRejectRequest
             if payload.len() < 12 =>
         {
-            return None
+            return Err(DecodeError::Truncated)
         }
-        MessageId::MsgPiece if payload.len() < 8 => return None,
-        MessageId::MsgExtended if payload.is_empty() => return None,
+        MessageId::MsgPiece if payload.len() < 8 => return Err(DecodeError::Truncated),
+        MessageId::MsgExtended if payload.is_empty() => return Err(DecodeError::Truncated),
         _ => {}
     }
 
-    Some(
-        (MessageInner {
-            id: message_id,
-            payload,
-        })
-        .into(),
-    )
+    Ok((MessageInner {
+        id: message_id,
+        payload,
+    })
+    .into())
 }
 
 #[cfg(test)]
@@ -616,10 +660,10 @@ mod tests {
         let expected = Message::Have(4);
 
         let result = read(&length_buf, &message_buf);
-        assert_eq!(result, Some(expected));
+        assert_eq!(result, Ok(expected));
     }
 
-    fn round_trip(msg: Message) -> Option<Message> {
+    fn round_trip(msg: Message) -> Result<Message, DecodeError> {
         let bytes = serialize(Some(msg));
         read(&bytes[0..4], &bytes[4..])
     }
@@ -669,12 +713,11 @@ mod tests {
 
         for msg in cases {
             let expected = msg.clone();
-            assert_eq!(round_trip(msg), Some(expected));
+            assert_eq!(round_trip(msg), Ok(expected));
         }
 
-        // Keep-alive serializes to a zero length prefix. read maps length 0 to None.
         assert_eq!(serialize(Some(Message::KeepAlive)), vec![0, 0, 0, 0]);
-        assert_eq!(round_trip(Message::KeepAlive), None);
+        assert_eq!(round_trip(Message::KeepAlive), Ok(Message::KeepAlive));
     }
 
     #[test]
@@ -711,20 +754,20 @@ mod tests {
         let mut expected = vec![0x00, 0x00, 0x00, 0x0f, 20, 0];
         expected.extend_from_slice(b"d1:md1:ai1eee");
         assert_eq!(serialize(Some(handshake.clone())), expected);
-        assert_eq!(round_trip(handshake.clone()), Some(handshake));
+        assert_eq!(round_trip(handshake.clone()), Ok(handshake));
 
         let data = format_extended(3, vec![0xaa, 0xbb]);
         assert_eq!(
             serialize(Some(data.clone())),
             vec![0x00, 0x00, 0x00, 0x04, 20, 3, 0xaa, 0xbb]
         );
-        assert_eq!(round_trip(data.clone()), Some(data));
+        assert_eq!(round_trip(data.clone()), Ok(data));
         assert!(format_extended(1, vec![]).is_extended());
     }
 
     #[test]
     fn read_keep_alive_length_zero() {
-        assert_eq!(read(&[0, 0, 0, 0], &[]), None);
+        assert_eq!(read(&[0, 0, 0, 0], &[]), Ok(Message::KeepAlive));
     }
 
     #[test]
@@ -754,27 +797,47 @@ mod tests {
         ];
 
         for (length_buf, message_buf) in cases {
-            assert_eq!(read(length_buf, message_buf), None);
+            assert_eq!(read(length_buf, message_buf), Err(DecodeError::Truncated));
         }
     }
 
     #[test]
     fn read_unknown_id() {
-        let cases: &[(&[u8], &[u8])] = &[
-            (&[0, 0, 0, 1], &[99]),
-            (&[0, 0, 0, 3], &[9, 0, 1]),
-            (&[0, 0, 0, 1], &[255]),
+        let cases: &[(&[u8], &[u8], u8)] = &[
+            (&[0, 0, 0, 1], &[99], 99),
+            (&[0, 0, 0, 3], &[9, 0, 1], 9),
+            (&[0, 0, 0, 1], &[255], 255),
         ];
 
-        for (length_buf, message_buf) in cases {
-            assert_eq!(read(length_buf, message_buf), None);
+        for (length_buf, message_buf, id) in cases {
+            assert_eq!(
+                read(length_buf, message_buf),
+                Err(DecodeError::UnknownId(*id))
+            );
         }
     }
 
     #[test]
     fn read_empty_buffer() {
-        assert_eq!(read(&[], &[]), None);
-        assert_eq!(read(&[0, 0, 0, 1], &[]), None);
+        assert_eq!(read(&[], &[]), Err(DecodeError::InvalidLengthPrefix));
+        assert_eq!(read(&[0, 0, 0, 1], &[]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn request_storm_disconnects_after_threshold() {
+        let mut storm = RequestStorm::default();
+        for _ in 0..MAX_CHOKED_REQUESTS {
+            assert_eq!(storm.on_choked_request(), Ok(()));
+        }
+        assert_eq!(storm.on_choked_request(), Err(RequestStormError::Choked));
+        storm.reset_choked();
+        assert_eq!(storm.on_choked_request(), Ok(()));
+
+        let mut storm = RequestStorm::default();
+        for _ in 0..MAX_QUEUE_OVERFLOWS {
+            assert_eq!(storm.on_queue_overflow(), Ok(()));
+        }
+        assert_eq!(storm.on_queue_overflow(), Err(RequestStormError::Queue));
     }
 
     #[test]

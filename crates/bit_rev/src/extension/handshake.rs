@@ -6,6 +6,8 @@ use crate::identity;
 
 pub const DEFAULT_REQQ: i64 = 250;
 pub const UT_METADATA: &str = "ut_metadata";
+pub const MAX_METADATA_SIZE: i64 = 2 * 1024 * 1024;
+pub const MAX_EXTENSION_PAYLOAD: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExtensionHandshake {
@@ -72,6 +74,9 @@ impl ExtensionHandshake {
     }
 
     pub fn decode(bytes: &[u8]) -> Self {
+        if bytes.len() > MAX_EXTENSION_PAYLOAD {
+            return Self::default();
+        }
         let Ok(Value::Dict(dict)) = serde_bencode::from_bytes::<Value>(bytes) else {
             return Self::default();
         };
@@ -97,7 +102,9 @@ impl ExtensionHandshake {
             handshake.reqq = Some(*reqq);
         }
         if let Some(Value::Int(size)) = dict.get(&b"metadata_size"[..]) {
-            handshake.metadata_size = Some(*size);
+            if (0..=MAX_METADATA_SIZE).contains(size) {
+                handshake.metadata_size = Some(*size);
+            }
         }
         handshake
     }
@@ -233,6 +240,19 @@ mod tests {
         assert_eq!(decoded.reqq, Some(250));
         assert_eq!(decoded.metadata_size, Some(32768));
         assert_eq!(decoded.v.as_deref(), Some("\u{00b5}Torrent 1.2"));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_payload_and_metadata_size() {
+        let huge = vec![0u8; MAX_EXTENSION_PAYLOAD + 1];
+        assert_eq!(
+            ExtensionHandshake::decode(&huge),
+            ExtensionHandshake::default()
+        );
+
+        let oversized = b"d13:metadata_sizei999999999ee";
+        let decoded = ExtensionHandshake::decode(oversized);
+        assert!(decoded.metadata_size.is_none());
     }
 
     #[test]

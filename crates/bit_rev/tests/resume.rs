@@ -13,7 +13,7 @@ use bit_rev::bitfield::Bitfield;
 use bit_rev::file::{Info, TorrentFile, TorrentMeta};
 use bit_rev::handshake::Handshake;
 use bit_rev::message::{self, BlockRequest, Message};
-use bit_rev::protocol::Protocol;
+use bit_rev::protocol::{Frame, Protocol};
 use bit_rev::resume::{self, ResumeData, ResumeStatus};
 use bit_rev::session::{AddTorrentOptions, Session, SessionOptions};
 use bit_rev::torrent::Torrent;
@@ -184,9 +184,9 @@ async fn serve_recording_peer(
             _ = cancel.cancelled() => break,
             msg = proto.read(&mut stream) => {
                 let msg = match msg {
-                    Ok(Some(msg)) => msg,
-                    Ok(None) => continue,
-                    Err(_) => break,
+                    Ok(Frame::Message(msg)) => msg,
+                    Ok(Frame::KeepAlive) | Ok(Frame::Unknown { .. }) => continue,
+                    Ok(Frame::Eof) | Err(_) => break,
                 };
                 match msg {
                     Message::Interested => {

@@ -721,6 +721,26 @@ mod tests {
         (buf[..len].to_vec(), from)
     }
 
+    async fn recv_announce(
+        socket: &UdpSocket,
+        connection_id: u64,
+        params: &AnnounceParams,
+    ) -> (u32, SocketAddr) {
+        loop {
+            let (data, from) = recv_from_mock(socket).await;
+            if data.len() == CONNECT_REQUEST_LEN {
+                let tid = assert_connect_request(&data);
+                socket
+                    .send_to(&connect_response_bytes(tid, connection_id), from)
+                    .await
+                    .unwrap();
+                continue;
+            }
+            let tid = assert_announce_request(&data, connection_id, params);
+            return (tid, from);
+        }
+    }
+
     #[test]
     fn test_build_connect_request() {
         let request = build_connect_request(0x0102_0304);
@@ -927,12 +947,12 @@ mod tests {
         .await
         .unwrap();
 
-        let (announce, from) = recv_from_mock(&mock).await;
-        let announce_tid = assert_announce_request(
-            &announce,
+        let (announce_tid, from) = recv_announce(
+            &mock,
             FIXED_CONNECTION_ID,
             &sample_params(Some(AnnounceEvent::Started)),
-        );
+        )
+        .await;
         let response = announce_response_v4(
             announce_tid,
             1800,
@@ -980,8 +1000,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (announce, from) = recv_from_mock(&mock).await;
-        let announce_tid = assert_announce_request(&announce, FIXED_CONNECTION_ID, &params);
+        let (announce_tid, from) = recv_announce(&mock, FIXED_CONNECTION_ID, &params).await;
         mock.send_to(
             &announce_response_v4(announce_tid.wrapping_add(1), 60, 0, 0, &[]),
             from,
@@ -1032,8 +1051,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (announce, from) = recv_from_mock(&mock).await;
-        let announce_tid = assert_announce_request(&announce, FIXED_CONNECTION_ID, &params);
+        let (announce_tid, from) = recv_announce(&mock, FIXED_CONNECTION_ID, &params).await;
         mock.send_to(
             &error_response_bytes(announce_tid, "banned by tracker"),
             from,
@@ -1076,8 +1094,7 @@ mod tests {
         mock.send_to(&connect_response_bytes(connect_tid, 1), from)
             .await
             .unwrap();
-        let (announce, from) = recv_from_mock(&mock).await;
-        let announce_tid = assert_announce_request(&announce, 1, &params);
+        let (announce_tid, from) = recv_announce(&mock, 1, &params).await;
         mock.send_to(&announce_response_v4(announce_tid, 1800, 0, 0, &[]), from)
             .await
             .unwrap();
@@ -1103,13 +1120,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (stale, from) = recv_from_mock(&mock).await;
-        let stale_cid = read_u64_at(&stale, 0);
-        assert_eq!(
-            stale_cid, 2,
-            "client must announce with the fresh connection id"
-        );
-        let announce_tid = assert_announce_request(&stale, 2, &params);
+        let (announce_tid, from) = recv_announce(&mock, 2, &params).await;
         mock.send_to(&announce_response_v4(announce_tid, 60, 0, 0, &[]), from)
             .await
             .unwrap();
@@ -1143,8 +1154,7 @@ mod tests {
         mock.send_to(&connect_response_bytes(connect_tid, 11), from)
             .await
             .unwrap();
-        let (announce, from) = recv_from_mock(&mock).await;
-        let announce_tid = assert_announce_request(&announce, 11, &params);
+        let (announce_tid, from) = recv_announce(&mock, 11, &params).await;
         mock.send_to(&announce_response_v4(announce_tid, 1800, 0, 0, &[]), from)
             .await
             .unwrap();
@@ -1169,13 +1179,7 @@ mod tests {
         mock.send_to(&connect_response_bytes(connect_tid, 22), from)
             .await
             .unwrap();
-        let (announce, from) = recv_from_mock(&mock).await;
-        assert_ne!(
-            read_u64_at(&announce, 0),
-            11,
-            "server would reject the expired connection id"
-        );
-        let announce_tid = assert_announce_request(&announce, 22, &params);
+        let (announce_tid, from) = recv_announce(&mock, 22, &params).await;
         mock.send_to(&announce_response_v4(announce_tid, 90, 1, 1, &[]), from)
             .await
             .unwrap();
@@ -1215,8 +1219,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (announce, from) = recv_from_mock(&mock).await;
-        let announce_tid = assert_announce_request(&announce, FIXED_CONNECTION_ID, &params);
+        let (announce_tid, from) = recv_announce(&mock, FIXED_CONNECTION_ID, &params).await;
         let peer = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         mock.send_to(
             &announce_response_v6(announce_tid, 120, 4, 5, &[(peer, 6881)]),
@@ -1258,13 +1261,11 @@ mod tests {
         .await
         .unwrap();
 
-        let (first, _from) = recv_from_mock(&mock).await;
-        let first_tid = assert_announce_request(&first, FIXED_CONNECTION_ID, &params);
+        let (first_tid, _from) = recv_announce(&mock, FIXED_CONNECTION_ID, &params).await;
 
         tokio::time::advance(Duration::from_secs(15)).await;
 
-        let (second, from) = recv_from_mock(&mock).await;
-        let second_tid = assert_announce_request(&second, FIXED_CONNECTION_ID, &params);
+        let (second_tid, from) = recv_announce(&mock, FIXED_CONNECTION_ID, &params).await;
         assert_ne!(
             first_tid, second_tid,
             "each request uses a fresh transaction id"

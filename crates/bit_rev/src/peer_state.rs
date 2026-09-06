@@ -1,20 +1,28 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::Notify;
 
 use crate::{bitfield::Bitfield, message::WriterRequest, peer::PeerAddr};
 
+pub const BAN_TTL: Duration = Duration::from_secs(60 * 60);
+pub const HASH_FAILURE_BAN_THRESHOLD: u32 = 3;
+
 #[derive(Debug, Default)]
 pub struct PeerStates {
     pub states: DashMap<PeerAddr, PeerState>,
+    hash_failures: DashMap<PeerAddr, u32>,
+    banned: DashMap<PeerAddr, Instant>,
 }
 
 impl PeerStates {
     pub fn add_if_not_seen(&self, peer: PeerAddr) -> bool {
+        if self.is_banned(peer) {
+            return false;
+        }
         use dashmap::mapref::entry::Entry;
         match self.states.entry(peer) {
             Entry::Occupied(_) => false,
@@ -26,6 +34,9 @@ impl PeerStates {
     }
 
     pub fn insert_live(&self, peer: PeerAddr, writer_tx: flume::Sender<WriterRequest>) -> bool {
+        if self.is_banned(peer) {
+            return false;
+        }
         use dashmap::mapref::entry::Entry;
         match self.states.entry(peer) {
             Entry::Occupied(_) => false,
@@ -42,6 +53,62 @@ impl PeerStates {
 
     pub fn is_empty(&self) -> bool {
         self.states.is_empty()
+    }
+
+    pub fn purge_expired_bans(&self) {
+        let now = Instant::now();
+        self.banned.retain(|_, until| *until > now);
+    }
+
+    pub fn is_banned(&self, peer: PeerAddr) -> bool {
+        self.purge_expired_bans();
+        self.banned.contains_key(&peer)
+    }
+
+    pub fn ban(&self, peer: PeerAddr) {
+        self.banned.insert(peer, Instant::now() + BAN_TTL);
+        if let Some(state) = self.states.get(&peer) {
+            if let Some(tx) = &state.writer_tx {
+                let _ = tx.send(WriterRequest::Disconnect);
+            }
+        }
+    }
+
+    pub fn banned_count(&self) -> usize {
+        self.purge_expired_bans();
+        self.banned.len()
+    }
+
+    pub fn hash_failures(&self, peer: PeerAddr) -> u32 {
+        self.hash_failures.get(&peer).map(|n| *n).unwrap_or(0)
+    }
+
+    pub fn increment_failures(&self, peer: PeerAddr) -> u32 {
+        let count = {
+            let mut entry = self.hash_failures.entry(peer).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        if let Some(mut state) = self.states.get_mut(&peer) {
+            state.hash_failures = count;
+        }
+        count
+    }
+
+    /// Returns true if the peer is now banned.
+    pub fn record_hash_failure(&self, peer: PeerAddr, sole_contributor: bool) -> bool {
+        if sole_contributor {
+            self.increment_failures(peer);
+            self.ban(peer);
+            return true;
+        }
+        let count = self.increment_failures(peer);
+        if count >= HASH_FAILURE_BAN_THRESHOLD {
+            self.ban(peer);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -60,6 +127,7 @@ pub struct PeerState {
     pub peer_allowed_fast: HashSet<u32>,
     pub our_allowed_fast: HashSet<u32>,
     pub suggested_pieces: Vec<u32>,
+    pub hash_failures: u32,
     pub stats: Arc<PeerLiveStats>,
     pub writer_tx: Option<flume::Sender<WriterRequest>>,
 }
@@ -111,6 +179,7 @@ impl PeerState {
             peer_allowed_fast: HashSet::new(),
             our_allowed_fast: HashSet::new(),
             suggested_pieces: Vec::new(),
+            hash_failures: 0,
             stats: Arc::new(PeerLiveStats::default()),
             writer_tx: None,
         }
@@ -158,5 +227,43 @@ mod tests {
         assert!(states.add_if_not_seen(peer));
         assert!(!states.add_if_not_seen(peer));
         assert_eq!(states.states.len(), 1);
+    }
+
+    #[test]
+    fn sole_contributor_is_banned_immediately() {
+        let states = PeerStates::default();
+        let peer = "127.0.0.1:6881".parse().unwrap();
+        assert!(states.record_hash_failure(peer, true));
+        assert!(states.is_banned(peer));
+        assert_eq!(states.banned_count(), 1);
+        assert!(!states.add_if_not_seen(peer));
+        let other_port: PeerAddr = "127.0.0.1:9999".parse().unwrap();
+        assert!(!states.is_banned(other_port));
+        assert!(states.add_if_not_seen(other_port));
+    }
+
+    #[test]
+    fn shared_contributors_banned_after_three_failures() {
+        let states = PeerStates::default();
+        let peer = "10.0.0.2:6881".parse().unwrap();
+        assert!(!states.record_hash_failure(peer, false));
+        assert!(!states.record_hash_failure(peer, false));
+        assert!(!states.is_banned(peer));
+        assert_eq!(states.hash_failures(peer), 2);
+        assert!(states.record_hash_failure(peer, false));
+        assert!(states.is_banned(peer));
+        assert_eq!(states.hash_failures(peer), 3);
+    }
+
+    #[test]
+    fn expired_bans_are_purged() {
+        let states = PeerStates::default();
+        let peer = "192.168.1.8:6881".parse().unwrap();
+        states
+            .banned
+            .insert(peer, Instant::now() - Duration::from_secs(1));
+        assert!(!states.is_banned(peer));
+        assert_eq!(states.banned_count(), 0);
+        assert!(states.add_if_not_seen(peer));
     }
 }
