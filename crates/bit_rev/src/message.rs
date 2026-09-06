@@ -16,6 +16,7 @@ pub enum MessageId {
     MsgHaveNone = 15,
     MsgRejectRequest = 16,
     MsgAllowedFast = 17,
+    MsgExtended = 20,
     MsgHashRequest = 21,
     MsgHashes = 22,
     MsgHashReject = 23,
@@ -44,6 +45,7 @@ pub enum Message {
     HaveNone,
     RejectRequest { index: u32, begin: u32, length: u32 },
     AllowedFast(u32),
+    Extended { ext_id: u8, payload: Vec<u8> },
     HashRequest,
     Hashes(Vec<u8>),
     HashReject,
@@ -90,6 +92,10 @@ impl From<MessageInner> for Message {
             MessageId::MsgAllowedFast => {
                 Message::AllowedFast(u32::from_be_bytes(inner.payload[0..4].try_into().unwrap()))
             }
+            MessageId::MsgExtended => Message::Extended {
+                ext_id: inner.payload[0],
+                payload: inner.payload[1..].to_vec(),
+            },
             MessageId::MsgHashRequest => Message::HashRequest,
             MessageId::MsgHashes => Message::Hashes(inner.payload),
             MessageId::MsgHashReject => Message::HashReject,
@@ -120,6 +126,7 @@ impl Display for MessageInner {
             MessageId::MsgHaveNone => "HAVE_NONE",
             MessageId::MsgRejectRequest => "REJECT_REQUEST",
             MessageId::MsgAllowedFast => "ALLOWED_FAST",
+            MessageId::MsgExtended => "EXTENDED",
             MessageId::MsgHashRequest => "HASH_REQUEST",
             MessageId::MsgHashes => "HASHES",
             MessageId::MsgHashReject => "HASH_REJECT",
@@ -224,6 +231,10 @@ pub fn format_reject_request(index: u32, begin: u32, length: u32) -> Message {
     }
 }
 
+pub fn format_extended(ext_id: u8, payload: Vec<u8>) -> Message {
+    Message::Extended { ext_id, payload }
+}
+
 impl Message {
     pub fn is_fast_extension(&self) -> bool {
         matches!(
@@ -234,6 +245,10 @@ impl Message {
                 | Message::RejectRequest { .. }
                 | Message::AllowedFast(_)
         )
+    }
+
+    pub fn is_extended(&self) -> bool {
+        matches!(self, Message::Extended { .. })
     }
 }
 
@@ -354,6 +369,12 @@ pub fn serialize(msg: Option<Message>) -> Vec<u8> {
                 Message::AllowedFast(index) => {
                     (MessageId::MsgAllowedFast, index.to_be_bytes().to_vec())
                 }
+                Message::Extended { ext_id, payload } => {
+                    let mut buf = Vec::with_capacity(1 + payload.len());
+                    buf.push(ext_id);
+                    buf.extend_from_slice(&payload);
+                    (MessageId::MsgExtended, buf)
+                }
                 Message::HashRequest => (MessageId::MsgHashRequest, vec![]),
                 Message::Hashes(payload) => (MessageId::MsgHashes, payload),
                 Message::HashReject => (MessageId::MsgHashReject, vec![]),
@@ -399,6 +420,7 @@ pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Option<Message> {
         15 => MessageId::MsgHaveNone,
         16 => MessageId::MsgRejectRequest,
         17 => MessageId::MsgAllowedFast,
+        20 => MessageId::MsgExtended,
         21 => MessageId::MsgHashRequest,
         22 => MessageId::MsgHashes,
         23 => MessageId::MsgHashReject,
@@ -417,6 +439,7 @@ pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Option<Message> {
             return None
         }
         MessageId::MsgPiece if payload.len() < 8 => return None,
+        MessageId::MsgExtended if payload.is_empty() => return None,
         _ => {}
     }
 
@@ -631,6 +654,14 @@ mod tests {
                 length: 4321,
             },
             Message::AllowedFast(7),
+            Message::Extended {
+                ext_id: 0,
+                payload: b"d1:md1:ai1eee".to_vec(),
+            },
+            Message::Extended {
+                ext_id: 3,
+                payload: vec![0x01, 0x02, 0x03],
+            },
             Message::HashRequest,
             Message::Hashes(vec![0x01, 0x02, 0x03]),
             Message::HashReject,
@@ -675,6 +706,23 @@ mod tests {
     }
 
     #[test]
+    fn extended_wire_bytes_and_round_trip() {
+        let handshake = format_extended(0, b"d1:md1:ai1eee".to_vec());
+        let mut expected = vec![0x00, 0x00, 0x00, 0x0f, 20, 0];
+        expected.extend_from_slice(b"d1:md1:ai1eee");
+        assert_eq!(serialize(Some(handshake.clone())), expected);
+        assert_eq!(round_trip(handshake.clone()), Some(handshake));
+
+        let data = format_extended(3, vec![0xaa, 0xbb]);
+        assert_eq!(
+            serialize(Some(data.clone())),
+            vec![0x00, 0x00, 0x00, 0x04, 20, 3, 0xaa, 0xbb]
+        );
+        assert_eq!(round_trip(data.clone()), Some(data));
+        assert!(format_extended(1, vec![]).is_extended());
+    }
+
+    #[test]
     fn read_keep_alive_length_zero() {
         assert_eq!(read(&[0, 0, 0, 0], &[]), None);
     }
@@ -701,6 +749,8 @@ mod tests {
             // RejectRequest payload shorter than 12 bytes
             (&[0, 0, 0, 9], &[16, 0, 0, 0, 1, 0, 0, 0, 0]),
             (&[0, 0, 0, 12], &[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]),
+            // Extended with no ext_id byte
+            (&[0, 0, 0, 1], &[20]),
         ];
 
         for (length_buf, message_buf) in cases {

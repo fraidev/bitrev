@@ -324,7 +324,12 @@ mod tests {
             let mut client_hs = [0u8; 68];
             server.read_exact(&mut client_hs).await.unwrap();
             assert_eq!(client_hs[27] & crate::handshake::FAST_EXTENSION_FLAG, 0x04);
-            assert_eq!(&client_hs[20..27], &[0u8; 7]);
+            assert_eq!(
+                client_hs[25] & crate::handshake::EXTENSION_PROTOCOL_FLAG,
+                0x10
+            );
+            assert_eq!(&client_hs[20..25], &[0u8; 5]);
+            assert_eq!(client_hs[26], 0);
             let reply = Handshake::new(INFO_HASH, REMOTE_PEER_ID).serialize();
             server.write_all(&reply).await.unwrap();
         });

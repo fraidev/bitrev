@@ -8,6 +8,7 @@ use tracing::debug;
 
 use crate::{
     discovery::{DiscoverySource, SourceDenied, SourceRegistry},
+    extension::ExtensionRegistry,
     file::TorrentMeta,
     identity::TrackerIdentity,
     peer::BencodeResponse,
@@ -31,6 +32,7 @@ pub struct PeerSpawnRuntime {
     pub max_peers_per_torrent: usize,
     pub max_peers_global: usize,
     pub listen_port: u16,
+    pub extensions: ExtensionRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +158,7 @@ impl TrackerPeers {
                 max_peers_per_torrent: runtime.max_peers_per_torrent,
                 max_peers_global: runtime.max_peers_global,
                 listen_port: runtime.listen_port,
+                extensions: runtime.extensions.clone(),
             };
             tokio::spawn(async move {
                 tracker::run_announce_loop(ctx, shutdown, |new_peers| {
@@ -175,6 +178,7 @@ impl TrackerPeers {
                         max_peers_per_torrent: runtime.max_peers_per_torrent,
                         max_peers_global: runtime.max_peers_global,
                         listen_port: runtime.listen_port,
+                        extensions: runtime.extensions.clone(),
                     };
                     async move {
                         process_peers(
@@ -226,6 +230,10 @@ async fn process_peers(
             choke_notify: runtime.choke_notify.clone(),
             incoming: None,
             incoming_fast_extension: None,
+            incoming_extension_protocol: None,
+            extensions: runtime.extensions.clone(),
+            listen_port: runtime.listen_port,
+            metadata_size: None,
             global_peers: runtime.global_peers.clone(),
             max_peers_per_torrent: runtime.max_peers_per_torrent,
             max_peers_global: runtime.max_peers_global,

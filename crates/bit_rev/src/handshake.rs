@@ -40,6 +40,7 @@ impl Handshake {
     pub fn outgoing(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
         let mut handshake = Self::new(info_hash, peer_id);
         handshake.enable_fast_extension();
+        handshake.enable_extension_protocol();
         handshake
     }
 
@@ -265,17 +266,19 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_sets_only_fast_extension_bit() {
+    fn outgoing_sets_fast_and_extension_protocol_bits() {
         let handshake = Handshake::outgoing(HASH_INFO, PEER_ID);
         assert_eq!(handshake.reserved[7], FAST_EXTENSION_FLAG);
-        assert_eq!(&handshake.reserved[..7], &[0u8; 7]);
+        assert_eq!(handshake.reserved[5], EXTENSION_PROTOCOL_FLAG);
+        assert_eq!(&handshake.reserved[..5], &[0u8; 5]);
+        assert_eq!(handshake.reserved[6], 0);
         assert!(handshake.supports_fast_extension());
-        assert!(!handshake.supports_extension_protocol());
+        assert!(handshake.supports_extension_protocol());
         assert_eq!(
             handshake.capabilities(),
             HandshakeCapabilities {
                 fast_extension: true,
-                extension_protocol: false,
+                extension_protocol: true,
             }
         );
     }
