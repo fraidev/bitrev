@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::extension::{Extension, ExtensionRegistry};
 use crate::file::{self, TorrentMeta};
 use crate::handshake::Handshake;
 use crate::message::{Message, WriterRequest};
@@ -104,6 +105,7 @@ pub struct Session {
     listen_addr: Arc<Mutex<Option<SocketAddr>>>,
     global_peers: Arc<AtomicUsize>,
     cancel: CancellationToken,
+    extensions: ExtensionRegistry,
 }
 
 pub struct AddTorrentOptions {
@@ -178,6 +180,7 @@ impl Session {
             listen_addr: Arc::new(Mutex::new(None)),
             global_peers: Arc::new(AtomicUsize::new(0)),
             cancel: CancellationToken::new(),
+            extensions: ExtensionRegistry::new(),
         };
         session.spawn_listener();
         session
@@ -221,6 +224,17 @@ impl Session {
         self.peer_id
     }
 
+    pub fn extensions(&self) -> &ExtensionRegistry {
+        &self.extensions
+    }
+
+    pub fn register_extension<F>(&self, factory: F) -> u8
+    where
+        F: Fn() -> Box<dyn Extension> + Send + Sync + 'static,
+    {
+        self.extensions.register(factory)
+    }
+
     fn spawn_listener(&self) {
         let port = self.options.listen_port;
         let torrents = self.torrents.clone();
@@ -230,6 +244,7 @@ impl Session {
         let cancel = self.cancel.clone();
         let max_peers_per_torrent = self.options.max_peers_per_torrent;
         let max_peers_global = self.options.max_peers_global;
+        let extensions = self.extensions.clone();
 
         tokio::spawn(async move {
             let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -264,15 +279,25 @@ impl Session {
                         };
                         let torrents = torrents.clone();
                         let global_peers = global_peers.clone();
+                        let extensions = extensions.clone();
+                        let listen_port = listen_addr
+                            .lock()
+                            .unwrap()
+                            .map(|bound| bound.port())
+                            .unwrap_or(port);
                         tokio::spawn(async move {
                             handle_incoming(
                                 stream,
                                 addr,
-                                peer_id,
-                                torrents,
-                                global_peers,
-                                max_peers_per_torrent,
-                                max_peers_global,
+                                IncomingPeerContext {
+                                    peer_id,
+                                    torrents,
+                                    global_peers,
+                                    max_peers_per_torrent,
+                                    max_peers_global,
+                                    extensions,
+                                    listen_port,
+                                },
                             )
                             .await;
                         });
@@ -412,6 +437,10 @@ impl Session {
             choke_notify: torrent.choke_notify.clone(),
             incoming: None,
             incoming_fast_extension: None,
+            incoming_extension_protocol: None,
+            extensions: self.extensions.clone(),
+            listen_port: self.listen_port(),
+            metadata_size: None,
             global_peers: self.global_peers.clone(),
             max_peers_per_torrent: self.options.max_peers_per_torrent,
             max_peers_global: self.options.max_peers_global,
@@ -591,6 +620,7 @@ impl Session {
                 max_peers_per_torrent: self.options.max_peers_per_torrent,
                 max_peers_global: self.options.max_peers_global,
                 listen_port,
+                extensions: self.extensions.clone(),
             })
             .await;
 
@@ -785,14 +815,20 @@ fn choke_all_peers(peer_states: &PeerStates) {
     }
 }
 
-async fn handle_incoming(
-    mut stream: tokio::net::TcpStream,
-    addr: SocketAddr,
+struct IncomingPeerContext {
     peer_id: [u8; 20],
     torrents: Arc<DashMap<[u8; 20], Arc<TorrentSession>>>,
     global_peers: Arc<AtomicUsize>,
     max_peers_per_torrent: usize,
     max_peers_global: usize,
+    extensions: ExtensionRegistry,
+    listen_port: u16,
+}
+
+async fn handle_incoming(
+    mut stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+    ctx: IncomingPeerContext,
 ) {
     let handshake = match Protocol::read_handshake(&mut stream).await {
         Ok(handshake) => handshake,
@@ -801,14 +837,15 @@ async fn handle_incoming(
             return;
         }
     };
-    let Some(torrent) = torrents
+    let Some(torrent) = ctx
+        .torrents
         .get(&handshake.info_hash)
         .map(|entry| entry.clone())
     else {
         debug!(%addr, "incoming peer for unknown info hash");
         return;
     };
-    let reply = Handshake::outgoing(handshake.info_hash, peer_id);
+    let reply = Handshake::outgoing(handshake.info_hash, ctx.peer_id);
     if let Err(e) = Protocol::write_handshake(&mut stream, &reply).await {
         debug!(%addr, error = %e, "failed to write handshake reply");
         return;
@@ -817,8 +854,12 @@ async fn handle_incoming(
     try_spawn_peer(SpawnPeerParams {
         peer: addr,
         info_hash: handshake.info_hash,
-        peer_id,
+        peer_id: ctx.peer_id,
         incoming_fast_extension: Some(handshake.supports_fast_extension()),
+        incoming_extension_protocol: Some(handshake.supports_extension_protocol()),
+        extensions: ctx.extensions,
+        listen_port: ctx.listen_port,
+        metadata_size: None,
         piece_tx: torrent.piece_tx.clone(),
         have_broadcast: torrent.have_broadcast.clone(),
         torrent_downloaded_state: torrent.downloaded_state.clone(),
@@ -829,9 +870,9 @@ async fn handle_incoming(
         torrent: torrent.torrent.clone(),
         choke_notify: torrent.choke_notify.clone(),
         incoming: Some(stream),
-        global_peers,
-        max_peers_per_torrent,
-        max_peers_global,
+        global_peers: ctx.global_peers,
+        max_peers_per_torrent: ctx.max_peers_per_torrent,
+        max_peers_global: ctx.max_peers_global,
     });
 }
 

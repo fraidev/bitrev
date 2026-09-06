@@ -19,6 +19,7 @@ use tracing::{debug, error, trace};
 use crate::{
     allowed_fast::{generate_allowed_fast_for_ip, DEFAULT_ALLOWED_FAST_SET_SIZE},
     bitfield::Bitfield,
+    extension::{ExtensionRegistry, ExtensionSession},
     message::{
         self, format_reject_request, validate_request, BlockRequest, Message, RequestError,
         WriterRequest, MAX_UPLOAD_QUEUE,
@@ -341,6 +342,9 @@ pub struct PeerHandlerConfig {
     pub uploaded: Arc<AtomicU64>,
     pub torrent: Arc<Torrent>,
     pub choke_notify: Arc<Notify>,
+    pub extensions: ExtensionRegistry,
+    pub listen_port: u16,
+    pub metadata_size: Option<i64>,
 }
 
 pub struct PeerHandler {
@@ -365,6 +369,10 @@ pub struct PeerHandler {
     our_allowed_fast: Mutex<HashSet<u32>>,
     suggested_pieces: Mutex<Vec<u32>>,
     outstanding_requests: Mutex<HashSet<BlockRequest>>,
+    extension_protocol: AtomicBool,
+    extensions: Mutex<ExtensionSession>,
+    listen_port: u16,
+    metadata_size: Option<i64>,
 }
 
 impl PeerHandler {
@@ -391,6 +399,10 @@ impl PeerHandler {
             our_allowed_fast: Mutex::new(HashSet::new()),
             suggested_pieces: Mutex::new(Vec::new()),
             outstanding_requests: Mutex::new(HashSet::new()),
+            extension_protocol: AtomicBool::new(false),
+            extensions: Mutex::new(config.extensions.bind()),
+            listen_port: config.listen_port,
+            metadata_size: config.metadata_size,
         }
     }
 
@@ -402,6 +414,17 @@ impl PeerHandler {
         self.fast_extension.store(enabled, Ordering::Relaxed);
         if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
             state.fast_extension = enabled;
+        }
+    }
+
+    fn extension_protocol(&self) -> bool {
+        self.extension_protocol.load(Ordering::Relaxed)
+    }
+
+    fn set_extension_protocol(&self, enabled: bool) {
+        self.extension_protocol.store(enabled, Ordering::Relaxed);
+        if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
+            state.extension_protocol = enabled;
         }
     }
 
@@ -976,6 +999,26 @@ impl PeerHandler {
                     debug!("peer canceled request {:?}", req);
                 }
             }
+            Message::Extended { ext_id, payload } => {
+                if !self.extension_protocol() {
+                    debug!("extended message without negotiation, ignoring");
+                    return Ok(());
+                }
+                let outgoing = self
+                    .extensions
+                    .lock()
+                    .unwrap()
+                    .handle_extended(ext_id, payload);
+                for msg in outgoing {
+                    if self
+                        .peer_writer_tx
+                        .send(WriterRequest::Message(msg))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
             message => {
                 debug!("received unsupported message {:?}, ignoring", message);
             }
@@ -1029,6 +1072,10 @@ impl PeerConnection {
         let handshake = protocol.complete_handshake(&mut stream).await?;
         self.handler
             .set_fast_extension(handshake.supports_fast_extension());
+        self.handler
+            .set_extension_protocol(handshake.supports_extension_protocol());
+        self.send_extension_handshake(&protocol, &mut stream)
+            .await?;
         self.send_initial_bitfield(&protocol, &mut stream).await?;
         self.send_allowed_fast(&protocol, &mut stream).await?;
         self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
@@ -1042,10 +1089,31 @@ impl PeerConnection {
         have_broadcast: tokio::sync::broadcast::Receiver<u32>,
     ) -> anyhow::Result<()> {
         let protocol = Arc::new(Protocol::connect(self.peer, self.info_hash, self.peer_id).await?);
+        self.send_extension_handshake(&protocol, &mut stream)
+            .await?;
         self.send_initial_bitfield(&protocol, &mut stream).await?;
         self.send_allowed_fast(&protocol, &mut stream).await?;
         self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
             .await
+    }
+
+    async fn send_extension_handshake(
+        &self,
+        protocol: &Protocol,
+        stream: &mut TcpStream,
+    ) -> anyhow::Result<()> {
+        if !self.handler.extension_protocol() {
+            return Ok(());
+        }
+        let listen_port = (self.handler.listen_port != 0).then_some(self.handler.listen_port);
+        let msg = self
+            .handler
+            .extensions
+            .lock()
+            .unwrap()
+            .outgoing_handshake(listen_port, self.handler.metadata_size);
+        protocol.send_message(stream, msg).await?;
+        Ok(())
     }
 
     async fn send_initial_bitfield(
@@ -1146,6 +1214,11 @@ impl PeerConnection {
                     };
 
                     let buf = match req {
+                        WriterRequest::Message(msg)
+                            if msg.is_extended() && !self.handler.extension_protocol() =>
+                        {
+                            continue;
+                        }
                         WriterRequest::Message(msg) => message::serialize(Some(msg)),
                     };
 
@@ -1226,6 +1299,10 @@ pub struct SpawnPeerParams {
     pub choke_notify: Arc<Notify>,
     pub incoming: Option<TcpStream>,
     pub incoming_fast_extension: Option<bool>,
+    pub incoming_extension_protocol: Option<bool>,
+    pub extensions: ExtensionRegistry,
+    pub listen_port: u16,
+    pub metadata_size: Option<i64>,
     pub global_peers: Arc<std::sync::atomic::AtomicUsize>,
     pub max_peers_per_torrent: usize,
     pub max_peers_global: usize,
@@ -1263,9 +1340,15 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             uploaded: params.uploaded,
             torrent: params.torrent,
             choke_notify: params.choke_notify,
+            extensions: params.extensions,
+            listen_port: params.listen_port,
+            metadata_size: params.metadata_size,
         }));
         if let Some(fast) = params.incoming_fast_extension {
             handler.set_fast_extension(fast);
+        }
+        if let Some(extended) = params.incoming_extension_protocol {
+            handler.set_extension_protocol(extended);
         }
         let connection = PeerConnection::new(
             params.peer,

@@ -313,6 +313,7 @@ async fn seeder_sends_have_all_when_fast_negotiated() {
             continue;
         };
         match msg {
+            Message::Extended { ext_id: 0, .. } => {}
             Message::HaveAll => saw_have_all = true,
             Message::AllowedFast(index) => allowed.push(index),
             Message::Bitfield(_) => panic!("expected have-all, got bitfield"),
@@ -329,6 +330,77 @@ async fn seeder_sends_have_all_when_fast_negotiated() {
         !allowed.is_empty(),
         "seeder should advertise an allowed-fast set"
     );
+    drop(session);
+}
+
+#[tokio::test]
+async fn seeder_sends_no_extended_without_negotiation() {
+    let data = generated_payload(16_384);
+    let (session, addr, meta) = start_seeder(&data, 16_384).await;
+    let (mut stream, proto) = handshake_with(addr, meta.info_hash, *b"-LC0001-noext0000001").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_bitfield = false;
+    while tokio::time::Instant::now() < deadline {
+        let msg = tokio::time::timeout(Duration::from_millis(400), proto.read(&mut stream)).await;
+        let Ok(Ok(Some(msg))) = msg else {
+            if saw_bitfield {
+                break;
+            }
+            continue;
+        };
+        assert!(
+            !msg.is_extended(),
+            "peer without the extension bit must not receive extended messages, got {msg:?}"
+        );
+        if matches!(msg, Message::Bitfield(_)) {
+            saw_bitfield = true;
+            break;
+        }
+    }
+    assert!(saw_bitfield, "expected a bitfield and no extended messages");
+    drop(session);
+}
+
+#[tokio::test]
+async fn seeder_sends_extension_handshake_immediately_when_negotiated() {
+    let data = generated_payload(16_384);
+    let (session, addr, meta) = start_seeder(&data, 16_384).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect seeder");
+    let local = Handshake::outgoing(meta.info_hash, *b"-LC0001-extproto0001");
+    assert!(local.supports_extension_protocol());
+    stream.write_all(&local.serialize()).await.unwrap();
+    let proto = Protocol::connect(addr, meta.info_hash, *b"-LC0001-extproto0001")
+        .await
+        .unwrap();
+    let reply = Protocol::read_handshake(&mut stream).await.unwrap();
+    assert!(reply.supports_extension_protocol());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut handshake = None;
+    while tokio::time::Instant::now() < deadline {
+        let msg = tokio::time::timeout(Duration::from_millis(400), proto.read(&mut stream)).await;
+        let Ok(Ok(Some(msg))) = msg else {
+            continue;
+        };
+        match msg {
+            Message::Extended { ext_id: 0, payload } => {
+                handshake = Some(crate::extension::ExtensionHandshake::decode(&payload));
+                break;
+            }
+            Message::KeepAlive => {}
+            other => {
+                panic!("expected extension handshake immediately after BT handshake, got {other:?}")
+            }
+        }
+    }
+    let handshake = handshake.expect("seeder should send an extension handshake");
+    assert_eq!(
+        handshake.v.as_deref(),
+        Some(crate::identity::extension_version().as_str())
+    );
+    assert_eq!(handshake.reqq, Some(crate::extension::DEFAULT_REQQ));
+    assert_eq!(handshake.p, Some(i64::from(addr.port())));
     drop(session);
 }
 
