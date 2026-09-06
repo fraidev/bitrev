@@ -1,0 +1,86 @@
+# BitRev default configuration.
+# Unknown keys are rejected. Keys for features that are not implemented yet
+# still parse so this file stays valid across releases.
+
+# Directory where torrent data is written.
+download_dir = "."
+
+# TCP listen port announced to trackers.
+port = 6881
+
+# Maximum peers for one torrent.
+max_peers_per_torrent = 55
+
+# Maximum peers across all torrents.
+max_connections = 200
+
+# Peers requested from each tracker announce.
+numwant = 50
+
+# Resume data, cached torrents, and DHT state. `~` is the home directory.
+state_dir = "~/.bitrev"
+
+# MSE policy: disabled | prefer_plaintext | prefer_encrypted | require_encrypted
+encryption = "prefer_encrypted"
+
+# Bytes per second. 0 is unlimited.
+upload_limit = 0
+download_limit = 0
+
+# Peer exchange (BEP-0011).
+pex = true
+
+# Local peer discovery (BEP-0014).
+lpd = true
+
+# UPnP / NAT-PMP port mapping.
+nat = true
+
+# HTTP/FTP web seeds (BEP-0017 / BEP-0019).
+webseed = true
+
+# Dual-stack IPv6 (BEP-0007).
+ipv6 = true
+
+# Move data here when a torrent finishes. Empty disables the feature.
+completed_dir = ""
+
+# Watch this directory for new .torrent / .magnet files. Empty disables it.
+watch_dir = ""
+
+[seed]
+# Serve pieces after the download finishes.
+enabled = true
+# Stop seeding at this upload/download ratio. 0 is unlimited.
+ratio_limit = 0.0
+# Stop seeding this many minutes after completion. 0 is unlimited.
+time_limit = 0
+
+[dht]
+# Distributed hash table (BEP-0005).
+enabled = true
+port = 6881
+
+[utp]
+# Micro Transport Protocol (BEP-0029).
+enabled = true
+
+[queue]
+max_active_downloads = 5
+max_active_uploads = 8
+# 0 is unlimited.
+max_active = 0
+dont_count_slow = true
+
+[ip_filter]
+# Path to an eMule / CIDR blocklist. Empty disables filtering.
+path = ""
+
+[server]
+# Used by `bitrev serve`. Binding loopback is intentional.
+host = "127.0.0.1"
+port = 8080
+username = "admin"
+# Empty password is generated on first `bitrev serve`.
+password = ""
+qbittorrent_compat = true

@@ -125,9 +125,13 @@ impl AddTorrentOptions {
         }
     }
 
-    fn from_path(path: &str) -> Self {
-        let torrent_meta = file::from_filename(path).unwrap();
-        Self::from_meta(torrent_meta)
+    pub fn from_path(path: &str) -> anyhow::Result<Self> {
+        let torrent_meta = file::from_filename(path)?;
+        Ok(Self::from_meta(torrent_meta))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.torrent_meta.torrent_file.info.name
     }
 
     pub fn output_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -152,8 +156,10 @@ impl From<TorrentMeta> for AddTorrentOptions {
     }
 }
 
-impl From<&str> for AddTorrentOptions {
-    fn from(path: &str) -> Self {
+impl TryFrom<&str> for AddTorrentOptions {
+    type Error = anyhow::Error;
+
+    fn try_from(path: &str) -> Result<Self, Self::Error> {
         Self::from_path(path)
     }
 }
@@ -989,5 +995,19 @@ impl Drop for Session {
 impl Default for Session {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod add_options_tests {
+    use super::AddTorrentOptions;
+
+    #[test]
+    fn from_path_is_fallible() {
+        let err = match AddTorrentOptions::from_path("/does/not/exist.torrent") {
+            Ok(_) => panic!("expected a parse error"),
+            Err(err) => err,
+        };
+        assert!(!err.to_string().is_empty());
     }
 }

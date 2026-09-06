@@ -8,7 +8,7 @@ This Project it's a rewrite of [tornado](https://github.com/fraidev/tornado) in 
 Exemple of how to download a debian iso:
 
 ```bash
-cargo run --release -- samples/debian-12.10.0-amd64-netinst.iso.torrent
+cargo run --release --bin bitrev -- samples/debian-13.0.0-amd64-netinst.iso.torrent
 ```
 
 Tests:
