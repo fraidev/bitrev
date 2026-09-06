@@ -7,8 +7,10 @@ use tokio::net::TcpStream;
 
 use crate::file::{Info, TorrentFile, TorrentMeta};
 use crate::handshake::Handshake;
-use crate::message::{self, BlockRequest, Message, MAX_INCOMING_REQUEST_LENGTH};
-use crate::protocol::Protocol;
+use crate::message::{
+    self, BlockRequest, Message, MAX_CHOKED_REQUESTS, MAX_INCOMING_REQUEST_LENGTH,
+};
+use crate::protocol::{Frame, Protocol};
 use crate::session::{AddTorrentOptions, Session, SessionOptions};
 use crate::utils;
 
@@ -122,9 +124,10 @@ async fn drain_until_bitfield(proto: &Protocol, stream: &mut TcpStream) {
             .expect("bitfield timeout")
             .expect("bitfield read");
         match msg {
-            Some(Message::Bitfield(_)) => return,
-            Some(Message::KeepAlive) | None => continue,
-            Some(other) => panic!("expected bitfield first, got {other:?}"),
+            Frame::Message(Message::Bitfield(_)) => return,
+            Frame::KeepAlive | Frame::Unknown { .. } => continue,
+            Frame::Eof => panic!("expected bitfield, got eof"),
+            Frame::Message(other) => panic!("expected bitfield first, got {other:?}"),
         }
     }
 }
@@ -132,8 +135,8 @@ async fn drain_until_bitfield(proto: &Protocol, stream: &mut TcpStream) {
 async fn expect_disconnect(proto: &Protocol, stream: &mut TcpStream) {
     let result = tokio::time::timeout(Duration::from_secs(2), proto.read(&mut *stream)).await;
     match result {
-        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
-        Ok(Ok(Some(msg))) => panic!("expected disconnect, got {msg:?}"),
+        Ok(Ok(Frame::Eof)) | Ok(Err(_)) | Err(_) => {}
+        Ok(Ok(other)) => panic!("expected disconnect, got {other:?}"),
     }
 }
 
@@ -162,7 +165,7 @@ async fn seeder_serves_full_torrent_to_in_process_leecher() {
             .await
             .expect("read timeout")
             .expect("read error");
-        let Some(msg) = msg else {
+        let Frame::Message(msg) = msg else {
             continue;
         };
         match msg {
@@ -306,7 +309,7 @@ async fn seeder_sends_have_all_when_fast_negotiated() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
         let msg = tokio::time::timeout(Duration::from_millis(500), proto.read(&mut stream)).await;
-        let Ok(Ok(Some(msg))) = msg else {
+        let Ok(Ok(Frame::Message(msg))) = msg else {
             if saw_have_all {
                 break;
             }
@@ -343,7 +346,7 @@ async fn seeder_sends_no_extended_without_negotiation() {
     let mut saw_bitfield = false;
     while tokio::time::Instant::now() < deadline {
         let msg = tokio::time::timeout(Duration::from_millis(400), proto.read(&mut stream)).await;
-        let Ok(Ok(Some(msg))) = msg else {
+        let Ok(Ok(Frame::Message(msg))) = msg else {
             if saw_bitfield {
                 break;
             }
@@ -380,7 +383,7 @@ async fn seeder_sends_extension_handshake_immediately_when_negotiated() {
     let mut handshake = None;
     while tokio::time::Instant::now() < deadline {
         let msg = tokio::time::timeout(Duration::from_millis(400), proto.read(&mut stream)).await;
-        let Ok(Ok(Some(msg))) = msg else {
+        let Ok(Ok(Frame::Message(msg))) = msg else {
             continue;
         };
         match msg {
@@ -418,5 +421,54 @@ async fn incoming_unknown_info_hash_is_closed() {
         matches!(result, Ok(Err(_)) | Err(_) | Ok(Ok(0))),
         "unknown hash should close, got {result:?}"
     );
+    drop(session);
+}
+
+#[tokio::test]
+async fn seeder_disconnects_on_choked_request_storm() {
+    let data = generated_payload(16_384);
+    let (session, addr, meta) = start_seeder(&data, 16_384).await;
+    let (mut stream, proto) = handshake_with(addr, meta.info_hash, *b"-LC0001-storm0000001").await;
+    drain_until_bitfield(&proto, &mut stream).await;
+
+    for _ in 0..(MAX_CHOKED_REQUESTS + 1) {
+        write_msg(&mut stream, message::format_request(0, 0, 16_384)).await;
+    }
+
+    expect_disconnect(&proto, &mut stream).await;
+    drop(session);
+}
+
+#[tokio::test]
+async fn incoming_connections_are_accounted() {
+    let data = generated_payload(16_384);
+    let (session, addr, meta) = start_seeder(&data, 16_384).await;
+    assert_eq!(session.global_peer_count(), 0);
+
+    let mut streams = Vec::new();
+    for i in 0u8..50 {
+        let mut peer_id = *b"-LC0001-account00000";
+        peer_id[19] = i;
+        let (stream, proto) = handshake_with(addr, meta.info_hash, peer_id).await;
+        streams.push((stream, proto));
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while session.global_peer_count() < 50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("incoming peers should be counted");
+
+    drop(streams);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while session.global_peer_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer counter should return to 0");
     drop(session);
 }
