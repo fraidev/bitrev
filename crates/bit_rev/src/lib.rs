@@ -1,6 +1,7 @@
 pub mod allowed_fast;
 pub mod bitfield;
 pub mod choke;
+pub mod config;
 pub mod discovery;
 pub mod extension;
 pub mod file;

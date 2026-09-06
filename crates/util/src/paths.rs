@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 lazy_static::lazy_static! {
     pub static ref HOME: PathBuf = dirs::home_dir().expect("failed to determine home directory");
-    /// Client state directory. Hardcoded until the config system (issue #21) lands.
+    /// Default client state directory (`~/.bitrev`).
     pub static ref STATE_DIR: PathBuf = HOME.join(".bitrev");
     pub static ref CONFIG_DIR: PathBuf = HOME.join(".config").join("bit_rev");
     pub static ref CONVERSATIONS_DIR: PathBuf = CONFIG_DIR.join("conversations");
@@ -45,6 +45,17 @@ lazy_static::lazy_static! {
 /// Default client state directory (`~/.bitrev`).
 pub fn state_dir() -> PathBuf {
     STATE_DIR.clone()
+}
+
+/// Expand a leading `~` component to the user's home directory.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    if path == Path::new("~") {
+        return HOME.clone();
+    }
+    match path.strip_prefix("~") {
+        Ok(rest) => HOME.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Resume files: `<state_dir>/resume/<info_hash_hex>.resume`.
@@ -408,6 +419,20 @@ mod tests {
         assert_eq!(
             torrents_dir(&state_dir()),
             HOME.join(".bitrev").join("torrents")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home_prefix() {
+        assert_eq!(expand_tilde(Path::new("~")), *HOME);
+        assert_eq!(expand_tilde(Path::new("~/.bitrev")), state_dir());
+        assert_eq!(
+            expand_tilde(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("rel/path")),
+            PathBuf::from("rel/path")
         );
     }
 

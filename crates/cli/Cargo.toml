@@ -3,8 +3,12 @@ name = "cli"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "bitrev_cli"
+path = "src/lib.rs"
+
 [[bin]]
-name = "cli"
+name = "bitrev"
 path = "src/main.rs"
 
 [features]
@@ -18,5 +22,11 @@ bit_rev.workspace = true
 indicatif.workspace = true
 console-subscriber = { workspace = true, optional = true }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 flume.workspace = true
+clap.workspace = true
+toml.workspace = true
+util = { path = "../util" }
+
+[dev-dependencies]
+tempfile = "3.10"
