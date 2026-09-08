@@ -26,7 +26,7 @@ pub struct PeerTimeouts {
 impl Default for PeerTimeouts {
     fn default() -> Self {
         Self {
-            connect: Duration::from_secs(6),
+            connect: crate::transport::CONNECT_TIMEOUT,
             handshake: Duration::from_secs(3),
             read_step: Duration::from_secs(10),
             idle: Duration::from_secs(180),

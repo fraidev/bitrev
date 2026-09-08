@@ -19,6 +19,7 @@ pub mod storage;
 pub mod torrent;
 pub mod tracker;
 pub mod tracker_peers;
+pub mod transport;
 pub mod utils;
 
 #[cfg(test)]

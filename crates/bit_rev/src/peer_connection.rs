@@ -10,7 +10,6 @@ use std::{
 
 use tokio::{
     io::AsyncWriteExt,
-    net::TcpStream,
     sync::{Notify, Semaphore},
     time::timeout,
 };
@@ -26,10 +25,11 @@ use crate::{
     },
     peer::PeerAddr,
     peer_state::PeerStates,
-    protocol::{Frame, PeerTimeouts, Protocol, ProtocolError},
+    protocol::{Frame, Protocol},
     session::{DownloadState, PieceWork},
     storage::Storage,
     torrent::Torrent,
+    transport::{BoxedPeerStream, Connector, PeerStream},
     utils,
 };
 
@@ -1086,6 +1086,7 @@ pub struct PeerConnection {
     pub peer: PeerAddr,
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
+    connector: Arc<dyn Connector>,
 }
 
 impl PeerConnection {
@@ -1094,6 +1095,7 @@ impl PeerConnection {
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         handler: Arc<PeerHandler>,
+        connector: Arc<dyn Connector>,
     ) -> Self {
         Self {
             handler,
@@ -1101,6 +1103,7 @@ impl PeerConnection {
             peer,
             info_hash,
             peer_id,
+            connector,
         }
     }
 
@@ -1109,17 +1112,7 @@ impl PeerConnection {
         peer_writer_rx: flume::Receiver<WriterRequest>,
         have_broadcast: tokio::sync::broadcast::Receiver<u32>,
     ) -> anyhow::Result<()> {
-        let connect = async {
-            TcpStream::connect(self.peer)
-                .await
-                .map_err(ProtocolError::Io)
-        };
-        let mut stream = match tokio::time::timeout(PeerTimeouts::default().connect, connect).await
-        {
-            Ok(Ok(b)) => Ok(b),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(ProtocolError::Timeout(e)),
-        }?;
+        let mut stream = self.connector.dial(self.peer).await?;
 
         let protocol = Arc::new(
             Protocol::connect(self.peer, self.info_hash, self.peer_id)
@@ -1139,9 +1132,9 @@ impl PeerConnection {
             .await
     }
 
-    pub async fn manage_incoming_stream(
+    pub async fn manage_incoming_stream<S: PeerStream>(
         &self,
-        mut stream: TcpStream,
+        mut stream: S,
         peer_writer_rx: flume::Receiver<WriterRequest>,
         have_broadcast: tokio::sync::broadcast::Receiver<u32>,
     ) -> anyhow::Result<()> {
@@ -1158,10 +1151,10 @@ impl PeerConnection {
             .await
     }
 
-    async fn send_extension_handshake(
+    async fn send_extension_handshake<S: PeerStream>(
         &self,
         protocol: &Protocol,
-        stream: &mut TcpStream,
+        stream: &mut S,
     ) -> anyhow::Result<()> {
         if !self.handler.extension_protocol() {
             return Ok(());
@@ -1177,10 +1170,10 @@ impl PeerConnection {
         Ok(())
     }
 
-    async fn send_initial_bitfield(
+    async fn send_initial_bitfield<S: PeerStream>(
         &self,
         protocol: &Protocol,
-        stream: &mut TcpStream,
+        stream: &mut S,
     ) -> anyhow::Result<()> {
         let bitfield = self.handler.torrent_downloaded_state.our_bitfield();
         if self.handler.fast_extension() {
@@ -1198,10 +1191,10 @@ impl PeerConnection {
         Ok(())
     }
 
-    async fn send_allowed_fast(
+    async fn send_allowed_fast<S: PeerStream>(
         &self,
         protocol: &Protocol,
-        stream: &mut TcpStream,
+        stream: &mut S,
     ) -> anyhow::Result<()> {
         if !self.handler.fast_extension() {
             return Ok(());
@@ -1228,14 +1221,14 @@ impl PeerConnection {
         Ok(())
     }
 
-    async fn manage_established(
+    pub(crate) async fn manage_established<S: PeerStream>(
         &self,
-        mut stream: TcpStream,
+        stream: S,
         protocol: Arc<Protocol>,
         peer_writer_rx: flume::Receiver<WriterRequest>,
         mut have_broadcast: tokio::sync::broadcast::Receiver<u32>,
     ) -> anyhow::Result<()> {
-        let (mut read, mut write) = stream.split();
+        let (mut read, mut write) = tokio::io::split(stream);
         let timeouts = protocol.timeouts;
 
         let writer = {
@@ -1375,7 +1368,8 @@ pub struct SpawnPeerParams {
     pub uploaded: Arc<AtomicU64>,
     pub torrent: Arc<Torrent>,
     pub choke_notify: Arc<Notify>,
-    pub incoming: Option<TcpStream>,
+    pub incoming: Option<BoxedPeerStream>,
+    pub connector: Arc<dyn Connector>,
     pub incoming_fast_extension: Option<bool>,
     pub incoming_extension_protocol: Option<bool>,
     pub extensions: ExtensionRegistry,
@@ -1459,6 +1453,7 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             params.info_hash,
             params.peer_id,
             handler.clone(),
+            params.connector,
         );
         let requester = handler.task_peer_chunk_requester();
         let uploader = handler.task_peer_uploader();
@@ -1490,6 +1485,7 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
 
     fn piece(index: u32, length: u32) -> PieceWorkState {
         PieceWorkState {
@@ -1740,5 +1736,114 @@ mod tests {
         let contributors = s.piece_contributors(0);
         assert_eq!(contributors, vec![p1, p2]);
         assert_eq!(s.pieces[0].chuncks.lock().unwrap()[0].buf[0], 1);
+    }
+
+    fn sha1(data: &[u8]) -> [u8; 20] {
+        let mut hasher = sha1_smol::Sha1::new();
+        hasher.update(data);
+        hasher.digest().bytes()
+    }
+
+    fn tiny_meta() -> crate::file::TorrentMeta {
+        let data = [0u8; 16];
+        crate::file::TorrentMeta::new(crate::file::TorrentFile {
+            info: crate::file::Info {
+                name: "tiny.bin".into(),
+                pieces: serde_bytes::ByteBuf::from(sha1(&data).to_vec()),
+                piece_length: 16,
+                md5sum: None,
+                length: Some(16),
+                files: None,
+                private: None,
+                path: None,
+                root_hash: None,
+            },
+            announce: None,
+            nodes: None,
+            encoding: None,
+            httpseeds: None,
+            announce_list: None,
+            creation_date: None,
+            comment: None,
+            created_by: None,
+        })
+        .expect("tiny torrent")
+    }
+
+    async fn connection_fixture(
+        addr: PeerAddr,
+    ) -> (
+        PeerConnection,
+        Arc<PeerStates>,
+        flume::Receiver<WriterRequest>,
+        tokio::sync::broadcast::Receiver<u32>,
+        tempfile::TempDir,
+    ) {
+        let meta = tiny_meta();
+        let torrent = Arc::new(crate::torrent::Torrent::new(&meta).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.bin");
+        std::fs::write(&path, [0u8; 16]).unwrap();
+        let storage = Storage::open(&torrent, &path).await.unwrap();
+        let peer_states = Arc::new(PeerStates::default());
+        let (piece_tx, _piece_rx) = flume::unbounded();
+        let (writer_tx, writer_rx) = flume::unbounded();
+        assert!(peer_states.insert_live(addr, writer_tx.clone()));
+        let downloaded = Arc::new(state(1, 16));
+        let handler = Arc::new(PeerHandler::from_config(PeerHandlerConfig {
+            peer: addr,
+            piece_tx,
+            peer_writer_tx: writer_tx,
+            peers_state: peer_states.clone(),
+            torrent_downloaded_state: downloaded,
+            download_state: Arc::new(Mutex::new(DownloadState::Downloading)),
+            storage,
+            uploaded: Arc::new(AtomicU64::new(0)),
+            torrent,
+            choke_notify: Arc::new(Notify::new()),
+            extensions: ExtensionRegistry::new(),
+            listen_port: 0,
+            metadata_size: None,
+        }));
+        let connector: Arc<dyn Connector> = Arc::new(crate::transport::TcpConnector::new());
+        let connection = PeerConnection::new(
+            addr,
+            meta.info_hash,
+            *b"-BR0100-testdriver01",
+            handler,
+            connector,
+        );
+        let have_rx = tokio::sync::broadcast::channel(8).0.subscribe();
+        (connection, peer_states, writer_rx, have_rx, dir)
+    }
+
+    #[tokio::test]
+    async fn manage_established_runs_over_duplex_without_a_socket() {
+        let addr = peer(51413);
+        let (connection, peer_states, writer_rx, have_rx, _dir) = connection_fixture(addr).await;
+        let protocol = Arc::new(
+            Protocol::connect(addr, connection.info_hash, connection.peer_id)
+                .await
+                .unwrap()
+                .with_piece_count(1),
+        );
+
+        let (driver, mut remote) = tokio::io::duplex(256);
+        let mut bitfield = Bitfield::with_piece_count(1);
+        bitfield.set_piece(0);
+        let payload = message::serialize(Some(Message::Bitfield(bitfield.as_bytes().to_vec())));
+
+        let drive = tokio::spawn(async move {
+            connection
+                .manage_established(driver, protocol, writer_rx, have_rx)
+                .await
+        });
+
+        remote.write_all(&payload).await.unwrap();
+        drop(remote);
+
+        drive.await.unwrap().unwrap();
+        let state = peer_states.states.get(&addr).expect("peer still tracked");
+        assert!(state.bitfield.has_piece(0));
     }
 }

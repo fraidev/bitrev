@@ -18,6 +18,9 @@ pub use crate::resume::ResumeStatus;
 use crate::storage::Storage;
 use crate::torrent::Torrent;
 use crate::tracker_peers::TrackerPeers;
+use crate::transport::{
+    boxed_stream, BoxedPeerStream, Connector, IncomingKind, IncomingStream, TcpConnector,
+};
 use crate::utils;
 use dashmap::DashMap;
 use flume::Receiver;
@@ -106,6 +109,7 @@ pub struct Session {
     global_peers: Arc<AtomicUsize>,
     cancel: CancellationToken,
     extensions: ExtensionRegistry,
+    connector: Arc<dyn Connector>,
 }
 
 pub struct AddTorrentOptions {
@@ -178,6 +182,10 @@ impl Session {
     }
 
     pub fn with_options(options: SessionOptions) -> Self {
+        Self::with_connector(options, Arc::new(TcpConnector::new()))
+    }
+
+    pub fn with_connector(options: SessionOptions, connector: Arc<dyn Connector>) -> Self {
         let session = Self {
             torrents: Arc::new(DashMap::new()),
             download_state: Arc::new(Mutex::new(DownloadState::Init)),
@@ -187,9 +195,14 @@ impl Session {
             global_peers: Arc::new(AtomicUsize::new(0)),
             cancel: CancellationToken::new(),
             extensions: ExtensionRegistry::new(),
+            connector,
         };
         session.spawn_listener();
         session
+    }
+
+    pub fn connector(&self) -> Arc<dyn Connector> {
+        self.connector.clone()
     }
 
     pub fn global_peer_count(&self) -> usize {
@@ -255,6 +268,7 @@ impl Session {
         let max_peers_per_torrent = self.options.max_peers_per_torrent;
         let max_peers_global = self.options.max_peers_global;
         let extensions = self.extensions.clone();
+        let connector = self.connector.clone();
 
         tokio::spawn(async move {
             let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -290,14 +304,15 @@ impl Session {
                         let torrents = torrents.clone();
                         let global_peers = global_peers.clone();
                         let extensions = extensions.clone();
+                        let connector = connector.clone();
                         let listen_port = listen_addr
                             .lock()
                             .unwrap()
                             .map(|bound| bound.port())
                             .unwrap_or(port);
                         tokio::spawn(async move {
-                            handle_incoming(
-                                stream,
+                            accept_incoming(
+                                boxed_stream(stream),
                                 addr,
                                 IncomingPeerContext {
                                     peer_id,
@@ -307,6 +322,7 @@ impl Session {
                                     max_peers_global,
                                     extensions,
                                     listen_port,
+                                    connector,
                                 },
                             )
                             .await;
@@ -454,6 +470,7 @@ impl Session {
             global_peers: self.global_peers.clone(),
             max_peers_per_torrent: self.options.max_peers_per_torrent,
             max_peers_global: self.options.max_peers_global,
+            connector: self.connector.clone(),
         })
     }
 
@@ -631,6 +648,7 @@ impl Session {
                 max_peers_global: self.options.max_peers_global,
                 listen_port,
                 extensions: self.extensions.clone(),
+                connector: self.connector.clone(),
             })
             .await;
 
@@ -825,21 +843,58 @@ fn choke_all_peers(peer_states: &PeerStates) {
     }
 }
 
-struct IncomingPeerContext {
-    peer_id: [u8; 20],
-    torrents: Arc<DashMap<[u8; 20], Arc<TorrentSession>>>,
-    global_peers: Arc<AtomicUsize>,
-    max_peers_per_torrent: usize,
-    max_peers_global: usize,
-    extensions: ExtensionRegistry,
-    listen_port: u16,
+pub struct IncomingPeerContext {
+    pub peer_id: [u8; 20],
+    pub torrents: Arc<DashMap<[u8; 20], Arc<TorrentSession>>>,
+    pub global_peers: Arc<AtomicUsize>,
+    pub max_peers_per_torrent: usize,
+    pub max_peers_global: usize,
+    pub extensions: ExtensionRegistry,
+    pub listen_port: u16,
+    pub connector: Arc<dyn Connector>,
 }
 
-async fn handle_incoming(
-    mut stream: tokio::net::TcpStream,
-    addr: SocketAddr,
-    ctx: IncomingPeerContext,
-) {
+impl Session {
+    pub fn incoming_context(&self) -> IncomingPeerContext {
+        IncomingPeerContext {
+            peer_id: self.peer_id,
+            torrents: self.torrents.clone(),
+            global_peers: self.global_peers.clone(),
+            max_peers_per_torrent: self.options.max_peers_per_torrent,
+            max_peers_global: self.options.max_peers_global,
+            extensions: self.extensions.clone(),
+            listen_port: self.listen_port(),
+            connector: self.connector.clone(),
+        }
+    }
+
+    /// Accept an inbound peer stream (TCP listener, later uTP). Handshake
+    /// lookup is transport-agnostic.
+    pub async fn accept_incoming(&self, stream: BoxedPeerStream, addr: SocketAddr) {
+        accept_incoming(stream, addr, self.incoming_context()).await;
+    }
+
+    pub async fn accept_incoming_stream(&self, incoming: IncomingStream) {
+        accept_incoming_stream(incoming, self.incoming_context()).await;
+    }
+}
+
+/// Handshake lookup shared by the TCP listener and later uTP accepts.
+pub async fn accept_incoming(stream: BoxedPeerStream, addr: SocketAddr, ctx: IncomingPeerContext) {
+    accept_incoming_stream(IncomingStream::new(stream, addr), ctx).await;
+}
+
+pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerContext) {
+    let IncomingStream {
+        mut stream,
+        addr,
+        kind,
+    } = incoming;
+    debug!(%addr, ?kind, "accepting incoming peer");
+    if kind == IncomingKind::MaybeEncrypted {
+        // MSE (#7) will take this branch after peeking the first bytes.
+        debug!(%addr, "encrypted inbound not implemented, trying plaintext handshake");
+    }
     let handshake = match Protocol::read_handshake(&mut stream).await {
         Ok(handshake) => handshake,
         Err(e) => {
@@ -887,6 +942,7 @@ async fn handle_incoming(
         global_peers: ctx.global_peers,
         max_peers_per_torrent: ctx.max_peers_per_torrent,
         max_peers_global: ctx.max_peers_global,
+        connector: ctx.connector,
     });
 }
 
@@ -1017,5 +1073,90 @@ mod add_options_tests {
             Err(err) => err,
         };
         assert!(!err.to_string().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod incoming_tests {
+    use super::*;
+    use crate::file::{Info, TorrentFile};
+    use crate::handshake::Handshake;
+    use crate::transport::boxed_stream;
+    use serde_bytes::ByteBuf;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn sha1(data: &[u8]) -> [u8; 20] {
+        let mut hasher = sha1_smol::Sha1::new();
+        hasher.update(data);
+        hasher.digest().bytes()
+    }
+
+    fn tiny_meta() -> TorrentMeta {
+        let data = [0u8; 16];
+        TorrentMeta::new(TorrentFile {
+            info: Info {
+                name: "tiny.bin".into(),
+                pieces: ByteBuf::from(sha1(&data).to_vec()),
+                piece_length: 16,
+                md5sum: None,
+                length: Some(16),
+                files: None,
+                private: None,
+                path: None,
+                root_hash: None,
+            },
+            announce: None,
+            nodes: None,
+            encoding: None,
+            httpseeds: None,
+            announce_list: None,
+            creation_date: None,
+            comment: None,
+            created_by: None,
+        })
+        .expect("tiny torrent")
+    }
+
+    #[tokio::test]
+    async fn accept_incoming_joins_torrent_by_info_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::with_options(SessionOptions {
+            listen_port: 0,
+            state_dir: None,
+            ..SessionOptions::default()
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.wait_listening()).await;
+
+        let meta = tiny_meta();
+        let path = dir.path().join("tiny.bin");
+        session
+            .add_torrent(AddTorrentOptions::from(meta.clone()).output_dir(path))
+            .await
+            .expect("add torrent");
+
+        let addr: SocketAddr = "127.0.0.1:51413".parse().unwrap();
+        let (mut remote, server) = tokio::io::duplex(256);
+        let handshake = Handshake::outgoing(meta.info_hash, *b"-LC0001-0123456789ab");
+
+        let remote_task = tokio::spawn(async move {
+            remote.write_all(&handshake.serialize()).await.unwrap();
+            let mut reply = [0u8; 68];
+            remote.read_exact(&mut reply).await.unwrap();
+            remote
+        });
+
+        session.accept_incoming(boxed_stream(server), addr).await;
+
+        let torrent = session
+            .torrent_session(&meta.info_hash)
+            .expect("torrent registered");
+        assert!(
+            torrent.peer_states.states.contains_key(&addr),
+            "incoming duplex should join by info hash"
+        );
+
+        drop(remote_task);
+        session.shutdown();
     }
 }
