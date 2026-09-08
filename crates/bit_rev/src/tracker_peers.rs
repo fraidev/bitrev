@@ -18,6 +18,7 @@ use crate::{
     storage::Storage,
     torrent::Torrent,
     tracker::{self, HttpAnnounceContext, TrackerError},
+    transport::Connector,
 };
 
 pub struct PeerSpawnRuntime {
@@ -33,6 +34,7 @@ pub struct PeerSpawnRuntime {
     pub max_peers_global: usize,
     pub listen_port: u16,
     pub extensions: ExtensionRegistry,
+    pub connector: Arc<dyn Connector>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +161,7 @@ impl TrackerPeers {
                 max_peers_global: runtime.max_peers_global,
                 listen_port: runtime.listen_port,
                 extensions: runtime.extensions.clone(),
+                connector: runtime.connector.clone(),
             };
             tokio::spawn(async move {
                 tracker::run_announce_loop(ctx, shutdown, |new_peers| {
@@ -179,6 +182,7 @@ impl TrackerPeers {
                         max_peers_global: runtime.max_peers_global,
                         listen_port: runtime.listen_port,
                         extensions: runtime.extensions.clone(),
+                        connector: runtime.connector.clone(),
                     };
                     async move {
                         process_peers(
@@ -237,6 +241,7 @@ async fn process_peers(
             global_peers: runtime.global_peers.clone(),
             max_peers_per_torrent: runtime.max_peers_per_torrent,
             max_peers_global: runtime.max_peers_global,
+            connector: runtime.connector.clone(),
         });
     }
 }
