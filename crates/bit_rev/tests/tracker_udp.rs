@@ -1,7 +1,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -15,10 +15,7 @@ use bit_rev::{
     tracker::{self, run_announce_loop, HttpAnnounceContext},
 };
 use serde_bytes::ByteBuf;
-use tokio::{
-    net::UdpSocket,
-    sync::{mpsc, Semaphore},
-};
+use tokio::{net::UdpSocket, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
 const INFO_HASH: [u8; 20] = [1u8; 20];
@@ -64,19 +61,13 @@ fn test_meta(announce: String) -> TorrentMeta {
 }
 
 fn incomplete_download() -> Arc<TorrentDownloadedState> {
-    Arc::new(TorrentDownloadedState {
-        semaphore: Semaphore::new(1),
-        pieces: vec![PieceWorkState {
-            piece_work: PieceWork {
-                index: 0,
-                length: 16384,
-                hash: INFO_HASH,
-            },
-            chuncks: Mutex::new(vec![]),
-            downloaded: AtomicBool::new(false),
-            reserved: Mutex::new(None),
-        }],
-    })
+    Arc::new(TorrentDownloadedState::new(vec![PieceWorkState::new(
+        PieceWork {
+            index: 0,
+            length: 16384,
+            hash: INFO_HASH,
+        },
+    )]))
 }
 
 fn announce_ctx(url: String, download: Arc<TorrentDownloadedState>) -> HttpAnnounceContext {

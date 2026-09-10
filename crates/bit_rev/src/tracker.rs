@@ -488,10 +488,7 @@ mod tests {
             announce_key: 42,
             port: 6881,
             download_state: Arc::new(Mutex::new(DownloadState::Downloading)),
-            torrent_downloaded_state: Arc::new(TorrentDownloadedState {
-                semaphore: tokio::sync::Semaphore::new(1),
-                pieces: vec![],
-            }),
+            torrent_downloaded_state: Arc::new(TorrentDownloadedState::new(vec![])),
             uploaded: Arc::new(AtomicU64::new(0)),
         };
 

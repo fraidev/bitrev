@@ -460,3 +460,133 @@ async fn large_file_stays_memory_bounded() {
         assert!(rss < RSS_BOUND, "peak RSS {rss} exceeded bound {RSS_BOUND}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rarest_first_unique_pieces_before_common() {
+    let fixture = Arc::new(TorrentFixture::single(
+        12 * u64::from(DEFAULT_PIECE_LENGTH),
+        DEFAULT_PIECE_LENGTH,
+        0x4A4E_0001,
+    ));
+    let piece_count = fixture.piece_count() as u32;
+    assert_eq!(piece_count, 12);
+
+    let unique_a = vec![0u32, 1, 2];
+    let unique_b = vec![3u32, 4, 5];
+    let unique_c = vec![6u32, 7, 8];
+    let common = [9u32, 10, 11];
+
+    let mut a_set = unique_a.clone();
+    a_set.extend_from_slice(&common);
+    let mut b_set = unique_b.clone();
+    b_set.extend_from_slice(&common);
+    let mut c_set = unique_c.clone();
+    c_set.extend_from_slice(&common);
+
+    let seeders = start_seeders(
+        &fixture,
+        vec![
+            SeederConfig::with_pieces(a_set).peer_id(unique_peer_id(1)),
+            SeederConfig::with_pieces(b_set).peer_id(unique_peer_id(2)),
+            SeederConfig::with_pieces(c_set).peer_id(unique_peer_id(3)),
+            SeederConfig::all_pieces()
+                .peer_id(unique_peer_id(4))
+                .latency(Duration::from_millis(200)),
+        ],
+    )
+    .await;
+
+    let download_dir = unique_temp_dir();
+    download_via_http(&fixture, &seeders, download_dir.path()).await;
+
+    let expected = [&unique_a, &unique_b, &unique_c];
+    for (i, unique) in expected.iter().enumerate() {
+        let requested = seeders[i].requested_pieces();
+        for piece in unique.iter() {
+            assert!(
+                requested.contains(piece),
+                "seeder {i} was never asked for unique piece {piece}, got {requested:?}"
+            );
+        }
+        assert!(
+            seeders[i].blocks_sent() > 0,
+            "unique seeder {i} sent nothing"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endgame_duplicate_bytes_under_two_pieces() {
+    let fixture = Arc::new(TorrentFixture::single(
+        4 * u64::from(DEFAULT_PIECE_LENGTH),
+        DEFAULT_PIECE_LENGTH,
+        0xE2D6_0001,
+    ));
+    let seeders = start_seeders(
+        &fixture,
+        vec![
+            SeederConfig::all_pieces().peer_id(unique_peer_id(1)),
+            SeederConfig::all_pieces().peer_id(unique_peer_id(2)),
+            SeederConfig::all_pieces().peer_id(unique_peer_id(3)),
+        ],
+    )
+    .await;
+
+    let peers: Vec<_> = seeders.iter().map(|s| s.addr).collect();
+    let tracker = MockHttpTracker::start(vec![HttpAnnounceBody::peers(1800, peers)]).await;
+    let meta = fixture.meta_with_trackers(Some(tracker.url.clone()), None);
+    let download_dir = unique_temp_dir();
+    let session = test_session(None).await;
+    let output = fixture.session_output(download_dir.path());
+    let added = add_download(&session, meta, output.clone()).await;
+    wait_for_completion(
+        &added.pr_rx,
+        &added.torrent,
+        added.already_have.len(),
+        DOWNLOAD_TIMEOUT,
+    )
+    .await;
+
+    let torrent = session
+        .torrent_session(&fixture.torrent_meta.info_hash)
+        .expect("torrent session");
+    let dup = torrent.downloaded_state.duplicate_bytes();
+    let bound = 2 * u64::from(DEFAULT_PIECE_LENGTH);
+    assert!(
+        dup < bound,
+        "endgame duplicate bytes {dup} exceeded bound {bound}"
+    );
+    session.shutdown();
+    fixture.assert_output_matches(&output);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn never_unchoke_seeder_does_not_stall_download() {
+    let fixture = Arc::new(TorrentFixture::single(
+        2 * u64::from(DEFAULT_PIECE_LENGTH),
+        DEFAULT_PIECE_LENGTH,
+        0x5B00_0001,
+    ));
+    let seeders = start_seeders(
+        &fixture,
+        vec![
+            SeederConfig::all_pieces()
+                .peer_id(unique_peer_id(1))
+                .never_unchoke(),
+            SeederConfig::all_pieces().peer_id(unique_peer_id(2)),
+            SeederConfig::all_pieces().peer_id(unique_peer_id(3)),
+        ],
+    )
+    .await;
+
+    let download_dir = unique_temp_dir();
+    let started = Instant::now();
+    download_via_http(&fixture, &seeders, download_dir.path()).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "download took {elapsed:?}, never-unchoke seeder stalled the swarm"
+    );
+    assert_eq!(seeders[0].blocks_sent(), 0);
+    assert!(seeders[1].blocks_sent() + seeders[2].blocks_sent() > 0);
+}

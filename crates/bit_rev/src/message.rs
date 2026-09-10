@@ -252,6 +252,17 @@ pub fn format_request(index: u32, start: u32, length: u32) -> Message {
     )
 }
 
+pub fn format_cancel(index: u32, start: u32, length: u32) -> Message {
+    Message::Cancel(
+        BlockRequest {
+            index,
+            begin: start,
+            length,
+        }
+        .to_payload(),
+    )
+}
+
 pub fn format_piece(index: u32, begin: u32, data: Vec<u8>) -> Message {
     Message::Piece(PieceChunk {
         index,

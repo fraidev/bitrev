@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -25,7 +25,7 @@ use serde_bytes::ByteBuf;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Semaphore},
+    sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -225,19 +225,13 @@ fn test_meta(announce: String) -> TorrentMeta {
 }
 
 fn incomplete_download() -> Arc<TorrentDownloadedState> {
-    Arc::new(TorrentDownloadedState {
-        semaphore: Semaphore::new(1),
-        pieces: vec![PieceWorkState {
-            piece_work: PieceWork {
-                index: 0,
-                length: 16384,
-                hash: [1u8; 20],
-            },
-            chuncks: Mutex::new(vec![]),
-            downloaded: AtomicBool::new(false),
-            reserved: Mutex::new(None),
-        }],
-    })
+    Arc::new(TorrentDownloadedState::new(vec![PieceWorkState::new(
+        PieceWork {
+            index: 0,
+            length: 16384,
+            hash: [1u8; 20],
+        },
+    )]))
 }
 
 fn announce_ctx(url: String, download: Arc<TorrentDownloadedState>) -> HttpAnnounceContext {

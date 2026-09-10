@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bit_rev::bitfield::Bitfield;
@@ -80,9 +80,19 @@ impl SeederConfig {
     }
 }
 
+#[derive(Clone)]
+struct SeederCounters {
+    blocks_sent: Arc<AtomicU64>,
+    requested_pieces: Arc<Mutex<Vec<u32>>>,
+    cancels_received: Arc<AtomicU64>,
+    block_notify: Arc<Notify>,
+}
+
 pub struct SeederPeer {
     pub addr: std::net::SocketAddr,
     pub blocks_sent: Arc<AtomicU64>,
+    pub requested_pieces: Arc<Mutex<Vec<u32>>>,
+    pub cancels_received: Arc<AtomicU64>,
     block_notify: Arc<Notify>,
     cancel: CancellationToken,
 }
@@ -97,11 +107,14 @@ impl SeederPeer {
     pub async fn start(fixture: Arc<TorrentFixture>, config: SeederConfig) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind seeder");
         let addr = listener.local_addr().expect("seeder addr");
-        let blocks_sent = Arc::new(AtomicU64::new(0));
-        let block_notify = Arc::new(Notify::new());
+        let counters = SeederCounters {
+            blocks_sent: Arc::new(AtomicU64::new(0)),
+            requested_pieces: Arc::new(Mutex::new(Vec::new())),
+            cancels_received: Arc::new(AtomicU64::new(0)),
+            block_notify: Arc::new(Notify::new()),
+        };
         let cancel = CancellationToken::new();
-        let blocks_task = blocks_sent.clone();
-        let notify_task = block_notify.clone();
+        let counters_task = counters.clone();
         let cancel_task = cancel.clone();
 
         tokio::spawn(async move {
@@ -112,19 +125,10 @@ impl SeederPeer {
                         let Ok((stream, _)) = accepted else { break };
                         let fixture = fixture.clone();
                         let config = config.clone();
-                        let blocks_sent = blocks_task.clone();
-                        let block_notify = notify_task.clone();
+                        let counters = counters_task.clone();
                         let cancel = cancel_task.clone();
                         tokio::spawn(async move {
-                            let _ = serve_peer(
-                                stream,
-                                fixture,
-                                config,
-                                blocks_sent,
-                                block_notify,
-                                cancel,
-                            )
-                            .await;
+                            let _ = serve_peer(stream, fixture, config, counters, cancel).await;
                         });
                     }
                 }
@@ -133,14 +137,24 @@ impl SeederPeer {
 
         Self {
             addr,
-            blocks_sent,
-            block_notify,
+            blocks_sent: counters.blocks_sent,
+            requested_pieces: counters.requested_pieces,
+            cancels_received: counters.cancels_received,
+            block_notify: counters.block_notify,
             cancel,
         }
     }
 
     pub fn blocks_sent(&self) -> u64 {
         self.blocks_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn requested_pieces(&self) -> Vec<u32> {
+        self.requested_pieces.lock().unwrap().clone()
+    }
+
+    pub fn cancels_received(&self) -> u64 {
+        self.cancels_received.load(Ordering::Relaxed)
     }
 
     pub async fn wait_blocks_sent(&self, n: u64, timeout: Duration) {
@@ -199,10 +213,15 @@ async fn serve_peer(
     mut stream: TcpStream,
     fixture: Arc<TorrentFixture>,
     config: SeederConfig,
-    blocks_sent: Arc<AtomicU64>,
-    block_notify: Arc<Notify>,
+    counters: SeederCounters,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    let SeederCounters {
+        blocks_sent,
+        requested_pieces,
+        cancels_received,
+        block_notify,
+    } = counters;
     let _hs = Protocol::read_handshake(&mut stream).await?;
     let reply = Handshake::new(fixture.torrent_meta.info_hash, config.peer_id);
     Protocol::write_handshake(&mut stream, &reply).await?;
@@ -246,6 +265,7 @@ async fn serve_peer(
                 let Some(req) = BlockRequest::from_payload(&payload) else {
                     continue;
                 };
+                requested_pieces.lock().unwrap().push(req.index);
                 if !has_piece(&config, req.index) {
                     continue;
                 }
@@ -271,13 +291,15 @@ async fn serve_peer(
                     }
                 }
             }
+            Message::Cancel(_) => {
+                cancels_received.fetch_add(1, Ordering::Relaxed);
+            }
             Message::NotInterested
             | Message::Bitfield(_)
             | Message::Have(_)
             | Message::KeepAlive
             | Message::Choke
             | Message::Unchoke
-            | Message::Cancel(_)
             | Message::SuggestPiece(_)
             | Message::HaveAll
             | Message::HaveNone
