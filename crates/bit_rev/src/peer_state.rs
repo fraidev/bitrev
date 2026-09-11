@@ -1,12 +1,16 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::Notify;
 
-use crate::{bitfield::Bitfield, message::WriterRequest, peer::PeerAddr};
+use crate::{
+    bitfield::Bitfield,
+    message::{BlockRequest, WriterRequest},
+    peer::PeerAddr,
+};
 
 pub const BAN_TTL: Duration = Duration::from_secs(60 * 60);
 pub const HASH_FAILURE_BAN_THRESHOLD: u32 = 3;
@@ -128,6 +132,7 @@ pub struct PeerState {
     pub our_allowed_fast: HashSet<u32>,
     pub suggested_pieces: Vec<u32>,
     pub hash_failures: u32,
+    pub snubbed: bool,
     pub stats: Arc<PeerLiveStats>,
     pub writer_tx: Option<flume::Sender<WriterRequest>>,
 }
@@ -141,6 +146,7 @@ pub struct PeerLiveStats {
     pub am_interested: AtomicBool,
     pub peer_choking: AtomicBool,
     pub upload_notify: Notify,
+    pub download_cancels: Mutex<Vec<BlockRequest>>,
 }
 
 impl Default for PeerLiveStats {
@@ -153,6 +159,7 @@ impl Default for PeerLiveStats {
             am_interested: AtomicBool::new(false),
             peer_choking: AtomicBool::new(true),
             upload_notify: Notify::new(),
+            download_cancels: Mutex::new(Vec::new()),
         }
     }
 }
@@ -180,6 +187,7 @@ impl PeerState {
             our_allowed_fast: HashSet::new(),
             suggested_pieces: Vec::new(),
             hash_failures: 0,
+            snubbed: false,
             stats: Arc::new(PeerLiveStats::default()),
             writer_tx: None,
         }
@@ -213,6 +221,10 @@ impl PeerState {
     pub fn set_peer_choking(&mut self, choking: bool) {
         self.peer_choking = choking;
         self.stats.peer_choking.store(choking, Ordering::Relaxed);
+    }
+
+    pub fn set_snubbed(&mut self, snubbed: bool) {
+        self.snubbed = snubbed;
     }
 }
 

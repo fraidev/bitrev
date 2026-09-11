@@ -26,7 +26,6 @@ use dashmap::DashMap;
 use flume::Receiver;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -570,18 +569,12 @@ impl Session {
             })
             .collect::<Vec<PieceWork>>();
 
-        let downloaded_state = Arc::new(TorrentDownloadedState {
-            semaphore: Semaphore::new(1),
-            pieces: pieces_of_work
+        let downloaded_state = Arc::new(TorrentDownloadedState::new(
+            pieces_of_work
                 .into_iter()
-                .map(|pw| PieceWorkState {
-                    piece_work: pw,
-                    chuncks: Mutex::new(vec![]),
-                    downloaded: std::sync::atomic::AtomicBool::new(false),
-                    reserved: Mutex::new(None),
-                })
+                .map(PieceWorkState::new)
                 .collect(),
-        });
+        ));
 
         let resume_status = if add_torrent.seed {
             downloaded_state.mark_all_downloaded();
