@@ -60,7 +60,7 @@ async fn download_via_http(
     wait_for_completion(
         &added.pr_rx,
         &added.torrent,
-        added.already_have.len(),
+        &added.already_have,
         DOWNLOAD_TIMEOUT,
     )
     .await;
@@ -214,7 +214,7 @@ async fn corrupt_piece_is_refetched() {
     wait_for_completion(
         &added.pr_rx,
         &added.torrent,
-        added.already_have.len(),
+        &added.already_have,
         DOWNLOAD_TIMEOUT,
     )
     .await;
@@ -272,7 +272,7 @@ async fn corrupt_seeder_is_banned_and_download_completes() {
     wait_for_completion(
         &added.pr_rx,
         &added.torrent,
-        added.already_have.len(),
+        &added.already_have,
         DOWNLOAD_TIMEOUT,
     )
     .await;
@@ -332,7 +332,7 @@ async fn disconnect_mid_piece_is_retried() {
     wait_for_completion(
         &added.pr_rx,
         &added.torrent,
-        added.already_have.len(),
+        &added.already_have,
         DOWNLOAD_TIMEOUT,
     )
     .await;
@@ -374,7 +374,7 @@ async fn tracker_failure_then_second_tracker_succeeds() {
     wait_for_completion(
         &added.pr_rx,
         &added.torrent,
-        added.already_have.len(),
+        &added.already_have,
         DOWNLOAD_TIMEOUT,
     )
     .await;
@@ -449,7 +449,7 @@ async fn large_file_stays_memory_bounded() {
     wait_for_completion(
         &added.pr_rx,
         &added.torrent,
-        added.already_have.len(),
+        &added.already_have,
         Duration::from_secs(180),
     )
     .await;
@@ -542,7 +542,7 @@ async fn endgame_duplicate_bytes_under_two_pieces() {
     wait_for_completion(
         &added.pr_rx,
         &added.torrent,
-        added.already_have.len(),
+        &added.already_have,
         DOWNLOAD_TIMEOUT,
     )
     .await;
@@ -556,8 +556,8 @@ async fn endgame_duplicate_bytes_under_two_pieces() {
         dup < bound,
         "endgame duplicate bytes {dup} exceeded bound {bound}"
     );
-    session.shutdown();
     fixture.assert_output_matches(&output);
+    session.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

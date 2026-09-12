@@ -100,6 +100,7 @@ impl Storage {
                 file.seek(SeekFrom::Start(mapping.file_offset as u64))
                     .await?;
                 file.write_all(slice).await?;
+                file.sync_data().await?;
             }
             buf_offset += mapping.length;
         }

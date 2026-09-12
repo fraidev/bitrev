@@ -77,6 +77,9 @@ impl ExtensionHandshake {
         if bytes.len() > MAX_EXTENSION_PAYLOAD {
             return Self::default();
         }
+        if crate::file::check_bencode_depth(bytes).is_err() {
+            return Self::default();
+        }
         let Ok(Value::Dict(dict)) = serde_bencode::from_bytes::<Value>(bytes) else {
             return Self::default();
         };

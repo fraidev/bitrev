@@ -540,7 +540,7 @@ impl Session {
 
         let storage = Storage::open(&torrent, &output_dir).await?;
 
-        let (pr_tx, pr_rx) = flume::bounded::<PieceResult>(torrent.piece_hashes.len().max(1));
+        let (pr_tx, pr_rx) = flume::bounded::<PieceResult>(torrent.piece_hashes.len().max(1) * 2);
         let have_broadcast = Arc::new(tokio::sync::broadcast::channel(128).0);
         let peer_states = Arc::new(PeerStates::default());
         let uploaded = Arc::new(AtomicU64::new(

@@ -33,6 +33,7 @@ pub struct BencodeResponse {
 
 impl BencodeResponse {
     pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        crate::file::check_bencode_depth(bytes)?;
         Ok(serde_bencode::from_bytes(bytes)?)
     }
 
