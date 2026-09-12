@@ -112,6 +112,7 @@ pub fn encode(data: &ResumeData) -> Result<Vec<u8>, ResumeError> {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<ResumeData, ResumeError> {
+    crate::file::check_bencode_depth(bytes).map_err(|e| ResumeError::Decode(e.to_string()))?;
     let data: ResumeData =
         serde_bencode::from_bytes(bytes).map_err(|e| ResumeError::Decode(e.to_string()))?;
     if data.version != RESUME_VERSION {

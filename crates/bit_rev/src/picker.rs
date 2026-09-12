@@ -61,14 +61,14 @@ impl Availability {
 }
 
 fn saturating_inc(slot: &AtomicU16) {
-    let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-        Some(c.saturating_add(1))
+    slot.update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        c.saturating_add(1)
     });
 }
 
 fn saturating_dec(slot: &AtomicU16) {
-    let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-        Some(c.saturating_sub(1))
+    slot.update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        c.saturating_sub(1)
     });
 }
 
@@ -128,11 +128,9 @@ impl VerifiedCount {
     }
 
     pub fn dec(&self) {
-        let _ = self
-            .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                Some(c.saturating_sub(1))
-            });
+        self.0.update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+            c.saturating_sub(1)
+        });
     }
 
     pub fn set(&self, n: usize) {

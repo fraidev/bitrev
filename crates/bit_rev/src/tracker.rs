@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use serde_bencode::de;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -96,8 +95,8 @@ pub async fn announce(
         });
     }
 
-    let decoded: BencodeResponse =
-        de::from_bytes(&body).map_err(|e| TrackerError::Decode(e.to_string()))?;
+    let decoded =
+        BencodeResponse::from_bytes(&body).map_err(|e| TrackerError::Decode(e.to_string()))?;
 
     if let Some(reason) = decoded.failure_reason_str() {
         return Err(TrackerError::FailureReason(reason));

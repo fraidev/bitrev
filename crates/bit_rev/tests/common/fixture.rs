@@ -245,12 +245,25 @@ impl TorrentFixture {
 
     pub fn assert_output_matches(&self, output: &Path) {
         if self.is_single_file() {
-            let expected = self.files[0].disk_path.as_path();
+            let expected = std::fs::read(&self.files[0].disk_path).expect("read fixture");
+            let got = std::fs::read(output).unwrap_or_else(|e| panic!("read {output:?}: {e}"));
             assert_eq!(
-                super::sha1_file(output),
-                super::sha1_file(expected),
-                "single-file output hash mismatch"
+                got.len(),
+                expected.len(),
+                "single-file length mismatch: got {} want {}",
+                got.len(),
+                expected.len()
             );
+            let piece_len = self.piece_length as usize;
+            for i in 0..self.piece_count() {
+                let start = i * piece_len;
+                let end = (start + piece_len).min(expected.len());
+                assert_eq!(
+                    &got[start..end],
+                    &expected[start..end],
+                    "piece {i} bytes mismatch"
+                );
+            }
             return;
         }
 

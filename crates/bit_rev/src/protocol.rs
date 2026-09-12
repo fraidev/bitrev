@@ -73,6 +73,38 @@ pub struct Protocol {
     pub timeouts: PeerTimeouts,
 }
 
+/// Decode one length-prefixed peer message from a complete buffer.
+/// Never allocates more than `MAX_MESSAGE_LEN` payload bytes.
+pub fn decode_frame(buf: &[u8]) -> Result<Frame, ProtocolError> {
+    if buf.len() < 4 {
+        return Err(ProtocolError::Truncated);
+    }
+    let length_buf: [u8; 4] = buf[0..4].try_into().map_err(|_| ProtocolError::Truncated)?;
+    let length = u32::from_be_bytes(length_buf);
+    if length == 0 {
+        return Ok(Frame::KeepAlive);
+    }
+    if length > MAX_MESSAGE_LEN {
+        return Err(ProtocolError::MessageTooLarge { length });
+    }
+    let need = 4 + length as usize;
+    if buf.len() < need {
+        return Err(ProtocolError::Truncated);
+    }
+    frame_from_parts(&length_buf, &buf[4..need])
+}
+
+fn frame_from_parts(length_buf: &[u8; 4], msg_bytes: &[u8]) -> Result<Frame, ProtocolError> {
+    match message::read(length_buf, msg_bytes) {
+        Ok(Message::KeepAlive) => Ok(Frame::KeepAlive),
+        Ok(msg) => Ok(Frame::Message(msg)),
+        Err(message::DecodeError::UnknownId(id)) => Ok(Frame::Unknown { id }),
+        Err(message::DecodeError::Truncated | message::DecodeError::InvalidLengthPrefix) => {
+            Err(ProtocolError::Truncated)
+        }
+    }
+}
+
 impl Protocol {
     pub async fn connect(
         peer: PeerAddr,
@@ -154,14 +186,7 @@ impl Protocol {
             }
         }
 
-        match message::read(&length_buf, &msg_bytes) {
-            Ok(Message::KeepAlive) => Ok(Frame::KeepAlive),
-            Ok(msg) => Ok(Frame::Message(msg)),
-            Err(message::DecodeError::UnknownId(id)) => Ok(Frame::Unknown { id }),
-            Err(message::DecodeError::Truncated | message::DecodeError::InvalidLengthPrefix) => {
-                Err(ProtocolError::Truncated)
-            }
-        }
+        frame_from_parts(&length_buf, &msg_bytes)
     }
 
     pub async fn read_with_idle(
@@ -432,6 +457,41 @@ mod tests {
 
     fn peer_addr() -> PeerAddr {
         "127.0.0.1:6881".parse().unwrap()
+    }
+
+    #[test]
+    fn decode_frame_keep_alive_and_have() {
+        assert!(matches!(decode_frame(&[0, 0, 0, 0]), Ok(Frame::KeepAlive)));
+        assert_eq!(
+            decode_frame(&[0, 0, 0, 5, 4, 0, 0, 0, 4]).unwrap(),
+            Frame::Message(Message::Have(4))
+        );
+    }
+
+    #[test]
+    fn decode_frame_rejects_truncated_and_too_large() {
+        assert!(matches!(
+            decode_frame(&[0, 0, 0]),
+            Err(ProtocolError::Truncated)
+        ));
+        assert!(matches!(
+            decode_frame(&[0, 0, 0, 5, 4]),
+            Err(ProtocolError::Truncated)
+        ));
+        let mut bomb = vec![0xff, 0xff, 0xff, 0xff];
+        bomb.extend_from_slice(&[0; 16]);
+        assert!(matches!(
+            decode_frame(&bomb),
+            Err(ProtocolError::MessageTooLarge { length: u32::MAX })
+        ));
+    }
+
+    #[test]
+    fn decode_frame_unknown_id_is_not_an_error() {
+        assert!(matches!(
+            decode_frame(&[0, 0, 0, 1, 99]),
+            Ok(Frame::Unknown { id: 99 })
+        ));
     }
 
     async fn protocol() -> Protocol {

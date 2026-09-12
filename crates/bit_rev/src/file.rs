@@ -9,6 +9,11 @@ use anyhow::Result;
 
 const URL_UNRESERVED_HEX: &[u8; 16] = b"0123456789ABCDEF";
 
+/// serde_bencode walks lists and dicts recursively. A few dozen levels is more
+/// than any real torrent or tracker body; past that we refuse before it blows
+/// the stack (ASAN CI stacks are much smaller than a developer laptop).
+pub const MAX_BENCODE_DEPTH: usize = 32;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Node(String, i64);
 
@@ -101,6 +106,7 @@ impl TorrentMeta {
 }
 
 pub fn from_bytes(content: &[u8]) -> Result<TorrentMeta> {
+    check_bencode_depth(content)?;
     let torrent = de::from_bytes::<TorrentFile>(content)?;
     validate_torrent_file(&torrent)?;
     let info_bytes = raw_info_dict(content)?;
@@ -164,6 +170,51 @@ fn path_component_is_safe(component: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Linear scan so a `llll…` bomb cannot recurse through serde_bencode.
+pub fn check_bencode_depth(data: &[u8]) -> Result<()> {
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < data.len() {
+        match data[i] {
+            b'd' | b'l' => {
+                depth += 1;
+                if depth > MAX_BENCODE_DEPTH {
+                    anyhow::bail!("bencode nesting exceeds {MAX_BENCODE_DEPTH}");
+                }
+                i += 1;
+            }
+            b'e' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'i' => {
+                i += 1;
+                while i < data.len() && data[i] != b'e' {
+                    i += 1;
+                }
+                if i < data.len() {
+                    i += 1;
+                }
+            }
+            b'0'..=b'9' => {
+                let start = i;
+                while i < data.len() && data[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i < data.len() && data[i] == b':' {
+                    let len = std::str::from_utf8(&data[start..i])
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    i = i.saturating_add(1).saturating_add(len);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
 }
 
 fn parse_bencode_byte_string(data: &[u8], i: usize) -> Result<(&[u8], usize)> {
@@ -558,18 +609,18 @@ mod tests {
     fn from_filename_parses_debian_sample() {
         const DEBIAN_SAMPLE: &str = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../samples/debian-13.0.0-amd64-netinst.iso.torrent"
+            "/../../samples/debian-13.6.0-amd64-netinst.iso.torrent"
         );
-        const DEBIAN_INFO_HASH_HEX: &str = "155a51b44b337d3b147c8d93d9764df48705ff89";
+        const DEBIAN_INFO_HASH_HEX: &str = "481b6e3617be4c88f96cb25e47c9d8272130071e";
 
         let meta = from_filename(DEBIAN_SAMPLE).expect("parse debian sample");
         let info = &meta.torrent_file.info;
 
-        assert_eq!(info.name, "debian-13.0.0-amd64-netinst.iso");
+        assert_eq!(info.name, "debian-13.6.0-amd64-netinst.iso");
         assert_eq!(info.piece_length, 262144);
-        assert_eq!(meta.piece_hashes.len(), 3016);
-        assert_eq!(info.pieces.len(), 3016 * 20);
-        assert_eq!(info.length, Some(790_626_304));
+        assert_eq!(meta.piece_hashes.len(), 3020);
+        assert_eq!(info.pieces.len(), 3020 * 20);
+        assert_eq!(info.length, Some(791_674_880));
         assert!(info.files.is_none());
         assert_eq!(meta.info_hash, decode_info_hash(DEBIAN_INFO_HASH_HEX));
         assert_eq!(
@@ -627,6 +678,26 @@ mod tests {
         assert_eq!(meta.torrent_file.info.length, Some(4));
         assert_eq!(meta.piece_hashes.len(), 1);
         assert_eq!(meta.info_hash, decode_info_hash(INFO_HASH_HEX));
+    }
+
+    #[test]
+    fn from_bytes_rejects_deep_bencode_nesting() {
+        let deep = vec![b'l'; MAX_BENCODE_DEPTH + 1];
+        assert!(from_bytes(&deep).is_err());
+
+        let mut closed = vec![b'l'; MAX_BENCODE_DEPTH + 1];
+        closed.extend(std::iter::repeat_n(b'e', MAX_BENCODE_DEPTH + 1));
+        assert!(from_bytes(&closed).is_err());
+    }
+
+    #[test]
+    fn bencode_depth_skips_l_inside_byte_strings() {
+        let mut data = b"d1:x".to_vec();
+        let payload = vec![b'l'; MAX_BENCODE_DEPTH + 8];
+        data.extend(format!("{}:", payload.len()).into_bytes());
+        data.extend(payload);
+        data.push(b'e');
+        assert!(check_bencode_depth(&data).is_ok());
     }
 
     #[test]

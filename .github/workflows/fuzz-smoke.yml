@@ -1,0 +1,65 @@
+name: Fuzz smoke
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  push:
+    paths:
+      - "crates/bit_rev/src/message.rs"
+      - "crates/bit_rev/src/handshake.rs"
+      - "crates/bit_rev/src/file.rs"
+      - "crates/bit_rev/src/peer.rs"
+      - "crates/bit_rev/src/protocol.rs"
+      - "crates/bit_rev/src/protocol_udp.rs"
+      - "crates/bit_rev/src/resume.rs"
+      - "crates/bit_rev/src/extension/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz-smoke.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz smoke (nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install nightly
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run each target for 30s
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          targets=(
+            message_read
+            handshake_read
+            metainfo_from_bytes
+            tracker_response
+            udp_tracker_packet
+            extension_handshake_decode
+            resume_decode
+          )
+          for t in "${targets[@]}"; do
+            echo "::group::fuzz $t"
+            cargo +nightly fuzz run "$t" -- -max_total_time=30
+            echo "::endgroup::"
+          done
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

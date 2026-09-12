@@ -62,17 +62,37 @@ pub async fn add_download(
 pub async fn wait_for_completion(
     pr_rx: &flume::Receiver<PieceResult>,
     torrent: &Torrent,
-    already_have: usize,
+    already_have: &[PieceResult],
     timeout: Duration,
 ) {
-    let needed = torrent.piece_hashes.len().saturating_sub(already_have);
+    let total = torrent.piece_hashes.len();
+    let mut seen = vec![false; total];
+    for pr in already_have {
+        if let Some(slot) = seen.get_mut(pr.index as usize) {
+            *slot = true;
+        }
+    }
     let deadline = tokio::time::Instant::now() + timeout;
-    for i in 0..needed {
+    while seen.iter().any(|have| !have) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        tokio::time::timeout(remaining, pr_rx.recv_async())
+        let pr = tokio::time::timeout(remaining, pr_rx.recv_async())
             .await
-            .unwrap_or_else(|_| panic!("piece {} / {needed} timed out", i + 1))
+            .unwrap_or_else(|_| {
+                let have: Vec<u32> = seen
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, have)| **have)
+                    .map(|(i, _)| i as u32)
+                    .collect();
+                panic!(
+                    "waiting for pieces timed out ({}/ {total}, have {have:?})",
+                    have.len()
+                )
+            })
             .expect("piece channel closed");
+        if let Some(slot) = seen.get_mut(pr.index as usize) {
+            *slot = true;
+        }
     }
 }
 

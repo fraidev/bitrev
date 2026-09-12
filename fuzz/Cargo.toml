@@ -1,0 +1,67 @@
+[package]
+name = "bit_rev-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bit_rev]
+path = "../crates/bit_rev"
+
+# Standalone workspace so `cargo test --workspace` on stable never builds this crate.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "message_read"
+path = "fuzz_targets/message_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_read"
+path = "fuzz_targets/handshake_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metainfo_from_bytes"
+path = "fuzz_targets/metainfo_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_response"
+path = "fuzz_targets/tracker_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_tracker_packet"
+path = "fuzz_targets/udp_tracker_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extension_handshake_decode"
+path = "fuzz_targets/extension_handshake_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resume_decode"
+path = "fuzz_targets/resume_decode.rs"
+test = false
+doc = false
+bench = false

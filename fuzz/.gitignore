@@ -1,0 +1,5 @@
+target
+artifacts
+# Corpora are committed so CI and local runs share seeds.
+!corpus
+!corpus/**

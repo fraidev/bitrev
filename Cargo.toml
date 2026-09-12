@@ -4,6 +4,11 @@ members = [
     "crates/cli",
     "crates/util",
 ]
+default-members = [
+    "crates/bit_rev",
+    "crates/cli",
+    "crates/util",
+]
 resolver = "3"
 edition = "2024"
 

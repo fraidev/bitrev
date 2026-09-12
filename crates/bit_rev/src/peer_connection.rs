@@ -277,15 +277,16 @@ impl TorrentDownloadedState {
                         begin: offset,
                         length,
                     };
-                    let Some(entry) = map.get(&req) else {
-                        offset += length;
-                        continue;
-                    };
-                    let already = entry.requesters.contains(&peer);
-                    let full = entry.requesters.len() >= picker::MAX_BLOCK_REQUESTERS;
-                    let aged = entry.first_at.elapsed() >= ENDGAME_REREQUEST_AFTER;
-                    if !already && !full && aged {
-                        found.push(req);
+                    match map.get(&req) {
+                        None => found.push(req),
+                        Some(entry) => {
+                            let already = entry.requesters.contains(&peer);
+                            let full = entry.requesters.len() >= picker::MAX_BLOCK_REQUESTERS;
+                            let aged = entry.first_at.elapsed() >= ENDGAME_REREQUEST_AFTER;
+                            if !already && !full && aged {
+                                found.push(req);
+                            }
+                        }
                     }
                 }
                 offset += length;
@@ -423,11 +424,19 @@ impl TorrentDownloadedState {
         for pw in self.pieces.iter() {
             if pw.piece_work.index == index {
                 pw.chuncks.lock().unwrap().clear();
+                pw.write_claimed.store(false, Ordering::Relaxed);
                 if pw.downloaded.swap(false, Ordering::Relaxed) {
                     self.verified.dec();
                 }
             }
         }
+    }
+
+    /// First successful hash for this piece wins. Write failure clears via `remove_downloaded`.
+    pub fn claim_write(&self, index: u32) -> bool {
+        self.pieces
+            .get(index as usize)
+            .is_some_and(|pw| !pw.write_claimed.swap(true, Ordering::Relaxed))
     }
 
     pub fn release_piece(&self, index: u32) {
@@ -516,14 +525,7 @@ impl TorrentDownloadedState {
         if pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
-        let complete = pw
-            .chuncks
-            .lock()
-            .unwrap()
-            .iter()
-            .fold(0, |acc, c| acc + c.length as usize)
-            == pw.piece_work.length as usize;
-        if !complete {
+        if !piece_chunks_cover(pw) {
             return None;
         }
         let already = pw
@@ -544,6 +546,7 @@ pub struct PieceWorkState {
     pub chuncks: Mutex<Vec<Chunk>>,
     pub downloaded: AtomicBool,
     pub reserved: Mutex<Option<PeerAddr>>,
+    write_claimed: AtomicBool,
 }
 
 impl PieceWorkState {
@@ -553,18 +556,40 @@ impl PieceWorkState {
             chuncks: Mutex::new(vec![]),
             downloaded: AtomicBool::new(false),
             reserved: Mutex::new(None),
+            write_claimed: AtomicBool::new(false),
         }
     }
 }
 
+fn piece_chunks_cover(pw: &PieceWorkState) -> bool {
+    let mut spans: Vec<(u32, u32)> = pw
+        .chuncks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| (c.start, c.length))
+        .collect();
+    spans.sort_unstable();
+    let mut covered = 0u32;
+    for (start, len) in spans {
+        if start != covered {
+            return false;
+        }
+        covered = covered.saturating_add(len);
+    }
+    covered == pw.piece_work.length
+}
+
 impl PieceWorkState {
     pub fn chunk_to_buf(&self) -> Vec<u8> {
-        let mut chuncks = self.chuncks.lock().unwrap();
-        let mut buf = vec![];
-        // sort by start
-        chuncks.sort_by_key(|a| a.start);
+        let chuncks = self.chuncks.lock().unwrap();
+        let mut buf = vec![0u8; self.piece_work.length as usize];
         for chunk in chuncks.iter() {
-            buf.extend(chunk.buf.iter());
+            let start = chunk.start as usize;
+            let end = start.saturating_add(chunk.buf.len());
+            if end <= buf.len() {
+                buf[start..end].copy_from_slice(&chunk.buf);
+            }
         }
         buf
     }
@@ -1608,14 +1633,16 @@ impl PeerHandler {
 
                     if utils::check_integrity(full_piece.piece_work.hash.as_ref(), &buf) {
                         trace!("piece index {} is correct", piece_chunk.index);
-                        let full_piece = FullPiece {
-                            index: piece_chunk.index,
-                            length: full_piece.piece_work.length,
-                            buf,
-                        };
+                        if self.torrent_downloaded_state.claim_write(piece_chunk.index) {
+                            let full_piece = FullPiece {
+                                index: piece_chunk.index,
+                                length: full_piece.piece_work.length,
+                                buf,
+                            };
 
-                        if self.piece_tx.send(full_piece).is_err() {
-                            return Ok(());
+                            if self.piece_tx.send(full_piece).is_err() {
+                                return Ok(());
+                            }
                         }
                     } else {
                         trace!("piece index {} is corrupted", piece_chunk.index);
@@ -2299,6 +2326,15 @@ mod tests {
         assert!(!s.is_complete());
     }
 
+    #[test]
+    fn claim_write_once_until_removed() {
+        let s = state(1, 16);
+        assert!(s.claim_write(0));
+        assert!(!s.claim_write(0));
+        s.remove_downloaded(0);
+        assert!(s.claim_write(0));
+    }
+
     #[tokio::test]
     async fn concurrent_reservation_completes_each_piece_once() {
         const N: u16 = 16;
@@ -2398,6 +2434,24 @@ mod tests {
         assert!(s.set_chuncks(0, 0, vec![0u8; 16], p1));
         let has = Bitfield::filled(1);
         assert!(s.endgame_blocks(p3, &has, 4).is_empty());
+    }
+
+    #[test]
+    fn endgame_requests_unassigned_blocks_on_reserved_piece() {
+        let s = state(1, 16);
+        let p1 = peer(6881);
+        let p2 = peer(6882);
+        assert!(s.try_reserve_piece(0, p1).is_some());
+        let has = Bitfield::filled(1);
+        let blocks = s.endgame_blocks(p2, &has, 4);
+        assert_eq!(
+            blocks,
+            vec![BlockRequest {
+                index: 0,
+                begin: 0,
+                length: 16,
+            }]
+        );
     }
 
     #[test]
