@@ -18,6 +18,7 @@ Issue: https://github.com/fraidev/bitrev/issues/65
 | `extension_handshake_decode` | `ExtensionHandshake::decode` |
 | `resume_decode` | `resume::decode` |
 | `ut_metadata_decode` | `ut_metadata::parse_message` |
+| `krpc_decode` | `dht::krpc::decode` |
 
 New parsers (KRPC, `ut_metadata`, magnet, `ut_pex`, LPD, `ipfilter.dat`) add one
 target here with a seed corpus under `corpus/<target>/`.

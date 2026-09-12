@@ -11,6 +11,7 @@ pub enum MessageId {
     MsgRequest = 6,
     MsgPiece = 7,
     MsgCancel = 8,
+    MsgPort = 9,
     MsgSuggestPiece = 13,
     MsgHaveAll = 14,
     MsgHaveNone = 15,
@@ -39,6 +40,7 @@ pub enum Message {
     Request(Vec<u8>),
     Piece(PieceChunk),
     Cancel(Vec<u8>),
+    Port(u16),
     SuggestPiece(u32),
     HaveAll,
     HaveNone,
@@ -75,6 +77,9 @@ impl From<MessageInner> for Message {
                 })
             }
             MessageId::MsgCancel => Message::Cancel(inner.payload[0..12].to_vec()),
+            MessageId::MsgPort => {
+                Message::Port(u16::from_be_bytes(inner.payload[0..2].try_into().unwrap()))
+            }
             MessageId::MsgSuggestPiece => {
                 Message::SuggestPiece(u32::from_be_bytes(inner.payload[0..4].try_into().unwrap()))
             }
@@ -120,6 +125,7 @@ impl Display for MessageInner {
             MessageId::MsgRequest => "REQUEST",
             MessageId::MsgPiece => "PIECE",
             MessageId::MsgCancel => "CANCEL",
+            MessageId::MsgPort => "PORT",
             MessageId::MsgSuggestPiece => "SUGGEST_PIECE",
             MessageId::MsgHaveAll => "HAVE_ALL",
             MessageId::MsgHaveNone => "HAVE_NONE",
@@ -403,6 +409,7 @@ pub fn serialize(msg: Option<Message>) -> Vec<u8> {
                     (MessageId::MsgPiece, payload)
                 }
                 Message::Cancel(payload) => (MessageId::MsgCancel, payload),
+                Message::Port(port) => (MessageId::MsgPort, port.to_be_bytes().to_vec()),
                 Message::SuggestPiece(index) => {
                     (MessageId::MsgSuggestPiece, index.to_be_bytes().to_vec())
                 }
@@ -472,6 +479,7 @@ pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Result<Message, DecodeErro
         6 => MessageId::MsgRequest,
         7 => MessageId::MsgPiece,
         8 => MessageId::MsgCancel,
+        9 => MessageId::MsgPort,
         13 => MessageId::MsgSuggestPiece,
         14 => MessageId::MsgHaveAll,
         15 => MessageId::MsgHaveNone,
@@ -490,6 +498,7 @@ pub fn read(length_buf: &[u8], message_buf: &[u8]) -> Result<Message, DecodeErro
         {
             return Err(DecodeError::Truncated)
         }
+        MessageId::MsgPort if payload.len() < 2 => return Err(DecodeError::Truncated),
         MessageId::MsgRequest | MessageId::MsgCancel | MessageId::MsgRejectRequest
             if payload.len() < 12 =>
         {
@@ -700,6 +709,7 @@ mod tests {
             Message::Cancel(vec![
                 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
             ]),
+            Message::Port(6881),
             Message::SuggestPiece(42),
             Message::HaveAll,
             Message::HaveNone,
@@ -729,6 +739,20 @@ mod tests {
 
         assert_eq!(serialize(Some(Message::KeepAlive)), vec![0, 0, 0, 0]);
         assert_eq!(round_trip(Message::KeepAlive), Ok(Message::KeepAlive));
+    }
+
+    #[test]
+    fn port_wire_bytes_and_round_trip() {
+        let msg = Message::Port(6881);
+        assert_eq!(
+            serialize(Some(msg.clone())),
+            vec![0x00, 0x00, 0x00, 0x03, 9, 0x1A, 0xE1]
+        );
+        assert_eq!(round_trip(msg.clone()), Ok(msg));
+        assert_eq!(
+            read(&[0, 0, 0, 3], &[9, 0x1A, 0xE1]),
+            Ok(Message::Port(6881))
+        );
     }
 
     #[test]
@@ -805,6 +829,9 @@ mod tests {
             (&[0, 0, 0, 12], &[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]),
             // Extended with no ext_id byte
             (&[0, 0, 0, 1], &[20]),
+            // Port payload shorter than 2 bytes
+            (&[0, 0, 0, 3], &[9]),
+            (&[0, 0, 0, 2], &[9, 0]),
         ];
 
         for (length_buf, message_buf) in cases {
@@ -816,7 +843,7 @@ mod tests {
     fn read_unknown_id() {
         let cases: &[(&[u8], &[u8], u8)] = &[
             (&[0, 0, 0, 1], &[99], 99),
-            (&[0, 0, 0, 3], &[9, 0, 1], 9),
+            (&[0, 0, 0, 3], &[10, 0, 1], 10),
             (&[0, 0, 0, 1], &[255], 255),
         ];
 

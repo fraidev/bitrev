@@ -68,6 +68,11 @@ pub fn torrents_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("torrents")
 }
 
+/// DHT routing table: `<state_dir>/dht.dat`.
+pub fn dht_dat(state_dir: &Path) -> PathBuf {
+    state_dir.join("dht.dat")
+}
+
 pub trait PathExt {
     fn compact(&self) -> PathBuf;
     fn icon_suffix(&self) -> Option<&str>;
@@ -420,6 +425,7 @@ mod tests {
             torrents_dir(&state_dir()),
             HOME.join(".bitrev").join("torrents")
         );
+        assert_eq!(dht_dat(&state_dir()), HOME.join(".bitrev").join("dht.dat"));
     }
 
     #[test]

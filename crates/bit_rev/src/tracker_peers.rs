@@ -36,6 +36,9 @@ pub struct PeerSpawnRuntime {
     pub extensions: ExtensionRegistry,
     pub connector: Arc<dyn Connector>,
     pub metadata: Arc<MetadataStore>,
+    pub advertise_dht: bool,
+    pub dht_port: Option<u16>,
+    pub dht: Option<crate::dht::DhtHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +167,9 @@ impl TrackerPeers {
                 extensions: runtime.extensions.clone(),
                 connector: runtime.connector.clone(),
                 metadata: runtime.metadata.clone(),
+                advertise_dht: runtime.advertise_dht,
+                dht_port: runtime.dht_port,
+                dht: runtime.dht.clone(),
             };
             tokio::spawn(async move {
                 tracker::run_announce_loop(ctx, shutdown, |new_peers| {
@@ -186,6 +192,9 @@ impl TrackerPeers {
                         extensions: runtime.extensions.clone(),
                         connector: runtime.connector.clone(),
                         metadata: runtime.metadata.clone(),
+                        advertise_dht: runtime.advertise_dht,
+                        dht_port: runtime.dht_port,
+                        dht: runtime.dht.clone(),
                     };
                     async move {
                         process_peers(
@@ -238,9 +247,13 @@ async fn process_peers(
             incoming: None,
             incoming_fast_extension: None,
             incoming_extension_protocol: None,
+            incoming_dht: None,
             extensions: runtime.extensions.clone(),
             listen_port: runtime.listen_port,
             metadata: runtime.metadata.clone(),
+            advertise_dht: runtime.advertise_dht,
+            dht_port: runtime.dht_port,
+            dht: runtime.dht.clone(),
             global_peers: runtime.global_peers.clone(),
             max_peers_per_torrent: runtime.max_peers_per_torrent,
             max_peers_global: runtime.max_peers_global,
