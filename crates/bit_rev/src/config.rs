@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dht::DhtOptions;
 use crate::file::AnnounceParams;
 use crate::session::{
     SessionOptions, DEFAULT_LISTEN_PORT, DEFAULT_MAX_PEERS_GLOBAL, DEFAULT_MAX_PEERS_PER_TORRENT,
@@ -201,6 +202,15 @@ impl Config {
             } else {
                 Some(state_dir)
             },
+            dht: DhtOptions {
+                enabled: self.dht.enabled,
+                port: self.dht.port,
+                bootstrap_nodes: if self.dht.enabled {
+                    DhtOptions::default_bootstrap()
+                } else {
+                    Vec::new()
+                },
+            },
         }
     }
 }
@@ -266,6 +276,26 @@ mod tests {
         );
         assert_eq!(options.max_peers_global, expected.max_peers_global);
         assert_eq!(options.state_dir, expected.state_dir);
+    }
+
+    #[test]
+    fn session_options_maps_dht() {
+        let options = Config::default().session_options();
+        assert!(options.dht.enabled);
+        assert_eq!(options.dht.port, DEFAULT_LISTEN_PORT);
+        assert_eq!(options.dht.bootstrap_nodes, DhtOptions::default_bootstrap());
+
+        let disabled = Config {
+            dht: DhtConfig {
+                enabled: false,
+                port: 6999,
+            },
+            ..Config::default()
+        }
+        .session_options();
+        assert!(!disabled.dht.enabled);
+        assert_eq!(disabled.dht.port, 6999);
+        assert!(disabled.dht.bootstrap_nodes.is_empty());
     }
 
     #[test]

@@ -43,7 +43,14 @@ impl PeerStates {
         }
         use dashmap::mapref::entry::Entry;
         match self.states.entry(peer) {
-            Entry::Occupied(_) => false,
+            Entry::Occupied(mut entry) => {
+                if entry.get().writer_tx.is_some() {
+                    false
+                } else {
+                    *entry.get_mut() = PeerState::live(writer_tx);
+                    true
+                }
+            }
             Entry::Vacant(entry) => {
                 entry.insert(PeerState::live(writer_tx));
                 true
@@ -239,6 +246,17 @@ mod tests {
         assert!(states.add_if_not_seen(peer));
         assert!(!states.add_if_not_seen(peer));
         assert_eq!(states.states.len(), 1);
+    }
+
+    #[test]
+    fn insert_live_upgrades_unwired_seen_peer() {
+        let states = PeerStates::default();
+        let peer = "127.0.0.1:6881".parse().unwrap();
+        assert!(states.add_if_not_seen(peer));
+        let (tx, _rx) = flume::unbounded();
+        assert!(states.insert_live(peer, tx.clone()));
+        assert!(states.states.get(&peer).unwrap().writer_tx.is_some());
+        assert!(!states.insert_live(peer, tx));
     }
 
     #[test]

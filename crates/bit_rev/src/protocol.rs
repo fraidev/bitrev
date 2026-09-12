@@ -71,6 +71,7 @@ pub struct Protocol {
     pub peer_id: [u8; 20],
     pub piece_count: Option<usize>,
     pub timeouts: PeerTimeouts,
+    pub advertise_dht: bool,
 }
 
 /// Decode one length-prefixed peer message from a complete buffer.
@@ -117,11 +118,17 @@ impl Protocol {
             peer_id,
             piece_count: None,
             timeouts: PeerTimeouts::default(),
+            advertise_dht: false,
         })
     }
 
     pub fn with_piece_count(mut self, count: usize) -> Self {
         self.piece_count = Some(count);
+        self
+    }
+
+    pub fn with_dht(mut self, enabled: bool) -> Self {
+        self.advertise_dht = enabled;
         self
     }
 
@@ -386,7 +393,10 @@ impl Protocol {
         stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
     ) -> Result<Handshake, ProtocolError> {
         let timeout = tokio::time::timeout(self.timeouts.handshake, async {
-            let handshake = Handshake::outgoing(self.info_hash, self.peer_id);
+            let mut handshake = Handshake::outgoing(self.info_hash, self.peer_id);
+            if self.advertise_dht {
+                handshake.enable_dht();
+            }
             let handshake_bytes = handshake.serialize();
             stream
                 .write_all(&handshake_bytes)

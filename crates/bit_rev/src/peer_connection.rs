@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -635,6 +636,9 @@ pub struct PeerHandlerConfig {
     pub listen_port: u16,
     pub metadata: Arc<MetadataStore>,
     pub info_hash: [u8; 20],
+    pub advertise_dht: bool,
+    pub dht_port: Option<u16>,
+    pub dht: Option<crate::dht::DhtHandle>,
 }
 
 pub struct PeerHandler {
@@ -664,6 +668,10 @@ pub struct PeerHandler {
     extensions: Mutex<ExtensionSession>,
     listen_port: u16,
     metadata: Arc<MetadataStore>,
+    advertise_dht: bool,
+    dht_port: Option<u16>,
+    dht: Option<crate::dht::DhtHandle>,
+    peer_dht: AtomicBool,
     snubbed: AtomicBool,
     last_block_at: Mutex<Option<tokio::time::Instant>>,
     first_request_at: Mutex<Option<tokio::time::Instant>>,
@@ -712,6 +720,10 @@ impl PeerHandler {
             })),
             listen_port: config.listen_port,
             metadata: config.metadata,
+            advertise_dht: config.advertise_dht,
+            dht_port: config.dht_port,
+            dht: config.dht,
+            peer_dht: AtomicBool::new(false),
             snubbed: AtomicBool::new(false),
             last_block_at: Mutex::new(None),
             first_request_at: Mutex::new(None),
@@ -1692,6 +1704,12 @@ impl PeerHandler {
                     debug!("peer canceled request {:?}", req);
                 }
             }
+            Message::Port(port) => {
+                if let Some(dht) = &self.dht {
+                    let addr = SocketAddr::new(self.peer.ip(), port);
+                    dht.ping_node(addr);
+                }
+            }
             Message::Extended { ext_id, payload } => {
                 if !self.extension_protocol() {
                     debug!("extended message without negotiation, ignoring");
@@ -1773,13 +1791,19 @@ impl PeerConnection {
         let protocol = Arc::new(
             Protocol::connect(self.peer, self.info_hash, self.peer_id)
                 .await?
-                .with_piece_count(self.handler.torrent_downloaded_state.piece_count()),
+                .with_piece_count(self.handler.torrent_downloaded_state.piece_count())
+                .with_dht(self.handler.advertise_dht),
         );
         let handshake = protocol.complete_handshake(&mut stream).await?;
         self.handler
             .set_fast_extension(handshake.supports_fast_extension());
         self.handler
             .set_extension_protocol(handshake.supports_extension_protocol());
+        if handshake.supports_dht() {
+            self.handler.peer_dht.store(true, Ordering::Relaxed);
+        }
+        self.send_dht_port(&protocol, &mut stream, handshake.supports_dht())
+            .await?;
         self.send_extension_handshake(&protocol, &mut stream)
             .await?;
         self.send_initial_bitfield(&protocol, &mut stream).await?;
@@ -1797,14 +1821,37 @@ impl PeerConnection {
         let protocol = Arc::new(
             Protocol::connect(self.peer, self.info_hash, self.peer_id)
                 .await?
-                .with_piece_count(self.handler.torrent_downloaded_state.piece_count()),
+                .with_piece_count(self.handler.torrent_downloaded_state.piece_count())
+                .with_dht(self.handler.advertise_dht),
         );
+        if self.handler.peer_dht.load(Ordering::Relaxed) {
+            self.send_dht_port(&protocol, &mut stream, true).await?;
+        }
         self.send_extension_handshake(&protocol, &mut stream)
             .await?;
         self.send_initial_bitfield(&protocol, &mut stream).await?;
         self.send_allowed_fast(&protocol, &mut stream).await?;
         self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
             .await
+    }
+
+    async fn send_dht_port<S: PeerStream>(
+        &self,
+        protocol: &Protocol,
+        stream: &mut S,
+        peer_supports_dht: bool,
+    ) -> anyhow::Result<()> {
+        if !peer_supports_dht {
+            return Ok(());
+        }
+        let Some(port) = self.handler.dht_port else {
+            return Ok(());
+        };
+        if port == 0 {
+            return Ok(());
+        }
+        protocol.send_message(stream, Message::Port(port)).await?;
+        Ok(())
     }
 
     async fn send_extension_handshake<S: PeerStream>(
@@ -2065,9 +2112,13 @@ pub struct SpawnPeerParams {
     pub connector: Arc<dyn Connector>,
     pub incoming_fast_extension: Option<bool>,
     pub incoming_extension_protocol: Option<bool>,
+    pub incoming_dht: Option<bool>,
     pub extensions: ExtensionRegistry,
     pub listen_port: u16,
     pub metadata: Arc<MetadataStore>,
+    pub advertise_dht: bool,
+    pub dht_port: Option<u16>,
+    pub dht: Option<crate::dht::DhtHandle>,
     pub global_peers: Arc<std::sync::atomic::AtomicUsize>,
     pub max_peers_per_torrent: usize,
     pub max_peers_global: usize,
@@ -2097,7 +2148,8 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
         debug!(peer = %params.peer, "global connection cap reached");
         return false;
     }
-    if params.peer_states.len() >= params.max_peers_per_torrent {
+    let already_seen = params.peer_states.states.contains_key(&params.peer);
+    if !already_seen && params.peer_states.len() >= params.max_peers_per_torrent {
         debug!(peer = %params.peer, "per-torrent connection cap reached");
         return false;
     }
@@ -2138,12 +2190,18 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             listen_port: params.listen_port,
             metadata: params.metadata,
             info_hash: params.info_hash,
+            advertise_dht: params.advertise_dht,
+            dht_port: params.dht_port,
+            dht: params.dht,
         }));
         if let Some(fast) = params.incoming_fast_extension {
             handler.set_fast_extension(fast);
         }
         if let Some(extended) = params.incoming_extension_protocol {
             handler.set_extension_protocol(extended);
+        }
+        if params.incoming_dht == Some(true) {
+            handler.peer_dht.store(true, Ordering::Relaxed);
         }
         let connection = PeerConnection::new(
             params.peer,
@@ -2605,6 +2663,9 @@ mod tests {
             listen_port: 0,
             metadata: MetadataStore::new(meta.info_hash),
             info_hash: meta.info_hash,
+            advertise_dht: false,
+            dht_port: None,
+            dht: None,
         }));
         let connector: Arc<dyn Connector> = Arc::new(crate::transport::TcpConnector::new());
         let connection = PeerConnection::new(

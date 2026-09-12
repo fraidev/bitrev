@@ -4,6 +4,8 @@ use thiserror::Error;
 pub const FAST_EXTENSION_FLAG: u8 = 0x04;
 /// Extension protocol (BEP-0010): reserved[5] |= 0x10
 pub const EXTENSION_PROTOCOL_FLAG: u8 = 0x10;
+/// DHT (BEP-0005): reserved[7] |= 0x01
+pub const DHT_FLAG: u8 = 0x01;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Handshake {
@@ -17,6 +19,7 @@ pub struct Handshake {
 pub struct HandshakeCapabilities {
     pub fast_extension: bool,
     pub extension_protocol: bool,
+    pub dht: bool,
 }
 
 /// Standard BitTorrent `pstrlen`. Larger values are rejected before allocation.
@@ -65,10 +68,19 @@ impl Handshake {
         self.reserved[5] |= EXTENSION_PROTOCOL_FLAG;
     }
 
+    pub fn supports_dht(&self) -> bool {
+        self.reserved[7] & DHT_FLAG != 0
+    }
+
+    pub fn enable_dht(&mut self) {
+        self.reserved[7] |= DHT_FLAG;
+    }
+
     pub fn capabilities(&self) -> HandshakeCapabilities {
         HandshakeCapabilities {
             fast_extension: self.supports_fast_extension(),
             extension_protocol: self.supports_extension_protocol(),
+            dht: self.supports_dht(),
         }
     }
 
@@ -305,6 +317,7 @@ mod tests {
         assert_eq!(handshake.reserved, [0u8; 8]);
         assert!(!handshake.supports_fast_extension());
         assert!(!handshake.supports_extension_protocol());
+        assert!(!handshake.supports_dht());
         assert_eq!(handshake.capabilities(), HandshakeCapabilities::default());
     }
 
@@ -322,6 +335,7 @@ mod tests {
             HandshakeCapabilities {
                 fast_extension: true,
                 extension_protocol: true,
+                dht: false,
             }
         );
     }
@@ -346,5 +360,18 @@ mod tests {
         assert_eq!(handshake.reserved[5], EXTENSION_PROTOCOL_FLAG);
         handshake.enable_extension_protocol();
         assert_eq!(handshake.reserved[5], EXTENSION_PROTOCOL_FLAG);
+    }
+
+    #[test]
+    fn enable_dht_round_trip() {
+        let mut handshake = Handshake::new(HASH_INFO, PEER_ID);
+        assert!(!handshake.supports_dht());
+        handshake.enable_dht();
+        assert!(handshake.supports_dht());
+        assert_eq!(handshake.reserved[7], DHT_FLAG);
+        handshake.enable_fast_extension();
+        assert_eq!(handshake.reserved[7], DHT_FLAG | FAST_EXTENSION_FLAG);
+        assert!(handshake.supports_dht());
+        assert!(handshake.supports_fast_extension());
     }
 }

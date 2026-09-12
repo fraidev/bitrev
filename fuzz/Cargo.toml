@@ -72,3 +72,10 @@ path = "fuzz_targets/ut_metadata_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "krpc_decode"
+path = "fuzz_targets/krpc_decode.rs"
+test = false
+doc = false
+bench = false

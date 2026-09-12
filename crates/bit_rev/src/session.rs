@@ -3,10 +3,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::dht::{DhtHandle, PeerSink};
+use crate::discovery::DiscoverySource;
 use crate::extension::{Extension, ExtensionContext, ExtensionRegistry, MetadataStore, UtMetadata};
 use crate::file::{self, TorrentMeta};
 use crate::handshake::Handshake;
 use crate::message::{Message, WriterRequest};
+use crate::peer::PeerAddr;
 use crate::peer_connection::{
     try_spawn_peer, PieceWorkState, SpawnPeerParams, TorrentDownloadedState,
 };
@@ -14,6 +17,7 @@ use crate::peer_state::PeerStates;
 use crate::protocol::Protocol;
 use crate::resume::{self, ResumeSnapshot};
 
+pub use crate::dht::{DhtOptions, DhtStats};
 pub use crate::resume::ResumeStatus;
 use crate::storage::Storage;
 use crate::torrent::Torrent;
@@ -61,6 +65,7 @@ pub struct SessionOptions {
     pub max_peers_global: usize,
     /// Directory for resume data and cached torrents. `None` disables persistence.
     pub state_dir: Option<PathBuf>,
+    pub dht: DhtOptions,
 }
 
 impl Default for SessionOptions {
@@ -70,6 +75,7 @@ impl Default for SessionOptions {
             max_peers_per_torrent: DEFAULT_MAX_PEERS_PER_TORRENT,
             max_peers_global: DEFAULT_MAX_PEERS_GLOBAL,
             state_dir: Some(util::paths::state_dir()),
+            dht: DhtOptions::default(),
         }
     }
 }
@@ -111,6 +117,7 @@ pub struct Session {
     extensions: ExtensionRegistry,
     connector: Arc<dyn Connector>,
     pending: Arc<DashMap<[u8; 20], Arc<PendingTorrent>>>,
+    dht: Arc<Mutex<Option<DhtHandle>>>,
 }
 
 pub(crate) struct PendingTorrent {
@@ -249,12 +256,71 @@ impl Session {
             extensions: ExtensionRegistry::new(),
             connector,
             pending: Arc::new(DashMap::new()),
+            dht: Arc::new(Mutex::new(None)),
         };
         session
             .extensions
             .register(|ctx| Box::new(UtMetadata::new(ctx.clone())));
         session.spawn_listener();
+        session.start_dht();
         session
+    }
+
+    fn start_dht(&self) {
+        if !self.options.dht.enabled {
+            return;
+        }
+        let inlet = self.peer_inlet();
+        let sink: PeerSink = Arc::new(move |info_hash, addrs| {
+            inlet.add_peers(&info_hash, DiscoverySource::Dht, addrs);
+        });
+        match DhtHandle::spawn(
+            self.options.dht.clone(),
+            self.options.state_dir.clone(),
+            sink,
+            self.cancel.clone(),
+        ) {
+            Ok(handle) => {
+                *self.dht.lock().unwrap() = Some(handle);
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start DHT");
+            }
+        }
+    }
+
+    fn peer_inlet(&self) -> PeerInlet {
+        PeerInlet {
+            torrents: self.torrents.clone(),
+            pending: self.pending.clone(),
+            peer_id: self.peer_id,
+            extensions: self.extensions.clone(),
+            listen_addr: self.listen_addr.clone(),
+            listen_port: self.options.listen_port,
+            global_peers: self.global_peers.clone(),
+            max_peers_per_torrent: self.options.max_peers_per_torrent,
+            max_peers_global: self.options.max_peers_global,
+            connector: self.connector.clone(),
+            dht: self.dht.clone(),
+            download_state: self.download_state.clone(),
+        }
+    }
+
+    pub fn dht(&self) -> Option<DhtHandle> {
+        self.dht.lock().unwrap().clone()
+    }
+
+    pub fn dht_stats(&self) -> Option<DhtStats> {
+        self.dht().map(|d| d.stats())
+    }
+
+    pub fn add_peers(
+        &self,
+        info_hash: &[u8; 20],
+        source: DiscoverySource,
+        addrs: Vec<PeerAddr>,
+    ) -> usize {
+        self.peer_inlet().add_peers(info_hash, source, addrs)
     }
 
     pub fn connector(&self) -> Arc<dyn Connector> {
@@ -326,6 +392,7 @@ impl Session {
         let extensions = self.extensions.clone();
         let connector = self.connector.clone();
         let pending = self.pending.clone();
+        let dht = self.dht.clone();
 
         tokio::spawn(async move {
             let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -363,6 +430,7 @@ impl Session {
                         let extensions = extensions.clone();
                         let connector = connector.clone();
                         let pending = pending.clone();
+                        let dht = dht.lock().unwrap().clone();
                         let listen_port = listen_addr
                             .lock()
                             .unwrap()
@@ -382,6 +450,7 @@ impl Session {
                                     listen_port,
                                     connector,
                                     pending,
+                                    dht,
                                 },
                             )
                             .await;
@@ -403,6 +472,9 @@ impl Session {
                 .tracker
                 .set_download_state(DownloadState::Downloading);
         }
+        if let Some(dht) = self.dht() {
+            dht.set_all_active(true);
+        }
     }
 
     pub fn pause(&self) {
@@ -414,6 +486,9 @@ impl Session {
             let torrent = entry.value();
             torrent.tracker.set_download_state(DownloadState::Paused);
             choke_all_peers(&torrent.peer_states);
+        }
+        if let Some(dht) = self.dht() {
+            dht.set_all_active(false);
         }
         self.spawn_flush_resume();
     }
@@ -429,6 +504,9 @@ impl Session {
                 .tracker
                 .set_download_state(DownloadState::Downloading);
             torrent.choke_notify.notify_waiters();
+        }
+        if let Some(dht) = self.dht() {
+            dht.set_all_active(true);
         }
         self.spawn_flush_resume();
     }
@@ -451,6 +529,9 @@ impl Session {
 
     pub fn shutdown(&self) {
         self.cancel.cancel();
+        if let Some(dht) = self.dht() {
+            dht.shutdown();
+        }
         for entry in self.torrents.iter() {
             entry.value().tracker.shutdown();
         }
@@ -503,6 +584,13 @@ impl Session {
         });
     }
 
+    fn dht_peer_fields(&self) -> (bool, Option<u16>, Option<DhtHandle>) {
+        match self.dht() {
+            Some(dht) => (true, Some(dht.udp_port()), Some(dht)),
+            None => (false, None, None),
+        }
+    }
+
     pub fn connect_peer(&self, info_hash: &[u8; 20], addr: SocketAddr) -> bool {
         if let Some(torrent) = self.torrents.get(info_hash).map(|entry| entry.clone()) {
             return try_spawn_peer(SpawnPeerParams {
@@ -521,9 +609,13 @@ impl Session {
                 incoming: None,
                 incoming_fast_extension: None,
                 incoming_extension_protocol: None,
+                incoming_dht: None,
                 extensions: self.extensions.clone(),
                 listen_port: self.listen_port(),
                 metadata: torrent.metadata.clone(),
+                advertise_dht: self.dht_peer_fields().0,
+                dht_port: self.dht_peer_fields().1,
+                dht: self.dht_peer_fields().2,
                 global_peers: self.global_peers.clone(),
                 max_peers_per_torrent: self.options.max_peers_per_torrent,
                 max_peers_global: self.options.max_peers_global,
@@ -549,9 +641,13 @@ impl Session {
             incoming: None,
             incoming_fast_extension: None,
             incoming_extension_protocol: None,
+            incoming_dht: None,
             extensions: self.extensions.clone(),
             listen_port: self.listen_port(),
             metadata: pending.metadata.clone(),
+            advertise_dht: self.dht_peer_fields().0,
+            dht_port: self.dht_peer_fields().1,
+            dht: self.dht_peer_fields().2,
             global_peers: self.global_peers.clone(),
             max_peers_per_torrent: self.options.max_peers_per_torrent,
             max_peers_global: self.options.max_peers_global,
@@ -568,6 +664,9 @@ impl Session {
             torrent.tracker.shutdown();
         }
         self.pending.remove(info_hash);
+        if let Some(dht) = self.dht() {
+            dht.remove_torrent(*info_hash);
+        }
     }
 
     pub async fn add_torrent_by_info_hash(
@@ -793,8 +892,24 @@ impl Session {
                 extensions: self.extensions.clone(),
                 connector: self.connector.clone(),
                 metadata: metadata.clone(),
+                advertise_dht: self.dht_peer_fields().0,
+                dht_port: self.dht_peer_fields().1,
+                dht: self.dht_peer_fields().2,
             })
             .await;
+
+        if let Some(dht) = self.dht() {
+            match tracker_stream.register_source(DiscoverySource::Dht) {
+                Ok(()) => {
+                    let active = !start_paused
+                        && *self.download_state.lock().unwrap() != DownloadState::Paused;
+                    dht.add_torrent(torrent.info_hash, listen_port, active);
+                }
+                Err(denied) => {
+                    debug!(error = %denied, "dht disabled for torrent");
+                }
+            }
+        }
 
         spawn_choke_loop(
             peer_states.clone(),
@@ -988,6 +1103,150 @@ fn choke_all_peers(peer_states: &PeerStates) {
     }
 }
 
+#[derive(Clone)]
+struct PeerInlet {
+    torrents: Arc<DashMap<[u8; 20], Arc<TorrentSession>>>,
+    pending: Arc<DashMap<[u8; 20], Arc<PendingTorrent>>>,
+    peer_id: [u8; 20],
+    extensions: ExtensionRegistry,
+    listen_addr: Arc<Mutex<Option<SocketAddr>>>,
+    listen_port: u16,
+    global_peers: Arc<AtomicUsize>,
+    max_peers_per_torrent: usize,
+    max_peers_global: usize,
+    connector: Arc<dyn Connector>,
+    dht: Arc<Mutex<Option<DhtHandle>>>,
+    download_state: Arc<Mutex<DownloadState>>,
+}
+
+impl PeerInlet {
+    fn listen_port(&self) -> u16 {
+        self.listen_addr
+            .lock()
+            .unwrap()
+            .map(|addr| addr.port())
+            .unwrap_or(self.listen_port)
+    }
+
+    fn dht_fields(&self) -> (bool, Option<u16>, Option<DhtHandle>) {
+        match self.dht.lock().unwrap().clone() {
+            Some(dht) => (true, Some(dht.udp_port()), Some(dht)),
+            None => (false, None, None),
+        }
+    }
+
+    fn add_peers(
+        &self,
+        info_hash: &[u8; 20],
+        source: DiscoverySource,
+        addrs: Vec<PeerAddr>,
+    ) -> usize {
+        let allowed = if let Some(torrent) = self.torrents.get(info_hash) {
+            torrent.tracker.allows_source(source)
+        } else if let Some(pending) = self.pending.get(info_hash) {
+            pending.torrent.allows_source(source)
+        } else {
+            return 0;
+        };
+        if !allowed {
+            return 0;
+        }
+        if *self.download_state.lock().unwrap() != DownloadState::Downloading {
+            return 0;
+        }
+
+        let (peer_states, max_per) = if let Some(torrent) = self.torrents.get(info_hash) {
+            (torrent.peer_states.clone(), self.max_peers_per_torrent)
+        } else if let Some(pending) = self.pending.get(info_hash) {
+            (pending.peer_states.clone(), self.max_peers_per_torrent)
+        } else {
+            return 0;
+        };
+
+        let mut added = 0;
+        for addr in addrs {
+            if self.global_peers.load(Ordering::Relaxed) >= self.max_peers_global {
+                break;
+            }
+            if peer_states.len() >= max_per {
+                break;
+            }
+            if !peer_states.add_if_not_seen(addr) {
+                continue;
+            }
+            if self.connect_peer(info_hash, addr) {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    fn connect_peer(&self, info_hash: &[u8; 20], addr: SocketAddr) -> bool {
+        let (advertise_dht, dht_port, dht) = self.dht_fields();
+        if let Some(torrent) = self.torrents.get(info_hash).map(|entry| entry.clone()) {
+            return try_spawn_peer(SpawnPeerParams {
+                peer: addr,
+                info_hash: *info_hash,
+                peer_id: self.peer_id,
+                piece_tx: torrent.piece_tx.clone(),
+                have_broadcast: torrent.have_broadcast.clone(),
+                torrent_downloaded_state: torrent.downloaded_state.clone(),
+                peer_states: torrent.peer_states.clone(),
+                download_state: torrent.download_state.clone(),
+                storage: torrent.storage.clone(),
+                uploaded: torrent.uploaded.clone(),
+                torrent: torrent.torrent.clone(),
+                choke_notify: torrent.choke_notify.clone(),
+                incoming: None,
+                incoming_fast_extension: None,
+                incoming_extension_protocol: None,
+                incoming_dht: None,
+                extensions: self.extensions.clone(),
+                listen_port: self.listen_port(),
+                metadata: torrent.metadata.clone(),
+                advertise_dht,
+                dht_port,
+                dht,
+                global_peers: self.global_peers.clone(),
+                max_peers_per_torrent: self.max_peers_per_torrent,
+                max_peers_global: self.max_peers_global,
+                connector: self.connector.clone(),
+            });
+        }
+        let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
+            return false;
+        };
+        try_spawn_peer(SpawnPeerParams {
+            peer: addr,
+            info_hash: *info_hash,
+            peer_id: self.peer_id,
+            piece_tx: pending.piece_tx.clone(),
+            have_broadcast: pending.have_broadcast.clone(),
+            torrent_downloaded_state: pending.downloaded_state.clone(),
+            peer_states: pending.peer_states.clone(),
+            download_state: pending.download_state.clone(),
+            storage: pending.storage.clone(),
+            uploaded: pending.uploaded.clone(),
+            torrent: pending.torrent.clone(),
+            choke_notify: pending.choke_notify.clone(),
+            incoming: None,
+            incoming_fast_extension: None,
+            incoming_extension_protocol: None,
+            incoming_dht: None,
+            extensions: self.extensions.clone(),
+            listen_port: self.listen_port(),
+            metadata: pending.metadata.clone(),
+            advertise_dht,
+            dht_port,
+            dht,
+            global_peers: self.global_peers.clone(),
+            max_peers_per_torrent: self.max_peers_per_torrent,
+            max_peers_global: self.max_peers_global,
+            connector: self.connector.clone(),
+        })
+    }
+}
+
 pub struct IncomingPeerContext {
     pub peer_id: [u8; 20],
     pub torrents: Arc<DashMap<[u8; 20], Arc<TorrentSession>>>,
@@ -998,6 +1257,7 @@ pub struct IncomingPeerContext {
     pub listen_port: u16,
     pub connector: Arc<dyn Connector>,
     pub(crate) pending: Arc<DashMap<[u8; 20], Arc<PendingTorrent>>>,
+    pub dht: Option<DhtHandle>,
 }
 
 impl Session {
@@ -1012,6 +1272,7 @@ impl Session {
             listen_port: self.listen_port(),
             connector: self.connector.clone(),
             pending: self.pending.clone(),
+            dht: self.dht(),
         }
     }
 
@@ -1088,7 +1349,10 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         debug!(%addr, "refusing banned incoming peer");
         return;
     }
-    let reply = Handshake::outgoing(handshake.info_hash, ctx.peer_id);
+    let mut reply = Handshake::outgoing(handshake.info_hash, ctx.peer_id);
+    if ctx.dht.is_some() {
+        reply.enable_dht();
+    }
     if let Err(e) = Protocol::write_handshake(&mut stream, &reply).await {
         debug!(%addr, error = %e, "failed to write handshake reply");
         return;
@@ -1100,9 +1364,13 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         peer_id: ctx.peer_id,
         incoming_fast_extension: Some(handshake.supports_fast_extension()),
         incoming_extension_protocol: Some(handshake.supports_extension_protocol()),
+        incoming_dht: Some(handshake.supports_dht()),
         extensions: ctx.extensions,
         listen_port: ctx.listen_port,
         metadata: target.metadata,
+        advertise_dht: ctx.dht.is_some(),
+        dht_port: ctx.dht.as_ref().map(|d| d.udp_port()),
+        dht: ctx.dht,
         piece_tx: target.piece_tx,
         have_broadcast: target.have_broadcast,
         torrent_downloaded_state: target.downloaded_state,
