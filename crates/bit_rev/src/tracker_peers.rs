@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::{
     discovery::{DiscoverySource, SourceDenied, SourceRegistry},
-    extension::ExtensionRegistry,
+    extension::{ExtensionRegistry, MetadataStore},
     file::TorrentMeta,
     identity::TrackerIdentity,
     peer::BencodeResponse,
@@ -35,6 +35,7 @@ pub struct PeerSpawnRuntime {
     pub listen_port: u16,
     pub extensions: ExtensionRegistry,
     pub connector: Arc<dyn Connector>,
+    pub metadata: Arc<MetadataStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +163,7 @@ impl TrackerPeers {
                 listen_port: runtime.listen_port,
                 extensions: runtime.extensions.clone(),
                 connector: runtime.connector.clone(),
+                metadata: runtime.metadata.clone(),
             };
             tokio::spawn(async move {
                 tracker::run_announce_loop(ctx, shutdown, |new_peers| {
@@ -183,6 +185,7 @@ impl TrackerPeers {
                         listen_port: runtime.listen_port,
                         extensions: runtime.extensions.clone(),
                         connector: runtime.connector.clone(),
+                        metadata: runtime.metadata.clone(),
                     };
                     async move {
                         process_peers(
@@ -237,7 +240,7 @@ async fn process_peers(
             incoming_extension_protocol: None,
             extensions: runtime.extensions.clone(),
             listen_port: runtime.listen_port,
-            metadata_size: None,
+            metadata: runtime.metadata.clone(),
             global_peers: runtime.global_peers.clone(),
             max_peers_per_torrent: runtime.max_peers_per_torrent,
             max_peers_global: runtime.max_peers_global,

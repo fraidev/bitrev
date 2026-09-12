@@ -17,9 +17,11 @@ use bit_rev::session::{AddTorrentOptions, AddTorrentResult, PieceResult, Session
 use bit_rev::torrent::Torrent;
 use tempfile::TempDir;
 
+#[allow(unused_imports)]
 pub use fixture::{FileSpec, TorrentFixture};
 #[allow(unused_imports)]
 pub use http_tracker::{HttpAnnounceBody, MockHttpTracker, RecordedHttpRequest};
+#[allow(unused_imports)]
 pub use seeder::{SeederConfig, SeederPeer};
 #[allow(unused_imports)]
 pub use udp_tracker::{MockUdpTracker, RecordedUdpAnnounce, UdpAnnounceBody};

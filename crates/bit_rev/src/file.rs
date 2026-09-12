@@ -4,6 +4,7 @@ use serde_bencode::de;
 use serde_bencode::ser;
 use serde_bytes::ByteBuf;
 use std::io::Read;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -82,25 +83,62 @@ pub struct TorrentMeta {
     pub torrent_file: TorrentFile,
     pub info_hash: [u8; 20],
     pub piece_hashes: Vec<[u8; 20]>,
+    /// Exact bencoded `info` dict the info hash was computed over.
+    #[serde(skip)]
+    pub info_bytes: Arc<[u8]>,
 }
 
 impl TorrentMeta {
     pub fn new(torrent_file: TorrentFile) -> Result<Self> {
         validate_torrent_file(&torrent_file)?;
-        let file_info_bencode = ser::to_bytes(&torrent_file.info)?;
+        let info_bytes: Arc<[u8]> = ser::to_bytes(&torrent_file.info)?.into();
         let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(&file_info_bencode);
+        hasher.update(&info_bytes);
         let info_hash = hasher.digest().bytes();
-        Ok(Self::from_validated(torrent_file, info_hash))
+        Ok(Self::from_validated(torrent_file, info_hash, info_bytes))
     }
 
-    fn from_validated(torrent_file: TorrentFile, info_hash: [u8; 20]) -> Self {
+    /// Build metainfo from a verified raw `info` dict (BEP-0009).
+    pub fn from_info_bytes(info_bytes: Arc<[u8]>) -> Result<Self> {
+        check_bencode_depth(&info_bytes)?;
+        let info: Info = de::from_bytes(info_bytes.as_ref())?;
+        let torrent_file = TorrentFile {
+            info,
+            announce: None,
+            nodes: None,
+            encoding: None,
+            httpseeds: None,
+            announce_list: None,
+            creation_date: None,
+            comment: None,
+            created_by: None,
+        };
+        validate_torrent_file(&torrent_file)?;
+        let mut hasher = sha1_smol::Sha1::new();
+        hasher.update(info_bytes.as_ref());
+        let info_hash = hasher.digest().bytes();
+        Ok(Self::from_validated(torrent_file, info_hash, info_bytes))
+    }
+
+    /// Construct when the info hash is already known. `info_bytes` is a serde
+    /// re-encode of `info` and may drop unknown keys; prefer `from_bytes`.
+    pub fn from_parsed(torrent_file: TorrentFile, info_hash: [u8; 20]) -> Self {
+        let info_bytes: Arc<[u8]> = ser::to_bytes(&torrent_file.info).unwrap_or_default().into();
+        Self::from_validated(torrent_file, info_hash, info_bytes)
+    }
+
+    fn from_validated(
+        torrent_file: TorrentFile,
+        info_hash: [u8; 20],
+        info_bytes: Arc<[u8]>,
+    ) -> Self {
         let piece_hashes = torrent_file.info.pieces.as_chunks::<20>().0.to_vec();
 
         Self {
             torrent_file,
             info_hash,
             piece_hashes,
+            info_bytes,
         }
     }
 }
@@ -113,7 +151,11 @@ pub fn from_bytes(content: &[u8]) -> Result<TorrentMeta> {
     let mut hasher = sha1_smol::Sha1::new();
     hasher.update(info_bytes);
     let info_hash = hasher.digest().bytes();
-    Ok(TorrentMeta::from_validated(torrent, info_hash))
+    Ok(TorrentMeta::from_validated(
+        torrent,
+        info_hash,
+        Arc::from(info_bytes.to_vec()),
+    ))
 }
 
 pub fn from_filename(filename: &str) -> Result<TorrentMeta> {
@@ -237,7 +279,7 @@ fn parse_bencode_byte_string(data: &[u8], i: usize) -> Result<(&[u8], usize)> {
     Ok((&data[start..end], end))
 }
 
-fn skip_bencode(data: &[u8], i: usize) -> Result<usize> {
+pub(crate) fn skip_bencode(data: &[u8], i: usize) -> Result<usize> {
     if i >= data.len() {
         anyhow::bail!("truncated bencode");
     }
@@ -268,7 +310,12 @@ fn skip_bencode(data: &[u8], i: usize) -> Result<usize> {
     }
 }
 
-fn raw_info_dict(data: &[u8]) -> Result<&[u8]> {
+pub(crate) fn raw_info_dict(data: &[u8]) -> Result<&[u8]> {
+    let range = info_dict_range(data)?;
+    Ok(&data[range])
+}
+
+fn info_dict_range(data: &[u8]) -> Result<std::ops::Range<usize>> {
     if data.first() != Some(&b'd') {
         anyhow::bail!("torrent metainfo must be a dict");
     }
@@ -277,11 +324,36 @@ fn raw_info_dict(data: &[u8]) -> Result<&[u8]> {
         let (key, after_key) = parse_bencode_byte_string(data, i)?;
         let value_end = skip_bencode(data, after_key)?;
         if key == b"info" {
-            return Ok(&data[after_key..value_end]);
+            return Ok(after_key..value_end);
         }
         i = value_end;
     }
     anyhow::bail!("missing info dictionary")
+}
+
+/// Encode a `.torrent` while keeping the exact `info` bytes the hash covers.
+pub fn encode_torrent_preserving_info(torrent_file: &TorrentFile, info_bytes: &[u8]) -> Vec<u8> {
+    match ser::to_bytes(torrent_file) {
+        Ok(encoded) => match info_dict_range(&encoded) {
+            Ok(range) if encoded[range.clone()] == *info_bytes => encoded,
+            Ok(range) => {
+                let mut out = Vec::with_capacity(encoded.len() - range.len() + info_bytes.len());
+                out.extend_from_slice(&encoded[..range.start]);
+                out.extend_from_slice(info_bytes);
+                out.extend_from_slice(&encoded[range.end..]);
+                out
+            }
+            Err(_) => wrap_info_dict(info_bytes),
+        },
+        Err(_) => wrap_info_dict(info_bytes),
+    }
+}
+
+fn wrap_info_dict(info_bytes: &[u8]) -> Vec<u8> {
+    let mut out = b"d4:info".to_vec();
+    out.extend_from_slice(info_bytes);
+    out.push(b'e');
+    out
 }
 
 /// RFC 3986 unreserved set `A-Z a-z 0-9 - . _ ~` stays literal; every other byte is `%XX`.
@@ -403,8 +475,8 @@ mod tests {
     const PEER_ID_ENCODED: &str = "-BR%00%FF%20~_%01%02%03%04%05%06%07%08%09%0A%0B%0C";
 
     fn test_meta(info_hash: [u8; 20]) -> TorrentMeta {
-        TorrentMeta {
-            torrent_file: TorrentFile {
+        TorrentMeta::from_parsed(
+            TorrentFile {
                 info: Info {
                     name: "test".into(),
                     pieces: ByteBuf::from(info_hash.to_vec()),
@@ -426,8 +498,7 @@ mod tests {
                 created_by: None,
             },
             info_hash,
-            piece_hashes: vec![info_hash],
-        }
+        )
     }
 
     #[test]
@@ -838,6 +909,7 @@ mod tests {
         let mut hasher = sha1_smol::Sha1::new();
         hasher.update(raw_info);
         assert_eq!(meta.info_hash, hasher.digest().bytes());
+        assert_eq!(meta.info_bytes.as_ref(), raw_info);
 
         let reencoded = ser::to_bytes(&meta.torrent_file.info).expect("re-encode info");
         assert_ne!(
@@ -845,5 +917,11 @@ mod tests {
             raw_info,
             "re-encoding must drop unknown info keys, proving from_bytes hashes the original bytes"
         );
+
+        let cached = encode_torrent_preserving_info(&meta.torrent_file, &meta.info_bytes);
+        let cached_info = raw_info_dict(&cached).expect("cached info");
+        assert_eq!(cached_info, raw_info);
+        let cached_meta = from_bytes(&cached).expect("parse cached torrent");
+        assert_eq!(cached_meta.info_hash, meta.info_hash);
     }
 }

@@ -33,8 +33,8 @@ fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn test_meta(announce: String) -> TorrentMeta {
-    TorrentMeta {
-        torrent_file: TorrentFile {
+    TorrentMeta::from_parsed(
+        TorrentFile {
             info: Info {
                 name: "test".into(),
                 pieces: ByteBuf::from(vec![0u8; 20]),
@@ -55,9 +55,8 @@ fn test_meta(announce: String) -> TorrentMeta {
             comment: None,
             created_by: None,
         },
-        info_hash: INFO_HASH,
-        piece_hashes: vec![INFO_HASH],
-    }
+        INFO_HASH,
+    )
 }
 
 fn incomplete_download() -> Arc<TorrentDownloadedState> {
