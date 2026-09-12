@@ -17,6 +17,7 @@ Issue: https://github.com/fraidev/bitrev/issues/65
 | `udp_tracker_packet` | `protocol_udp::parse_udp_packet` |
 | `extension_handshake_decode` | `ExtensionHandshake::decode` |
 | `resume_decode` | `resume::decode` |
+| `ut_metadata_decode` | `ut_metadata::parse_message` |
 
 New parsers (KRPC, `ut_metadata`, magnet, `ut_pex`, LPD, `ipfilter.dat`) add one
 target here with a seed corpus under `corpus/<target>/`.

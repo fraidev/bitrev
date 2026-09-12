@@ -6,7 +6,7 @@ use crate::identity;
 
 pub const DEFAULT_REQQ: i64 = 250;
 pub const UT_METADATA: &str = "ut_metadata";
-pub const MAX_METADATA_SIZE: i64 = 2 * 1024 * 1024;
+pub const MAX_METADATA_SIZE: i64 = 8 * 1024 * 1024;
 pub const MAX_EXTENSION_PAYLOAD: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -105,7 +105,7 @@ impl ExtensionHandshake {
             handshake.reqq = Some(*reqq);
         }
         if let Some(Value::Int(size)) = dict.get(&b"metadata_size"[..]) {
-            if (0..=MAX_METADATA_SIZE).contains(size) {
+            if (1..=MAX_METADATA_SIZE).contains(size) {
                 handshake.metadata_size = Some(*size);
             }
         }

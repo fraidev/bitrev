@@ -231,17 +231,12 @@ pub fn cache_torrent_file(
     state_dir: &Path,
     info_hash: &[u8; 20],
     torrent_file: &crate::file::TorrentFile,
+    info_bytes: &[u8],
 ) -> PathBuf {
     let path = torrent_cache_path(state_dir, info_hash);
-    match serde_bencode::to_bytes(torrent_file) {
-        Ok(bytes) => {
-            if let Err(e) = write_atomic(&path, &bytes) {
-                warn!(path = %path.display(), error = %e, "failed to cache torrent metainfo");
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to encode torrent metainfo for cache");
-        }
+    let bytes = crate::file::encode_torrent_preserving_info(torrent_file, info_bytes);
+    if let Err(e) = write_atomic(&path, &bytes) {
+        warn!(path = %path.display(), error = %e, "failed to cache torrent metainfo");
     }
     path
 }

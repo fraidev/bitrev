@@ -49,6 +49,7 @@ jobs:
             udp_tracker_packet
             extension_handshake_decode
             resume_decode
+            ut_metadata_decode
           )
           for t in "${targets[@]}"; do
             echo "::group::fuzz $t"

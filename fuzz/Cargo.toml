@@ -65,3 +65,10 @@ path = "fuzz_targets/resume_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ut_metadata_decode"
+path = "fuzz_targets/ut_metadata_decode.rs"
+test = false
+doc = false
+bench = false

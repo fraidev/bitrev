@@ -103,8 +103,8 @@ mod tests {
     use serde_bytes::ByteBuf;
 
     fn meta_with_private(private: Option<u8>) -> TorrentMeta {
-        TorrentMeta {
-            torrent_file: TorrentFile {
+        TorrentMeta::from_parsed(
+            TorrentFile {
                 info: Info {
                     name: "test".into(),
                     pieces: ByteBuf::from(vec![0u8; 20]),
@@ -125,9 +125,8 @@ mod tests {
                 comment: None,
                 created_by: None,
             },
-            info_hash: [0u8; 20],
-            piece_hashes: vec![[0u8; 20]],
-        }
+            [0u8; 20],
+        )
     }
 
     #[test]

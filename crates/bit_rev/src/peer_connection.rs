@@ -19,7 +19,9 @@ use tracing::{debug, error, trace};
 use crate::{
     allowed_fast::{generate_allowed_fast_for_ip, DEFAULT_ALLOWED_FAST_SET_SIZE},
     bitfield::Bitfield,
-    extension::{ExtensionRegistry, ExtensionSession, DEFAULT_REQQ},
+    extension::{
+        ExtensionContext, ExtensionRegistry, ExtensionSession, MetadataStore, DEFAULT_REQQ,
+    },
     message::{
         self, format_reject_request, validate_request, BlockRequest, Message, RequestError,
         RequestStorm, WriterRequest, MAX_UPLOAD_QUEUE,
@@ -631,7 +633,8 @@ pub struct PeerHandlerConfig {
     pub choke_notify: Arc<Notify>,
     pub extensions: ExtensionRegistry,
     pub listen_port: u16,
-    pub metadata_size: Option<i64>,
+    pub metadata: Arc<MetadataStore>,
+    pub info_hash: [u8; 20],
 }
 
 pub struct PeerHandler {
@@ -660,7 +663,7 @@ pub struct PeerHandler {
     extension_protocol: AtomicBool,
     extensions: Mutex<ExtensionSession>,
     listen_port: u16,
-    metadata_size: Option<i64>,
+    metadata: Arc<MetadataStore>,
     snubbed: AtomicBool,
     last_block_at: Mutex<Option<tokio::time::Instant>>,
     first_request_at: Mutex<Option<tokio::time::Instant>>,
@@ -682,7 +685,7 @@ impl PeerHandler {
             on_bitfield_notify: Notify::new(),
             downloaded: AtomicU32::new(0),
             chocked: AtomicBool::new(true),
-            peers_state: config.peers_state,
+            peers_state: config.peers_state.clone(),
             requests_sem: Semaphore::new(0),
             piece_tx: config.piece_tx,
             peer_writer_tx: config.peer_writer_tx,
@@ -701,9 +704,14 @@ impl PeerHandler {
             outstanding_requests: Mutex::new(HashMap::new()),
             request_storm: Mutex::new(RequestStorm::default()),
             extension_protocol: AtomicBool::new(false),
-            extensions: Mutex::new(config.extensions.bind()),
+            extensions: Mutex::new(config.extensions.bind(&ExtensionContext {
+                info_hash: config.info_hash,
+                peer: config.peer,
+                metadata: config.metadata.clone(),
+                peer_states: config.peers_state.clone(),
+            })),
             listen_port: config.listen_port,
-            metadata_size: config.metadata_size,
+            metadata: config.metadata,
             snubbed: AtomicBool::new(false),
             last_block_at: Mutex::new(None),
             first_request_at: Mutex::new(None),
@@ -1715,6 +1723,9 @@ impl PeerHandler {
                         break;
                     }
                 }
+                if self.extensions.lock().unwrap().should_disconnect() {
+                    return Err(anyhow::anyhow!("extension requested disconnect"));
+                }
             }
             message => {
                 debug!("received unsupported message {:?}, ignoring", message);
@@ -1810,7 +1821,7 @@ impl PeerConnection {
             .extensions
             .lock()
             .unwrap()
-            .outgoing_handshake(listen_port, self.handler.metadata_size);
+            .outgoing_handshake(listen_port, self.handler.metadata.metadata_size());
         protocol.send_message(stream, msg).await?;
         Ok(())
     }
@@ -1820,6 +1831,12 @@ impl PeerConnection {
         protocol: &Protocol,
         stream: &mut S,
     ) -> anyhow::Result<()> {
+        if self.handler.torrent_downloaded_state.piece_count() == 0 {
+            if self.handler.fast_extension() {
+                protocol.send_message(stream, Message::HaveNone).await?;
+            }
+            return Ok(());
+        }
         let bitfield = self.handler.torrent_downloaded_state.our_bitfield();
         if self.handler.fast_extension() {
             let msg = if self.handler.torrent_downloaded_state.is_complete() {
@@ -1987,6 +2004,33 @@ impl PeerConnection {
             Ok::<_, anyhow::Error>(())
         };
 
+        let ticker = async {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let (outgoing, close) = {
+                    let mut session = self.handler.extensions.lock().unwrap();
+                    let outgoing = session.on_tick();
+                    (outgoing, session.should_disconnect())
+                };
+                for msg in outgoing {
+                    if self
+                        .handler
+                        .peer_writer_tx
+                        .send(WriterRequest::Message(msg))
+                        .is_err()
+                    {
+                        anyhow::bail!("extension tick writer closed");
+                    }
+                }
+                if close {
+                    let _ = self.handler.peer_writer_tx.send(WriterRequest::Disconnect);
+                    anyhow::bail!("extension requested disconnect");
+                }
+            }
+        };
+
         tokio::select! {
             r = reader => {
                 trace!(result=?r, "reader is done, exiting");
@@ -1994,6 +2038,10 @@ impl PeerConnection {
             }
             r = writer => {
                 trace!(result=?r, "writer is done, exiting");
+                r
+            }
+            r = ticker => {
+                trace!(result=?r, "extension ticker is done, exiting");
                 r
             }
         }
@@ -2019,7 +2067,7 @@ pub struct SpawnPeerParams {
     pub incoming_extension_protocol: Option<bool>,
     pub extensions: ExtensionRegistry,
     pub listen_port: u16,
-    pub metadata_size: Option<i64>,
+    pub metadata: Arc<MetadataStore>,
     pub global_peers: Arc<std::sync::atomic::AtomicUsize>,
     pub max_peers_per_torrent: usize,
     pub max_peers_global: usize,
@@ -2088,7 +2136,8 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             choke_notify: params.choke_notify,
             extensions: params.extensions,
             listen_port: params.listen_port,
-            metadata_size: params.metadata_size,
+            metadata: params.metadata,
+            info_hash: params.info_hash,
         }));
         if let Some(fast) = params.incoming_fast_extension {
             handler.set_fast_extension(fast);
@@ -2554,7 +2603,8 @@ mod tests {
             choke_notify: Arc::new(Notify::new()),
             extensions: ExtensionRegistry::new(),
             listen_port: 0,
-            metadata_size: None,
+            metadata: MetadataStore::new(meta.info_hash),
+            info_hash: meta.info_hash,
         }));
         let connector: Arc<dyn Connector> = Arc::new(crate::transport::TcpConnector::new());
         let connection = PeerConnection::new(

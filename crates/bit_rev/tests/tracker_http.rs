@@ -197,8 +197,8 @@ async fn spawn_scripted_tracker(
 }
 
 fn test_meta(announce: String) -> TorrentMeta {
-    TorrentMeta {
-        torrent_file: TorrentFile {
+    TorrentMeta::from_parsed(
+        TorrentFile {
             info: Info {
                 name: "test".into(),
                 pieces: ByteBuf::from(vec![0u8; 20]),
@@ -219,9 +219,8 @@ fn test_meta(announce: String) -> TorrentMeta {
             comment: None,
             created_by: None,
         },
-        info_hash: [1u8; 20],
-        piece_hashes: vec![[1u8; 20]],
-    }
+        [1u8; 20],
+    )
 }
 
 fn incomplete_download() -> Arc<TorrentDownloadedState> {

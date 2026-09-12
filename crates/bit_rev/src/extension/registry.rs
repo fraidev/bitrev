@@ -2,19 +2,49 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::message::{format_extended, Message};
+use crate::peer::PeerAddr;
+use crate::peer_state::PeerStates;
 
 use super::handshake::{ExtensionHandshake, PeerExtensionInfo};
+use super::ut_metadata::MetadataStore;
+
+#[derive(Clone)]
+pub struct ExtensionContext {
+    pub info_hash: [u8; 20],
+    pub peer: PeerAddr,
+    pub metadata: Arc<MetadataStore>,
+    pub peer_states: Arc<PeerStates>,
+}
+
+impl ExtensionContext {
+    pub fn probe() -> Self {
+        Self {
+            info_hash: [0; 20],
+            peer: "0.0.0.0:0".parse().expect("probe addr"),
+            metadata: MetadataStore::new([0; 20]),
+            peer_states: Arc::new(PeerStates::default()),
+        }
+    }
+}
 
 pub trait Extension: Send {
     fn name(&self) -> &str;
     fn on_handshake(&mut self, peer_info: &PeerExtensionInfo);
     fn on_message(&mut self, payload: &[u8]) -> Vec<Vec<u8>>;
+    fn on_tick(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    fn should_disconnect(&self) -> bool {
+        false
+    }
 }
+
+type ExtensionFactory = Arc<dyn Fn(&ExtensionContext) -> Box<dyn Extension> + Send + Sync>;
 
 struct RegisteredExtension {
     name: String,
     local_id: u8,
-    factory: Arc<dyn Fn() -> Box<dyn Extension> + Send + Sync>,
+    factory: ExtensionFactory,
 }
 
 #[derive(Clone, Default)]
@@ -29,9 +59,10 @@ impl ExtensionRegistry {
 
     pub fn register<F>(&self, factory: F) -> u8
     where
-        F: Fn() -> Box<dyn Extension> + Send + Sync + 'static,
+        F: Fn(&ExtensionContext) -> Box<dyn Extension> + Send + Sync + 'static,
     {
-        let probe = factory();
+        let probe_ctx = ExtensionContext::probe();
+        let probe = factory(&probe_ctx);
         let name = probe.name().to_string();
         drop(probe);
 
@@ -66,13 +97,13 @@ impl ExtensionRegistry {
             .collect()
     }
 
-    pub fn bind(&self) -> ExtensionSession {
+    pub fn bind(&self, ctx: &ExtensionContext) -> ExtensionSession {
         let entries = self.inner.lock().unwrap();
         let mut local_ids = BTreeMap::new();
         let mut by_local_id = HashMap::new();
         for entry in entries.iter() {
             local_ids.insert(entry.name.clone(), entry.local_id);
-            by_local_id.insert(entry.local_id, (entry.factory)());
+            by_local_id.insert(entry.local_id, (entry.factory)(ctx));
         }
         ExtensionSession {
             local_ids,
@@ -126,7 +157,7 @@ impl ExtensionSession {
             for ext in self.by_local_id.values_mut() {
                 ext.on_handshake(&info);
             }
-            return Vec::new();
+            return self.collect_ticks();
         }
 
         let (name, replies) = {
@@ -139,6 +170,31 @@ impl ExtensionSession {
             .into_iter()
             .filter_map(|payload| self.encode_outgoing(&name, payload))
             .collect()
+    }
+
+    pub fn on_tick(&mut self) -> Vec<Message> {
+        self.collect_ticks()
+    }
+
+    pub fn should_disconnect(&self) -> bool {
+        self.by_local_id.values().any(|ext| ext.should_disconnect())
+    }
+
+    fn collect_ticks(&mut self) -> Vec<Message> {
+        let ticks: Vec<(String, Vec<Vec<u8>>)> = self
+            .by_local_id
+            .values_mut()
+            .map(|ext| (ext.name().to_string(), ext.on_tick()))
+            .collect();
+        let mut out = Vec::new();
+        for (name, replies) in ticks {
+            for payload in replies {
+                if let Some(msg) = self.encode_outgoing(&name, payload) {
+                    out.push(msg);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -175,7 +231,7 @@ mod tests {
         replies: Vec<Vec<u8>>,
     ) -> ExtensionRegistry {
         let registry = ExtensionRegistry::new();
-        registry.register(move || {
+        registry.register(move |_ctx| {
             Box::new(DummyExt {
                 name: "ut_dummy",
                 seen: seen.clone(),
@@ -189,7 +245,7 @@ mod tests {
     #[test]
     fn assigns_local_ids_starting_at_one() {
         let registry = ExtensionRegistry::new();
-        let first = registry.register(|| {
+        let first = registry.register(|_ctx| {
             Box::new(DummyExt {
                 name: "ut_a",
                 seen: Arc::new(Mutex::new(Vec::new())),
@@ -197,7 +253,7 @@ mod tests {
                 replies: Vec::new(),
             })
         });
-        let second = registry.register(|| {
+        let second = registry.register(|_ctx| {
             Box::new(DummyExt {
                 name: "ut_b",
                 seen: Arc::new(Mutex::new(Vec::new())),
@@ -217,7 +273,7 @@ mod tests {
         let handshakes = Arc::new(Mutex::new(Vec::new()));
         let registry =
             registry_with_dummy(seen.clone(), handshakes.clone(), vec![b"pong".to_vec()]);
-        let mut session = registry.bind();
+        let mut session = registry.bind(&ExtensionContext::probe());
 
         let mut m = BTreeMap::new();
         m.insert("ut_dummy".into(), 7);
@@ -251,7 +307,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Vec::new(),
         );
-        let mut session = registry.bind();
+        let mut session = registry.bind(&ExtensionContext::probe());
         assert_eq!(session.local_id("ut_dummy"), Some(1));
         assert!(session.encode_outgoing("ut_dummy", b"x".to_vec()).is_none());
 
