@@ -32,6 +32,10 @@ pub struct BencodeResponse {
 }
 
 impl BencodeResponse {
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_bencode::from_bytes(bytes)?)
+    }
+
     pub fn failure_reason_str(&self) -> Option<String> {
         self.failure_reason
             .as_ref()
@@ -122,7 +126,7 @@ mod tests {
     #[test]
     fn decodes_failure_reason() {
         let body = b"d14:failure reason16:unregistered 123e";
-        let decoded = de::from_bytes::<BencodeResponse>(body).unwrap();
+        let decoded = BencodeResponse::from_bytes(body).unwrap();
         assert_eq!(
             decoded.failure_reason_str().as_deref(),
             Some("unregistered 123")

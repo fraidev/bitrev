@@ -1,4 +1,7 @@
 /target
+/fuzz/target
+/fuzz/artifacts
+**/proptest-regressions/
 **.iso
 **.iso.part
 todo.md

@@ -129,6 +129,23 @@ impl Handshake {
             peer_id,
         })
     }
+
+    /// Parse a complete handshake frame: `pstrlen || pstr || reserved || info_hash || peer_id`.
+    pub fn from_bytes(buf: &[u8]) -> Result<Handshake, HandshakeError> {
+        let pstrlen = *buf.first().ok_or(HandshakeError::BufferTooShort)? as usize;
+        if pstrlen == 0 {
+            return Err(HandshakeError::ProtocolLengthCantBeZero);
+        }
+        if pstrlen > MAX_PSTR_LEN {
+            return Err(HandshakeError::InvalidProtocolLength);
+        }
+        let rest = buf.get(1..).ok_or(HandshakeError::BufferTooShort)?;
+        let needed = pstrlen.saturating_add(48);
+        if rest.len() < needed {
+            return Err(HandshakeError::BufferTooShort);
+        }
+        Handshake::read(pstrlen, rest[..needed].to_vec())
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +209,27 @@ mod tests {
         let rest = serialized[1..].to_vec();
         let read = Handshake::read(protocol_str_len, rest).unwrap();
         assert_eq!(read, handshake);
+        assert_eq!(Handshake::from_bytes(&serialized).unwrap(), handshake);
+    }
+
+    #[test]
+    fn from_bytes_rejects_empty_oversized_and_short() {
+        assert_eq!(
+            Handshake::from_bytes(&[]),
+            Err(HandshakeError::BufferTooShort)
+        );
+        assert_eq!(
+            Handshake::from_bytes(&[0]),
+            Err(HandshakeError::ProtocolLengthCantBeZero)
+        );
+        assert_eq!(
+            Handshake::from_bytes(&[20]),
+            Err(HandshakeError::InvalidProtocolLength)
+        );
+        assert_eq!(
+            Handshake::from_bytes(&[19, 1, 2, 3]),
+            Err(HandshakeError::BufferTooShort)
+        );
     }
 
     #[test]

@@ -25,3 +25,6 @@ pub mod utils;
 
 #[cfg(test)]
 mod seeding_tests;
+
+#[cfg(test)]
+mod proptest_suite;

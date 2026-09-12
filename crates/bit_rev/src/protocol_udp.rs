@@ -89,6 +89,77 @@ enum Packet<T> {
     Ignore,
 }
 
+/// Classified UDP tracker response. The transaction id is taken from the packet
+/// so a lone datagram can be parsed without a prior request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UdpPacket {
+    Connect {
+        transaction_id: u32,
+        connection_id: u64,
+    },
+    Announce {
+        transaction_id: u32,
+        response: UdpAnnounceResponse,
+    },
+    Error {
+        transaction_id: u32,
+        message: String,
+    },
+    Ignore,
+}
+
+/// Parse a UDP tracker response (connect, announce, or error).
+pub fn parse_udp_packet(data: &[u8]) -> UdpPacket {
+    if data.len() < ERROR_HEADER_LEN {
+        return UdpPacket::Ignore;
+    }
+    let Some(action) = read_u32(data, 0) else {
+        return UdpPacket::Ignore;
+    };
+    let Some(tid) = read_u32(data, 4) else {
+        return UdpPacket::Ignore;
+    };
+    match action {
+        ACTION_CONNECT => match parse_connect_response(data, tid) {
+            Packet::Valid(connection_id) => UdpPacket::Connect {
+                transaction_id: tid,
+                connection_id,
+            },
+            Packet::Error(message) => UdpPacket::Error {
+                transaction_id: tid,
+                message,
+            },
+            Packet::Ignore => UdpPacket::Ignore,
+        },
+        ACTION_ANNOUNCE => match parse_announce_response(data, tid, false) {
+            Packet::Valid(response) => UdpPacket::Announce {
+                transaction_id: tid,
+                response,
+            },
+            Packet::Error(message) => UdpPacket::Error {
+                transaction_id: tid,
+                message,
+            },
+            Packet::Ignore => match parse_announce_response(data, tid, true) {
+                Packet::Valid(response) => UdpPacket::Announce {
+                    transaction_id: tid,
+                    response,
+                },
+                Packet::Error(message) => UdpPacket::Error {
+                    transaction_id: tid,
+                    message,
+                },
+                Packet::Ignore => UdpPacket::Ignore,
+            },
+        },
+        ACTION_ERROR => UdpPacket::Error {
+            transaction_id: tid,
+            message: String::from_utf8_lossy(&data[ERROR_HEADER_LEN..]).into_owned(),
+        },
+        _ => UdpPacket::Ignore,
+    }
+}
+
 struct AnnounceRequest {
     connection_id: u64,
     transaction_id: u32,
@@ -772,6 +843,47 @@ mod tests {
         let request = build_announce_request(&fixture_announce_request(50));
         assert_eq!(&request[92..96], &50i32.to_be_bytes());
         assert_eq!(request.len(), ANNOUNCE_REQUEST_LEN);
+    }
+
+    #[test]
+    fn parse_udp_packet_classifies_connect_announce_error() {
+        let connect = connect_response_bytes(0x0102_0304, 0xFEDC_BA98_7654_3210);
+        assert_eq!(
+            parse_udp_packet(&connect),
+            UdpPacket::Connect {
+                transaction_id: 0x0102_0304,
+                connection_id: 0xFEDC_BA98_7654_3210,
+            }
+        );
+
+        let announce = announce_response_v4(
+            FIXED_TRANSACTION_ID,
+            1800,
+            3,
+            7,
+            &[(Ipv4Addr::new(127, 0, 0, 1), 6881)],
+        );
+        match parse_udp_packet(&announce) {
+            UdpPacket::Announce {
+                transaction_id,
+                response,
+            } => {
+                assert_eq!(transaction_id, FIXED_TRANSACTION_ID);
+                assert_eq!(response.interval, 1800);
+                assert_eq!(response.peers.len(), 1);
+            }
+            other => panic!("expected announce, got {other:?}"),
+        }
+
+        let err = error_response_bytes(0x0102_0304, "banned by tracker");
+        assert_eq!(
+            parse_udp_packet(&err),
+            UdpPacket::Error {
+                transaction_id: 0x0102_0304,
+                message: "banned by tracker".into(),
+            }
+        );
+        assert_eq!(parse_udp_packet(&[0u8; 7]), UdpPacket::Ignore);
     }
 
     #[test]

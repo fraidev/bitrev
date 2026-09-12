@@ -32,3 +32,4 @@ serde.workspace = true
 serde_bencode.workspace = true
 tempfile = "3.10"
 toml.workspace = true
+proptest = "1.6"
