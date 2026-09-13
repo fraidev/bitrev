@@ -41,6 +41,7 @@ pub struct PeerSpawnRuntime {
     pub dht: Option<crate::dht::DhtHandle>,
     pub piece_tx: Arc<Slot<flume::Sender<FullPiece>>>,
     pub promote_notify: Arc<Notify>,
+    pub encryption: crate::mse::EncryptionPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +198,7 @@ fn clone_runtime(runtime: &PeerSpawnRuntime) -> PeerSpawnRuntime {
         dht: runtime.dht.clone(),
         piece_tx: runtime.piece_tx.clone(),
         promote_notify: runtime.promote_notify.clone(),
+        encryption: runtime.encryption,
     }
 }
 
@@ -233,6 +235,8 @@ async fn process_peers(
             incoming_fast_extension: None,
             incoming_extension_protocol: None,
             incoming_dht: None,
+            incoming_encrypted: false,
+            encryption: runtime.encryption,
             extensions: runtime.extensions.clone(),
             listen_port: runtime.listen_port,
             metadata: runtime.metadata.clone(),

@@ -28,9 +28,37 @@ pub fn boxed_stream<S: PeerStream>(stream: S) -> BoxedPeerStream {
 
 pub type DialFuture<'a> = Pin<Box<dyn Future<Output = io::Result<BoxedPeerStream>> + Send + 'a>>;
 
+/// Outgoing dial with torrent context so MSE can send the BT handshake as IA.
+#[derive(Clone)]
+pub struct PeerDial {
+    pub addr: SocketAddr,
+    pub info_hash: [u8; 20],
+    pub initial_payload: Vec<u8>,
+}
+
+/// Result of [`Connector::dial_peer`].
+pub struct PeerConnected {
+    pub stream: BoxedPeerStream,
+    pub encrypted: bool,
+    pub sent_initial_payload: bool,
+}
+
+pub type PeerDialFuture<'a> = Pin<Box<dyn Future<Output = io::Result<PeerConnected>> + Send + 'a>>;
+
 /// Outgoing dialer. MSE wraps one; uTP adds one.
 pub trait Connector: Send + Sync {
     fn dial(&self, addr: SocketAddr) -> DialFuture<'_>;
+
+    fn dial_peer(&self, req: PeerDial) -> PeerDialFuture<'_> {
+        Box::pin(async move {
+            let stream = self.dial(req.addr).await?;
+            Ok(PeerConnected {
+                stream,
+                encrypted: false,
+                sent_initial_payload: false,
+            })
+        })
+    }
 }
 
 /// Classification of inbound traffic before the BitTorrent handshake.
@@ -44,8 +72,23 @@ pub enum IncomingKind {
 /// pstrlen of a standard BitTorrent handshake (`"BitTorrent protocol"`).
 pub const BT_HANDSHAKE_PSTRLEN: u8 = 19;
 
+/// First 20 bytes of a plaintext BitTorrent handshake.
+pub const BT_HANDSHAKE_HEAD: &[u8] = b"\x13BitTorrent protocol";
+
 pub fn classify_incoming(first_byte: u8) -> IncomingKind {
     if first_byte == BT_HANDSHAKE_PSTRLEN {
+        IncomingKind::Plaintext
+    } else {
+        IncomingKind::MaybeEncrypted
+    }
+}
+
+/// Classify a peeked prefix. A full or truncated BT handshake head is plaintext.
+pub fn classify_incoming_prefix(prefix: &[u8]) -> IncomingKind {
+    if prefix.is_empty() {
+        return IncomingKind::Plaintext;
+    }
+    if BT_HANDSHAKE_HEAD.starts_with(prefix) || prefix.starts_with(BT_HANDSHAKE_HEAD) {
         IncomingKind::Plaintext
     } else {
         IncomingKind::MaybeEncrypted
@@ -68,6 +111,16 @@ impl<S> PrefixedStream<S> {
 
     pub fn into_inner(self) -> S {
         self.inner
+    }
+
+    /// Remaining unread prefix bytes plus the inner stream.
+    pub fn into_parts(self) -> (Vec<u8>, S) {
+        let pos = self.prefix.position() as usize;
+        let mut data = self.prefix.into_inner();
+        if pos > 0 {
+            data.drain(..pos.min(data.len()));
+        }
+        (data, self.inner)
     }
 }
 
@@ -127,11 +180,11 @@ impl IncomingStream {
 
     /// Wrap a stream that already had `prefix` read. MSE uses this after peeking.
     pub fn with_peek(prefix: Vec<u8>, stream: BoxedPeerStream, addr: SocketAddr) -> Self {
-        let kind = prefix
-            .first()
-            .copied()
-            .map(classify_incoming)
-            .unwrap_or(IncomingKind::Plaintext);
+        let kind = if prefix.is_empty() {
+            IncomingKind::Plaintext
+        } else {
+            classify_incoming_prefix(&prefix)
+        };
         let stream = if prefix.is_empty() {
             stream
         } else {

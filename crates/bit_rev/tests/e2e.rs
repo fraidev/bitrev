@@ -3,10 +3,13 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bit_rev::mse::EncryptionPolicy;
+use bit_rev::session::{AddTorrentOptions, Session, SessionOptions};
+
 use common::{
     add_download, test_session, unique_temp_dir, wait_for_completion, FileSpec, HttpAnnounceBody,
     MockHttpTracker, MockUdpTracker, SeederConfig, SeederPeer, TorrentFixture, UdpAnnounceBody,
-    BLOCK_SIZE, DEFAULT_PIECE_LENGTH, DOWNLOAD_TIMEOUT,
+    BLOCK_SIZE, DEFAULT_PIECE_LENGTH, DOWNLOAD_TIMEOUT, LISTEN_TIMEOUT,
 };
 
 const FOUR_MIB: u64 = 4 * 1024 * 1024;
@@ -589,4 +592,118 @@ async fn never_unchoke_seeder_does_not_stall_download() {
     );
     assert_eq!(seeders[0].blocks_sent(), 0);
     assert!(seeders[1].blocks_sent() + seeders[2].blocks_sent() > 0);
+}
+
+async fn session_with_encryption(encryption: EncryptionPolicy) -> Session {
+    let session = Session::with_options(SessionOptions {
+        listen_port: 0,
+        state_dir: None,
+        encryption,
+        dht: bit_rev::session::DhtOptions {
+            enabled: false,
+            ..bit_rev::session::DhtOptions::default()
+        },
+        ..SessionOptions::default()
+    });
+    tokio::time::timeout(LISTEN_TIMEOUT, session.wait_listening())
+        .await
+        .expect("session listen timeout");
+    session
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_require_encrypted_two_sessions() {
+    let fixture = Arc::new(TorrentFixture::single(
+        64 * 1024,
+        DEFAULT_PIECE_LENGTH,
+        0xE5E7_0007,
+    ));
+
+    let seed_dir = unique_temp_dir();
+    let seed_path = fixture.session_output(seed_dir.path());
+    std::fs::copy(&fixture.files[0].disk_path, &seed_path).expect("copy seed payload");
+
+    let seeder = session_with_encryption(EncryptionPolicy::RequireEncrypted).await;
+    seeder
+        .add_torrent(
+            AddTorrentOptions::from(fixture.torrent_meta.clone())
+                .output_dir(seed_path)
+                .seed(true),
+        )
+        .await
+        .expect("add seeder");
+    let seeder_addr = seeder.wait_listening().await;
+
+    let download_dir = unique_temp_dir();
+    let output = fixture.session_output(download_dir.path());
+    let leecher = session_with_encryption(EncryptionPolicy::RequireEncrypted).await;
+    let added = add_download(&leecher, fixture.torrent_meta.clone(), output.clone()).await;
+    assert!(
+        leecher.connect_peer(&fixture.torrent_meta.info_hash, seeder_addr),
+        "leecher should dial the seeder"
+    );
+    wait_for_completion(
+        &added.pr_rx,
+        &added.torrent,
+        &added.already_have,
+        DOWNLOAD_TIMEOUT,
+    )
+    .await;
+    fixture.assert_output_matches(&output);
+
+    let leecher_torrent = leecher
+        .torrent_session(&fixture.torrent_meta.info_hash)
+        .expect("leecher torrent");
+    assert!(
+        leecher_torrent
+            .peer_states
+            .states
+            .iter()
+            .any(|entry| entry.encrypted),
+        "require_encrypted download should mark the peer as encrypted"
+    );
+
+    leecher.shutdown();
+    seeder.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_plaintext_leecher_joins_prefer_encrypted_seeder() {
+    let fixture = Arc::new(TorrentFixture::single(
+        32 * 1024,
+        DEFAULT_PIECE_LENGTH,
+        0xA07C_0007,
+    ));
+
+    let seed_dir = unique_temp_dir();
+    let seed_path = fixture.session_output(seed_dir.path());
+    std::fs::copy(&fixture.files[0].disk_path, &seed_path).expect("copy seed payload");
+
+    let seeder = session_with_encryption(EncryptionPolicy::PreferEncrypted).await;
+    seeder
+        .add_torrent(
+            AddTorrentOptions::from(fixture.torrent_meta.clone())
+                .output_dir(seed_path)
+                .seed(true),
+        )
+        .await
+        .expect("add seeder");
+    let seeder_addr = seeder.wait_listening().await;
+
+    let download_dir = unique_temp_dir();
+    let output = fixture.session_output(download_dir.path());
+    let leecher = session_with_encryption(EncryptionPolicy::Disabled).await;
+    let added = add_download(&leecher, fixture.torrent_meta.clone(), output.clone()).await;
+    assert!(leecher.connect_peer(&fixture.torrent_meta.info_hash, seeder_addr));
+    wait_for_completion(
+        &added.pr_rx,
+        &added.torrent,
+        &added.already_have,
+        DOWNLOAD_TIMEOUT,
+    )
+    .await;
+    fixture.assert_output_matches(&output);
+
+    leecher.shutdown();
+    seeder.shutdown();
 }

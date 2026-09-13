@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bit_rev::file::TorrentMeta;
+use bit_rev::mse::EncryptionPolicy;
 use bit_rev::session::{AddTorrentOptions, AddTorrentResult, PieceResult, Session, SessionOptions};
 use bit_rev::torrent::Torrent;
 use tempfile::TempDir;
@@ -42,6 +43,7 @@ pub async fn test_session(state_dir: Option<PathBuf>) -> Session {
     let session = Session::with_options(SessionOptions {
         listen_port: 0,
         state_dir,
+        encryption: EncryptionPolicy::Disabled,
         ..SessionOptions::default()
     });
     tokio::time::timeout(LISTEN_TIMEOUT, session.wait_listening())
