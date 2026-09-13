@@ -77,6 +77,21 @@ impl Cli {
     }
 }
 
+/// Classify a positional input: `magnet:` prefix versus a torrent file path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    Magnet,
+    File,
+}
+
+pub fn classify_input(input: &str) -> InputKind {
+    if input.starts_with("magnet:") {
+        InputKind::Magnet
+    } else {
+        InputKind::File
+    }
+}
+
 pub fn init_tracing(verbose: u8, quiet: u8) {
     #[cfg(feature = "tokio-console")]
     {
@@ -194,5 +209,17 @@ mod tests {
     fn no_seed_overrides_seed() {
         let cli = Cli::parse_from(["bitrev", "--seed", "--no-seed", "t.torrent"]);
         assert!(!cli.stay_alive());
+    }
+
+    #[test]
+    fn classifies_magnet_prefix() {
+        assert_eq!(
+            super::classify_input("magnet:?xt=urn:btih:abc"),
+            super::InputKind::Magnet
+        );
+        assert_eq!(
+            super::classify_input("debian.torrent"),
+            super::InputKind::File
+        );
     }
 }

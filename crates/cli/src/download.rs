@@ -7,7 +7,7 @@ use bit_rev::config::Config;
 use bit_rev::session::{AddTorrentOptions, AddTorrentResult, Session};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
-use crate::args::Cli;
+use crate::args::{classify_input, Cli, InputKind};
 
 pub async fn run(cli: Cli, config: Config) -> anyhow::Result<()> {
     let mut pending = Vec::with_capacity(cli.inputs.len());
@@ -28,11 +28,7 @@ pub async fn run(cli: Cli, config: Config) -> anyhow::Result<()> {
             .add_torrent(opts)
             .await
             .with_context(|| format!("failed to add {input}"))?;
-        let name = result.torrent.name.clone();
-        let pb = mp.add(ProgressBar::new(result.torrent.length as u64));
-        pb.set_style(style.clone());
-        pb.set_message(name);
-        join.spawn(drive_progress(result, pb));
+        join.spawn(drive_download(result, mp.clone(), style.clone()));
     }
 
     let downloads = async {
@@ -64,11 +60,10 @@ fn add_options(
     download_dir: &Path,
     verify: bool,
 ) -> anyhow::Result<AddTorrentOptions> {
-    if input.starts_with("magnet:") {
-        anyhow::bail!("magnet links are not supported yet");
-    }
-    let opts = AddTorrentOptions::from_path(input)
-        .with_context(|| format!("failed to open torrent {input}"))?;
+    let opts = match classify_input(input) {
+        InputKind::Magnet | InputKind::File => AddTorrentOptions::try_from(input)
+            .with_context(|| format!("failed to open torrent or magnet {input}"))?,
+    };
     let output = util::paths::expand_tilde(download_dir).join(opts.name());
     Ok(opts.verify(verify).output_dir(output))
 }
@@ -87,8 +82,43 @@ fn progress_style() -> ProgressStyle {
     .progress_chars("#>-")
 }
 
-async fn drive_progress(result: AddTorrentResult, pb: ProgressBar) -> anyhow::Result<()> {
-    let torrent = result.torrent;
+async fn drive_download(
+    result: AddTorrentResult,
+    mp: MultiProgress,
+    style: ProgressStyle,
+) -> anyhow::Result<()> {
+    let torrent = if result.is_fetching_metadata() {
+        let spinner = mp.add(ProgressBar::new_spinner());
+        spinner.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        spinner.enable_steady_tick(std::time::Duration::from_millis(120));
+        loop {
+            spinner.set_message(format!(
+                "fetching metadata from {} peers",
+                result.peer_count()
+            ));
+            tokio::select! {
+                torrent = result.metadata() => {
+                    spinner.finish_and_clear();
+                    break torrent?;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+        }
+    } else {
+        std::sync::Arc::new(result.torrent.clone())
+    };
+
+    let pb = mp.add(ProgressBar::new(torrent.length as u64));
+    pb.set_style(style);
+    pb.set_message(torrent.name.clone());
+    drive_progress(result, torrent.as_ref(), pb).await
+}
+
+async fn drive_progress(
+    result: AddTorrentResult,
+    torrent: &bit_rev::torrent::Torrent,
+    pb: ProgressBar,
+) -> anyhow::Result<()> {
     let mut have = HashSet::new();
     let mut downloaded = 0u64;
     for piece in &result.already_have {

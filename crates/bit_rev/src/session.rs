@@ -8,10 +8,11 @@ use crate::discovery::DiscoverySource;
 use crate::extension::{Extension, ExtensionContext, ExtensionRegistry, MetadataStore, UtMetadata};
 use crate::file::{self, TorrentMeta};
 use crate::handshake::Handshake;
+use crate::magnet::Magnet;
 use crate::message::{Message, WriterRequest};
 use crate::peer::PeerAddr;
 use crate::peer_connection::{
-    try_spawn_peer, PieceWorkState, SpawnPeerParams, TorrentDownloadedState,
+    try_spawn_peer, PieceWorkState, Slot, SpawnPeerParams, TorrentDownloadedState,
 };
 use crate::peer_state::PeerStates;
 use crate::protocol::Protocol;
@@ -118,6 +119,7 @@ pub struct Session {
     connector: Arc<dyn Connector>,
     pending: Arc<DashMap<[u8; 20], Arc<PendingTorrent>>>,
     dht: Arc<Mutex<Option<DhtHandle>>>,
+    owns_lifecycle: bool,
 }
 
 pub(crate) struct PendingTorrent {
@@ -127,10 +129,15 @@ pub(crate) struct PendingTorrent {
     uploaded: Arc<AtomicU64>,
     choke_notify: Arc<Notify>,
     have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
-    downloaded_state: Arc<TorrentDownloadedState>,
-    storage: Arc<Storage>,
-    torrent: Arc<Torrent>,
-    piece_tx: flume::Sender<crate::peer_connection::FullPiece>,
+    downloaded_state: Arc<Slot<Arc<TorrentDownloadedState>>>,
+    storage: Arc<Slot<Arc<Storage>>>,
+    torrent: Arc<Slot<Arc<Torrent>>>,
+    piece_tx: Arc<Slot<flume::Sender<crate::peer_connection::FullPiece>>>,
+    promote_notify: Arc<Notify>,
+    trackers: Vec<String>,
+    output_dir: PathBuf,
+    pr_tx: flume::Sender<PieceResult>,
+    pr_rx: Receiver<PieceResult>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,8 +178,14 @@ impl MetadataHandle {
     }
 }
 
+enum AddSource {
+    Meta(Box<TorrentMeta>),
+    Magnet(Magnet),
+}
+
 pub struct AddTorrentOptions {
-    torrent_meta: TorrentMeta,
+    source: AddSource,
+    name: String,
     output_dir: Option<PathBuf>,
     seed: bool,
     verify: bool,
@@ -180,8 +193,10 @@ pub struct AddTorrentOptions {
 
 impl AddTorrentOptions {
     fn from_meta(torrent_meta: TorrentMeta) -> Self {
+        let name = torrent_meta.torrent_file.info.name.clone();
         Self {
-            torrent_meta,
+            source: AddSource::Meta(Box::new(torrent_meta)),
+            name,
             output_dir: None,
             seed: false,
             verify: false,
@@ -193,8 +208,22 @@ impl AddTorrentOptions {
         Ok(Self::from_meta(torrent_meta))
     }
 
+    pub fn from_magnet(magnet: &Magnet) -> Self {
+        Self {
+            name: magnet.name_or_hash(),
+            source: AddSource::Magnet(magnet.clone()),
+            output_dir: None,
+            seed: false,
+            verify: false,
+        }
+    }
+
     pub fn name(&self) -> &str {
-        &self.torrent_meta.torrent_file.info.name
+        &self.name
+    }
+
+    pub fn is_magnet(&self) -> bool {
+        matches!(self.source, AddSource::Magnet(_))
     }
 
     pub fn output_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -222,17 +251,62 @@ impl From<TorrentMeta> for AddTorrentOptions {
 impl TryFrom<&str> for AddTorrentOptions {
     type Error = anyhow::Error;
 
-    fn try_from(path: &str) -> Result<Self, Self::Error> {
-        Self::from_path(path)
+    fn try_from(input: &str) -> Result<Self, Self::Error> {
+        if input.starts_with("magnet:") {
+            let magnet = Magnet::parse(input)?;
+            Ok(Self::from_magnet(&magnet))
+        } else {
+            Self::from_path(input)
+        }
     }
 }
 
 pub struct AddTorrentResult {
     pub torrent: Torrent,
-    pub torrent_meta: TorrentMeta,
+    pub torrent_meta: Option<TorrentMeta>,
     pub pr_rx: Receiver<PieceResult>,
     pub resume_status: ResumeStatus,
     pub already_have: Vec<PieceResult>,
+    info_hash: [u8; 20],
+    fetching_metadata: bool,
+    metadata: Arc<MetadataStore>,
+    peer_states: Arc<PeerStates>,
+    ready: tokio::sync::watch::Receiver<Option<Arc<Torrent>>>,
+}
+
+impl AddTorrentResult {
+    pub fn info_hash(&self) -> [u8; 20] {
+        self.info_hash
+    }
+
+    pub fn is_fetching_metadata(&self) -> bool {
+        self.fetching_metadata && self.metadata.info_bytes().is_none()
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peer_states.len()
+    }
+
+    pub async fn metadata(&self) -> anyhow::Result<Arc<Torrent>> {
+        if let Some(torrent) = self.ready.borrow().clone() {
+            return Ok(torrent);
+        }
+        let bytes = self.metadata.wait().await;
+        let meta = TorrentMeta::from_info_bytes(bytes)?;
+        let torrent = Arc::new(Torrent::new(&meta)?);
+        let mut rx = self.ready.clone();
+        if rx.borrow().is_some() {
+            return Ok(rx.borrow().clone().expect("ready"));
+        }
+        loop {
+            if let Some(ready) = rx.borrow().clone() {
+                return Ok(ready);
+            }
+            if rx.changed().await.is_err() {
+                return Ok(torrent);
+            }
+        }
+    }
 }
 
 impl Session {
@@ -257,6 +331,7 @@ impl Session {
             connector,
             pending: Arc::new(DashMap::new()),
             dht: Arc::new(Mutex::new(None)),
+            owns_lifecycle: true,
         };
         session
             .extensions
@@ -264,6 +339,23 @@ impl Session {
         session.spawn_listener();
         session.start_dht();
         session
+    }
+
+    fn share(&self) -> Self {
+        Self {
+            torrents: self.torrents.clone(),
+            download_state: self.download_state.clone(),
+            peer_id: self.peer_id,
+            options: self.options.clone(),
+            listen_addr: self.listen_addr.clone(),
+            global_peers: self.global_peers.clone(),
+            cancel: self.cancel.clone(),
+            extensions: self.extensions.clone(),
+            connector: self.connector.clone(),
+            pending: self.pending.clone(),
+            dht: self.dht.clone(),
+            owns_lifecycle: false,
+        }
     }
 
     fn start_dht(&self) {
@@ -592,67 +684,44 @@ impl Session {
     }
 
     pub fn connect_peer(&self, info_hash: &[u8; 20], addr: SocketAddr) -> bool {
+        let (advertise_dht, dht_port, dht) = self.dht_peer_fields();
         if let Some(torrent) = self.torrents.get(info_hash).map(|entry| entry.clone()) {
-            return try_spawn_peer(SpawnPeerParams {
-                peer: addr,
-                info_hash: *info_hash,
-                peer_id: self.peer_id,
-                piece_tx: torrent.piece_tx.clone(),
-                have_broadcast: torrent.have_broadcast.clone(),
-                torrent_downloaded_state: torrent.downloaded_state.clone(),
-                peer_states: torrent.peer_states.clone(),
-                download_state: torrent.download_state.clone(),
-                storage: torrent.storage.clone(),
-                uploaded: torrent.uploaded.clone(),
-                torrent: torrent.torrent.clone(),
-                choke_notify: torrent.choke_notify.clone(),
-                incoming: None,
-                incoming_fast_extension: None,
-                incoming_extension_protocol: None,
-                incoming_dht: None,
-                extensions: self.extensions.clone(),
-                listen_port: self.listen_port(),
-                metadata: torrent.metadata.clone(),
-                advertise_dht: self.dht_peer_fields().0,
-                dht_port: self.dht_peer_fields().1,
-                dht: self.dht_peer_fields().2,
-                global_peers: self.global_peers.clone(),
-                max_peers_per_torrent: self.options.max_peers_per_torrent,
-                max_peers_global: self.options.max_peers_global,
-                connector: self.connector.clone(),
-            });
+            return try_spawn_peer(spawn_from_session(
+                addr,
+                *info_hash,
+                self.peer_id,
+                &torrent,
+                None,
+                self.extensions.clone(),
+                self.listen_port(),
+                advertise_dht,
+                dht_port,
+                dht,
+                self.global_peers.clone(),
+                self.options.max_peers_per_torrent,
+                self.options.max_peers_global,
+                self.connector.clone(),
+            ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
             return false;
         };
-        try_spawn_peer(SpawnPeerParams {
-            peer: addr,
-            info_hash: *info_hash,
-            peer_id: self.peer_id,
-            piece_tx: pending.piece_tx.clone(),
-            have_broadcast: pending.have_broadcast.clone(),
-            torrent_downloaded_state: pending.downloaded_state.clone(),
-            peer_states: pending.peer_states.clone(),
-            download_state: pending.download_state.clone(),
-            storage: pending.storage.clone(),
-            uploaded: pending.uploaded.clone(),
-            torrent: pending.torrent.clone(),
-            choke_notify: pending.choke_notify.clone(),
-            incoming: None,
-            incoming_fast_extension: None,
-            incoming_extension_protocol: None,
-            incoming_dht: None,
-            extensions: self.extensions.clone(),
-            listen_port: self.listen_port(),
-            metadata: pending.metadata.clone(),
-            advertise_dht: self.dht_peer_fields().0,
-            dht_port: self.dht_peer_fields().1,
-            dht: self.dht_peer_fields().2,
-            global_peers: self.global_peers.clone(),
-            max_peers_per_torrent: self.options.max_peers_per_torrent,
-            max_peers_global: self.options.max_peers_global,
-            connector: self.connector.clone(),
-        })
+        try_spawn_peer(spawn_from_pending(
+            addr,
+            *info_hash,
+            self.peer_id,
+            &pending,
+            None,
+            self.extensions.clone(),
+            self.listen_port(),
+            advertise_dht,
+            dht_port,
+            dht,
+            self.global_peers.clone(),
+            self.options.max_peers_per_torrent,
+            self.options.max_peers_global,
+            self.connector.clone(),
+        ))
     }
 
     pub fn torrent_session(&self, info_hash: &[u8; 20]) -> Option<Arc<TorrentSession>> {
@@ -689,6 +758,32 @@ impl Session {
             });
         }
 
+        let pending = self
+            .register_pending(
+                info_hash,
+                resume::info_hash_hex(&info_hash),
+                Vec::new(),
+                opts.output_dir
+                    .unwrap_or_else(|| std::env::temp_dir().join("bitrev-metadata")),
+            )
+            .await?;
+        Ok(MetadataHandle {
+            info_hash,
+            store: pending.metadata.clone(),
+            peer_states: pending.peer_states.clone(),
+        })
+    }
+
+    async fn register_pending(
+        &self,
+        info_hash: [u8; 20],
+        name: String,
+        trackers: Vec<String>,
+        output_dir: PathBuf,
+    ) -> anyhow::Result<Arc<PendingTorrent>> {
+        if let Some(pending) = self.pending.get(&info_hash) {
+            return Ok(pending.clone());
+        }
         let metadata = MetadataStore::new(info_hash);
         let torrent = Arc::new(Torrent {
             info_hash,
@@ -696,39 +791,70 @@ impl Session {
             piece_length: 16 * 1024,
             length: 0,
             files: Vec::new(),
-            name: resume::info_hash_hex(&info_hash),
+            name,
             private: false,
         });
-        let output_dir = opts
-            .output_dir
-            .unwrap_or_else(|| std::env::temp_dir().join("bitrev-metadata"));
         let storage = Storage::open(&torrent, &output_dir).await?;
         let (piece_tx, _piece_rx) = flume::unbounded();
+        let (pr_tx, pr_rx) = flume::unbounded();
         let pending = Arc::new(PendingTorrent {
-            metadata: metadata.clone(),
+            metadata,
             peer_states: Arc::new(PeerStates::default()),
             download_state: self.download_state.clone(),
             uploaded: Arc::new(AtomicU64::new(0)),
             choke_notify: Arc::new(Notify::new()),
             have_broadcast: Arc::new(tokio::sync::broadcast::channel(8).0),
-            downloaded_state: Arc::new(TorrentDownloadedState::new(Vec::new())),
-            storage,
-            torrent,
-            piece_tx,
+            downloaded_state: Slot::new(Arc::new(TorrentDownloadedState::new(Vec::new()))),
+            storage: Slot::new(storage),
+            torrent: Slot::new(torrent),
+            piece_tx: Slot::new(piece_tx),
+            promote_notify: Arc::new(Notify::new()),
+            trackers,
+            output_dir,
+            pr_tx,
+            pr_rx,
         });
         self.pending.insert(info_hash, pending.clone());
-        Ok(MetadataHandle {
-            info_hash,
-            store: metadata,
-            peer_states: pending.peer_states.clone(),
-        })
+        Ok(pending)
     }
 
     pub async fn add_torrent(
         &self,
         add_torrent: AddTorrentOptions,
     ) -> anyhow::Result<AddTorrentResult> {
-        let torrent = Torrent::new(&add_torrent.torrent_meta.clone())?;
+        match add_torrent.source {
+            AddSource::Magnet(magnet) => {
+                return self
+                    .add_magnet(
+                        magnet,
+                        add_torrent.output_dir,
+                        add_torrent.seed,
+                        add_torrent.verify,
+                    )
+                    .await;
+            }
+            AddSource::Meta(torrent_meta) => {
+                self.add_torrent_meta(
+                    *torrent_meta,
+                    add_torrent.output_dir,
+                    add_torrent.seed,
+                    add_torrent.verify,
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn add_torrent_meta(
+        &self,
+        torrent_meta: TorrentMeta,
+        output_dir: Option<PathBuf>,
+        seed: bool,
+        verify: bool,
+        reuse: Option<Arc<PendingTorrent>>,
+    ) -> anyhow::Result<AddTorrentResult> {
+        let torrent = Torrent::new(&torrent_meta)?;
         if torrent.is_private() {
             let disabled: Vec<&str> = torrent
                 .disabled_discovery_sources()
@@ -742,10 +868,7 @@ impl Session {
             );
         }
         let torrent = Arc::new(torrent);
-        let torrent_meta = add_torrent.torrent_meta.clone();
-        let output_dir = add_torrent
-            .output_dir
-            .unwrap_or_else(|| PathBuf::from(&torrent.name));
+        let output_dir = output_dir.unwrap_or_else(|| PathBuf::from(&torrent.name));
 
         let torrent_cache_path = if let Some(state_dir) = self.options.state_dir.as_ref() {
             resume::cache_torrent_file(
@@ -778,24 +901,44 @@ impl Session {
         let resume_unreadable = resume_existed && loaded_resume.is_none();
 
         let fast_path = match &loaded_resume {
-            Some(data) if !add_torrent.verify => {
-                resume::files_match(&data.files, &torrent, &output_dir)
-            }
+            Some(data) if !verify => resume::files_match(&data.files, &torrent, &output_dir),
             _ => false,
         };
 
         let storage = Storage::open(&torrent, &output_dir).await?;
 
-        let (pr_tx, pr_rx) = flume::bounded::<PieceResult>(torrent.piece_hashes.len().max(1) * 2);
-        let have_broadcast = Arc::new(tokio::sync::broadcast::channel(128).0);
-        let peer_states = Arc::new(PeerStates::default());
-        let uploaded = Arc::new(AtomicU64::new(
-            loaded_resume
-                .as_ref()
-                .map(|data| data.uploaded.max(0) as u64)
-                .unwrap_or(0),
-        ));
-        let choke_notify = Arc::new(Notify::new());
+        let (pr_tx, pr_rx) = if let Some(pending) = reuse.as_ref() {
+            (pending.pr_tx.clone(), pending.pr_rx.clone())
+        } else {
+            flume::bounded::<PieceResult>(torrent.piece_hashes.len().max(1) * 2)
+        };
+        let have_broadcast = reuse
+            .as_ref()
+            .map(|p| p.have_broadcast.clone())
+            .unwrap_or_else(|| Arc::new(tokio::sync::broadcast::channel(128).0));
+        let peer_states = reuse
+            .as_ref()
+            .map(|p| p.peer_states.clone())
+            .unwrap_or_else(|| Arc::new(PeerStates::default()));
+        let uploaded = reuse
+            .as_ref()
+            .map(|p| p.uploaded.clone())
+            .unwrap_or_else(|| {
+                Arc::new(AtomicU64::new(
+                    loaded_resume
+                        .as_ref()
+                        .map(|data| data.uploaded.max(0) as u64)
+                        .unwrap_or(0),
+                ))
+            });
+        let choke_notify = reuse
+            .as_ref()
+            .map(|p| p.choke_notify.clone())
+            .unwrap_or_else(|| Arc::new(Notify::new()));
+        let promote_notify = reuse
+            .as_ref()
+            .map(|p| p.promote_notify.clone())
+            .unwrap_or_else(|| Arc::new(Notify::new()));
         let added_at = loaded_resume
             .as_ref()
             .map(|data| data.added_at)
@@ -822,7 +965,7 @@ impl Session {
                 .collect(),
         ));
 
-        let resume_status = if add_torrent.seed {
+        let resume_status = if seed {
             downloaded_state.mark_all_downloaded();
             ResumeStatus::Fresh
         } else if let Some(data) = &loaded_resume {
@@ -858,8 +1001,31 @@ impl Session {
 
         let start_paused = loaded_resume.as_ref().is_some_and(|data| data.is_paused());
 
-        let metadata =
-            MetadataStore::with_bytes(torrent.info_hash, torrent_meta.info_bytes.clone());
+        let metadata = reuse
+            .as_ref()
+            .map(|p| p.metadata.clone())
+            .unwrap_or_else(|| {
+                MetadataStore::with_bytes(torrent.info_hash, torrent_meta.info_bytes.clone())
+            });
+        let torrent_slot = reuse
+            .as_ref()
+            .map(|p| p.torrent.clone())
+            .unwrap_or_else(|| Slot::new(torrent.clone()));
+        let storage_slot = reuse
+            .as_ref()
+            .map(|p| p.storage.clone())
+            .unwrap_or_else(|| Slot::new(storage.clone()));
+        let downloaded_slot = reuse
+            .as_ref()
+            .map(|p| p.downloaded_state.clone())
+            .unwrap_or_else(|| Slot::new(downloaded_state.clone()));
+        let piece_tx_slot = reuse
+            .as_ref()
+            .map(|p| p.piece_tx.clone())
+            .unwrap_or_else(|| Slot::new(flume::unbounded().0));
+        torrent_slot.set(torrent.clone());
+        storage_slot.set(storage.clone());
+        downloaded_slot.set(downloaded_state.clone());
 
         let tracker_stream = TrackerPeers::new(
             torrent_meta.clone(),
@@ -870,6 +1036,7 @@ impl Session {
             pr_rx.clone(),
             self.download_state.clone(),
         );
+        piece_tx_slot.set(tracker_stream.piece_tx.clone());
 
         let listen_port =
             tokio::time::timeout(std::time::Duration::from_millis(250), self.wait_listening())
@@ -880,10 +1047,10 @@ impl Session {
             .connect(crate::tracker_peers::PeerSpawnRuntime {
                 info_hash: torrent.info_hash,
                 peer_id: self.peer_id,
-                storage: storage.clone(),
-                downloaded_state: downloaded_state.clone(),
+                storage: storage_slot.clone(),
+                downloaded_state: downloaded_slot.clone(),
                 uploaded: uploaded.clone(),
-                torrent: torrent.clone(),
+                torrent: torrent_slot.clone(),
                 choke_notify: choke_notify.clone(),
                 global_peers: self.global_peers.clone(),
                 max_peers_per_torrent: self.options.max_peers_per_torrent,
@@ -895,6 +1062,8 @@ impl Session {
                 advertise_dht: self.dht_peer_fields().0,
                 dht_port: self.dht_peer_fields().1,
                 dht: self.dht_peer_fields().2,
+                piece_tx: piece_tx_slot.clone(),
+                promote_notify: promote_notify.clone(),
             })
             .await;
 
@@ -978,11 +1147,13 @@ impl Session {
         });
 
         let piece_tx = tracker_stream.piece_tx.clone();
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(Some(torrent.clone()));
+        let _ = ready_tx;
         let torrent_session = Arc::new(TorrentSession {
             tracker: tracker_stream,
             storage,
             downloaded_state,
-            peer_states,
+            peer_states: peer_states.clone(),
             piece_tx,
             have_broadcast,
             download_state: self.download_state.clone(),
@@ -994,10 +1165,20 @@ impl Session {
             added_at,
             completed_at,
             torrent_cache_path,
-            metadata,
+            metadata: metadata.clone(),
         });
         self.torrents
             .insert(torrent.info_hash, torrent_session.clone());
+
+        if let Some(pending) = reuse {
+            if torrent.is_private() {
+                if let Some(dht) = self.dht() {
+                    dht.remove_torrent(torrent.info_hash);
+                }
+            }
+            pending.promote_notify.notify_waiters();
+            self.pending.remove(&torrent.info_hash);
+        }
 
         if let Some(state_dir) = self.options.state_dir.clone() {
             spawn_resume_timer(torrent_session, state_dir, self.cancel.clone());
@@ -1010,12 +1191,143 @@ impl Session {
         }
 
         Ok(AddTorrentResult {
+            info_hash: torrent.info_hash,
             torrent: (*torrent).clone(),
-            torrent_meta,
+            torrent_meta: Some(torrent_meta),
             pr_rx,
             resume_status,
             already_have,
+            fetching_metadata: false,
+            metadata,
+            peer_states,
+            ready: ready_rx,
         })
+    }
+
+    async fn add_magnet(
+        &self,
+        magnet: Magnet,
+        output_dir: Option<PathBuf>,
+        _seed: bool,
+        verify: bool,
+    ) -> anyhow::Result<AddTorrentResult> {
+        if let Some(existing) = self.torrents.get(&magnet.info_hash) {
+            let torrent = existing.torrent.clone();
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(Some(torrent.clone()));
+            let _ = ready_tx;
+            let already_have: Vec<PieceResult> = existing
+                .downloaded_state
+                .pieces
+                .iter()
+                .filter(|pw| pw.downloaded.load(Ordering::Relaxed))
+                .map(|pw| PieceResult {
+                    index: pw.piece_work.index,
+                    length: pw.piece_work.length,
+                })
+                .collect();
+            let (_, pr_rx) = flume::unbounded();
+            return Ok(AddTorrentResult {
+                info_hash: magnet.info_hash,
+                torrent: (*torrent).clone(),
+                torrent_meta: Some(existing.torrent_meta.clone()),
+                pr_rx,
+                resume_status: ResumeStatus::FastPath,
+                already_have,
+                fetching_metadata: false,
+                metadata: existing.metadata.clone(),
+                peer_states: existing.peer_states.clone(),
+                ready: ready_rx,
+            });
+        }
+
+        let output_dir = output_dir.unwrap_or_else(|| PathBuf::from(magnet.name_or_hash()));
+        let already_pending = self.pending.contains_key(&magnet.info_hash);
+        let pending = self
+            .register_pending(
+                magnet.info_hash,
+                magnet.name_or_hash(),
+                magnet.trackers.clone(),
+                output_dir.clone(),
+            )
+            .await?;
+
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
+        let placeholder = pending.torrent.get();
+        let result = AddTorrentResult {
+            info_hash: magnet.info_hash,
+            torrent: (*placeholder).clone(),
+            torrent_meta: None,
+            pr_rx: pending.pr_rx.clone(),
+            resume_status: ResumeStatus::Fresh,
+            already_have: Vec::new(),
+            fetching_metadata: true,
+            metadata: pending.metadata.clone(),
+            peer_states: pending.peer_states.clone(),
+            ready: ready_rx,
+        };
+
+        self.start_downloading();
+
+        if !magnet.peers.is_empty() {
+            self.add_peers(
+                &magnet.info_hash,
+                DiscoverySource::Tracker,
+                magnet.peers.clone(),
+            );
+        }
+
+        if let Some(dht) = self.dht() {
+            let listen_port = self.listen_port();
+            dht.add_torrent(magnet.info_hash, listen_port, true);
+        }
+
+        if already_pending {
+            return Ok(result);
+        }
+
+        let promoter = self.share();
+
+        tokio::spawn(async move {
+            let bytes = pending.metadata.wait().await;
+            let mut meta = match TorrentMeta::from_info_bytes(bytes) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    warn!(error = %e, "failed to parse fetched metadata");
+                    return;
+                }
+            };
+            if !pending.trackers.is_empty() {
+                meta.torrent_file.announce = Some(pending.trackers[0].clone());
+                meta.torrent_file.announce_list = Some(
+                    pending
+                        .trackers
+                        .iter()
+                        .cloned()
+                        .map(|url| vec![url])
+                        .collect(),
+                );
+            }
+
+            match promoter
+                .add_torrent_meta(
+                    meta,
+                    Some(pending.output_dir.clone()),
+                    false,
+                    verify,
+                    Some(pending.clone()),
+                )
+                .await
+            {
+                Ok(added) => {
+                    let _ = ready_tx.send(Some(Arc::new(added.torrent)));
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to promote magnet after metadata");
+                }
+            }
+        });
+
+        Ok(result)
     }
 }
 
@@ -1144,7 +1456,7 @@ impl PeerInlet {
         let allowed = if let Some(torrent) = self.torrents.get(info_hash) {
             torrent.tracker.allows_source(source)
         } else if let Some(pending) = self.pending.get(info_hash) {
-            pending.torrent.allows_source(source)
+            pending.torrent.get().allows_source(source)
         } else {
             return 0;
         };
@@ -1184,66 +1496,42 @@ impl PeerInlet {
     fn connect_peer(&self, info_hash: &[u8; 20], addr: SocketAddr) -> bool {
         let (advertise_dht, dht_port, dht) = self.dht_fields();
         if let Some(torrent) = self.torrents.get(info_hash).map(|entry| entry.clone()) {
-            return try_spawn_peer(SpawnPeerParams {
-                peer: addr,
-                info_hash: *info_hash,
-                peer_id: self.peer_id,
-                piece_tx: torrent.piece_tx.clone(),
-                have_broadcast: torrent.have_broadcast.clone(),
-                torrent_downloaded_state: torrent.downloaded_state.clone(),
-                peer_states: torrent.peer_states.clone(),
-                download_state: torrent.download_state.clone(),
-                storage: torrent.storage.clone(),
-                uploaded: torrent.uploaded.clone(),
-                torrent: torrent.torrent.clone(),
-                choke_notify: torrent.choke_notify.clone(),
-                incoming: None,
-                incoming_fast_extension: None,
-                incoming_extension_protocol: None,
-                incoming_dht: None,
-                extensions: self.extensions.clone(),
-                listen_port: self.listen_port(),
-                metadata: torrent.metadata.clone(),
+            return try_spawn_peer(spawn_from_session(
+                addr,
+                *info_hash,
+                self.peer_id,
+                &torrent,
+                None,
+                self.extensions.clone(),
+                self.listen_port(),
                 advertise_dht,
                 dht_port,
                 dht,
-                global_peers: self.global_peers.clone(),
-                max_peers_per_torrent: self.max_peers_per_torrent,
-                max_peers_global: self.max_peers_global,
-                connector: self.connector.clone(),
-            });
+                self.global_peers.clone(),
+                self.max_peers_per_torrent,
+                self.max_peers_global,
+                self.connector.clone(),
+            ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
             return false;
         };
-        try_spawn_peer(SpawnPeerParams {
-            peer: addr,
-            info_hash: *info_hash,
-            peer_id: self.peer_id,
-            piece_tx: pending.piece_tx.clone(),
-            have_broadcast: pending.have_broadcast.clone(),
-            torrent_downloaded_state: pending.downloaded_state.clone(),
-            peer_states: pending.peer_states.clone(),
-            download_state: pending.download_state.clone(),
-            storage: pending.storage.clone(),
-            uploaded: pending.uploaded.clone(),
-            torrent: pending.torrent.clone(),
-            choke_notify: pending.choke_notify.clone(),
-            incoming: None,
-            incoming_fast_extension: None,
-            incoming_extension_protocol: None,
-            incoming_dht: None,
-            extensions: self.extensions.clone(),
-            listen_port: self.listen_port(),
-            metadata: pending.metadata.clone(),
+        try_spawn_peer(spawn_from_pending(
+            addr,
+            *info_hash,
+            self.peer_id,
+            &pending,
+            None,
+            self.extensions.clone(),
+            self.listen_port(),
             advertise_dht,
             dht_port,
             dht,
-            global_peers: self.global_peers.clone(),
-            max_peers_per_torrent: self.max_peers_per_torrent,
-            max_peers_global: self.max_peers_global,
-            connector: self.connector.clone(),
-        })
+            self.global_peers.clone(),
+            self.max_peers_per_torrent,
+            self.max_peers_global,
+            self.connector.clone(),
+        ))
     }
 }
 
@@ -1313,33 +1601,11 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
     let known = ctx
         .torrents
         .get(&handshake.info_hash)
-        .map(|entry| IncomingTarget {
-            piece_tx: entry.piece_tx.clone(),
-            have_broadcast: entry.have_broadcast.clone(),
-            downloaded_state: entry.downloaded_state.clone(),
-            peer_states: entry.peer_states.clone(),
-            download_state: entry.download_state.clone(),
-            storage: entry.storage.clone(),
-            uploaded: entry.uploaded.clone(),
-            torrent: entry.torrent.clone(),
-            choke_notify: entry.choke_notify.clone(),
-            metadata: entry.metadata.clone(),
-        })
+        .map(|entry| IncomingTarget::from_session(&entry))
         .or_else(|| {
             ctx.pending
                 .get(&handshake.info_hash)
-                .map(|entry| IncomingTarget {
-                    piece_tx: entry.piece_tx.clone(),
-                    have_broadcast: entry.have_broadcast.clone(),
-                    downloaded_state: entry.downloaded_state.clone(),
-                    peer_states: entry.peer_states.clone(),
-                    download_state: entry.download_state.clone(),
-                    storage: entry.storage.clone(),
-                    uploaded: entry.uploaded.clone(),
-                    torrent: entry.torrent.clone(),
-                    choke_notify: entry.choke_notify.clone(),
-                    metadata: entry.metadata.clone(),
-                })
+                .map(|entry| IncomingTarget::from_pending(&entry))
         });
     let Some(target) = known else {
         debug!(%addr, "incoming peer for unknown info hash");
@@ -1385,20 +1651,152 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         max_peers_per_torrent: ctx.max_peers_per_torrent,
         max_peers_global: ctx.max_peers_global,
         connector: ctx.connector,
+        promote_notify: target.promote_notify,
     });
 }
 
 struct IncomingTarget {
-    piece_tx: flume::Sender<crate::peer_connection::FullPiece>,
+    piece_tx: Arc<Slot<flume::Sender<crate::peer_connection::FullPiece>>>,
     have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
-    downloaded_state: Arc<TorrentDownloadedState>,
+    downloaded_state: Arc<Slot<Arc<TorrentDownloadedState>>>,
     peer_states: Arc<PeerStates>,
     download_state: Arc<Mutex<DownloadState>>,
-    storage: Arc<Storage>,
+    storage: Arc<Slot<Arc<Storage>>>,
     uploaded: Arc<AtomicU64>,
-    torrent: Arc<Torrent>,
+    torrent: Arc<Slot<Arc<Torrent>>>,
     choke_notify: Arc<Notify>,
-    metadata: Arc<MetadataStore>,
+    metadata: Arc<crate::extension::MetadataStore>,
+    promote_notify: Arc<Notify>,
+}
+
+impl IncomingTarget {
+    fn from_session(entry: &TorrentSession) -> Self {
+        Self {
+            piece_tx: Slot::new(entry.piece_tx.clone()),
+            have_broadcast: entry.have_broadcast.clone(),
+            downloaded_state: Slot::new(entry.downloaded_state.clone()),
+            peer_states: entry.peer_states.clone(),
+            download_state: entry.download_state.clone(),
+            storage: Slot::new(entry.storage.clone()),
+            uploaded: entry.uploaded.clone(),
+            torrent: Slot::new(entry.torrent.clone()),
+            choke_notify: entry.choke_notify.clone(),
+            metadata: entry.metadata.clone(),
+            promote_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn from_pending(entry: &PendingTorrent) -> Self {
+        Self {
+            piece_tx: entry.piece_tx.clone(),
+            have_broadcast: entry.have_broadcast.clone(),
+            downloaded_state: entry.downloaded_state.clone(),
+            peer_states: entry.peer_states.clone(),
+            download_state: entry.download_state.clone(),
+            storage: entry.storage.clone(),
+            uploaded: entry.uploaded.clone(),
+            torrent: entry.torrent.clone(),
+            choke_notify: entry.choke_notify.clone(),
+            metadata: entry.metadata.clone(),
+            promote_notify: entry.promote_notify.clone(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_from_session(
+    peer: SocketAddr,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    torrent: &TorrentSession,
+    incoming: Option<crate::transport::BoxedPeerStream>,
+    extensions: crate::extension::ExtensionRegistry,
+    listen_port: u16,
+    advertise_dht: bool,
+    dht_port: Option<u16>,
+    dht: Option<DhtHandle>,
+    global_peers: Arc<AtomicUsize>,
+    max_peers_per_torrent: usize,
+    max_peers_global: usize,
+    connector: Arc<dyn crate::transport::Connector>,
+) -> SpawnPeerParams {
+    SpawnPeerParams {
+        peer,
+        info_hash,
+        peer_id,
+        piece_tx: Slot::new(torrent.piece_tx.clone()),
+        have_broadcast: torrent.have_broadcast.clone(),
+        torrent_downloaded_state: Slot::new(torrent.downloaded_state.clone()),
+        peer_states: torrent.peer_states.clone(),
+        download_state: torrent.download_state.clone(),
+        storage: Slot::new(torrent.storage.clone()),
+        uploaded: torrent.uploaded.clone(),
+        torrent: Slot::new(torrent.torrent.clone()),
+        choke_notify: torrent.choke_notify.clone(),
+        incoming,
+        incoming_fast_extension: None,
+        incoming_extension_protocol: None,
+        incoming_dht: None,
+        extensions,
+        listen_port,
+        metadata: torrent.metadata.clone(),
+        advertise_dht,
+        dht_port,
+        dht,
+        global_peers,
+        max_peers_per_torrent,
+        max_peers_global,
+        connector,
+        promote_notify: Arc::new(Notify::new()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_from_pending(
+    peer: SocketAddr,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    pending: &PendingTorrent,
+    incoming: Option<crate::transport::BoxedPeerStream>,
+    extensions: crate::extension::ExtensionRegistry,
+    listen_port: u16,
+    advertise_dht: bool,
+    dht_port: Option<u16>,
+    dht: Option<DhtHandle>,
+    global_peers: Arc<AtomicUsize>,
+    max_peers_per_torrent: usize,
+    max_peers_global: usize,
+    connector: Arc<dyn crate::transport::Connector>,
+) -> SpawnPeerParams {
+    SpawnPeerParams {
+        peer,
+        info_hash,
+        peer_id,
+        piece_tx: pending.piece_tx.clone(),
+        have_broadcast: pending.have_broadcast.clone(),
+        torrent_downloaded_state: pending.downloaded_state.clone(),
+        peer_states: pending.peer_states.clone(),
+        download_state: pending.download_state.clone(),
+        storage: pending.storage.clone(),
+        uploaded: pending.uploaded.clone(),
+        torrent: pending.torrent.clone(),
+        choke_notify: pending.choke_notify.clone(),
+        incoming,
+        incoming_fast_extension: None,
+        incoming_extension_protocol: None,
+        incoming_dht: None,
+        extensions,
+        listen_port,
+        metadata: pending.metadata.clone(),
+        advertise_dht,
+        dht_port,
+        dht,
+        global_peers,
+        max_peers_per_torrent,
+        max_peers_global,
+        connector,
+        promote_notify: pending.promote_notify.clone(),
+    }
 }
 
 fn spawn_choke_loop(
@@ -1507,7 +1905,9 @@ fn apply_choke(
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.shutdown();
+        if self.owns_lifecycle {
+            self.shutdown();
+        }
     }
 }
 
@@ -1528,6 +1928,15 @@ mod add_options_tests {
             Err(err) => err,
         };
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn try_from_dispatches_magnet_prefix() {
+        let hex = "123456789abcdef0112233445566778899aabbcc";
+        let opts = AddTorrentOptions::try_from(format!("magnet:?xt=urn:btih:{hex}").as_str())
+            .expect("parse magnet");
+        assert!(opts.is_magnet());
+        assert_eq!(opts.name(), hex);
     }
 }
 
