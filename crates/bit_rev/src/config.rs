@@ -211,6 +211,7 @@ impl Config {
                     Vec::new()
                 },
             },
+            encryption: self.encryption.into(),
         }
     }
 }
@@ -276,6 +277,11 @@ mod tests {
         );
         assert_eq!(options.max_peers_global, expected.max_peers_global);
         assert_eq!(options.state_dir, expected.state_dir);
+        assert_eq!(options.encryption, expected.encryption);
+        assert_eq!(
+            options.encryption,
+            crate::mse::EncryptionPolicy::PreferEncrypted
+        );
     }
 
     #[test]

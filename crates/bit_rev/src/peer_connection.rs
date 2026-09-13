@@ -27,6 +27,7 @@ use crate::{
         self, format_reject_request, validate_request, BlockRequest, Message, RequestError,
         RequestStorm, WriterRequest, MAX_UPLOAD_QUEUE,
     },
+    mse::{initiate, EncryptionPolicy, CRYPTO_PLAINTEXT, CRYPTO_RC4},
     peer::PeerAddr,
     peer_state::PeerStates,
     picker::{self, select_piece, Availability, BOOTSTRAP_VERIFIED},
@@ -34,7 +35,7 @@ use crate::{
     session::{DownloadState, PieceWork},
     storage::Storage,
     torrent::Torrent,
-    transport::{BoxedPeerStream, Connector, PeerStream},
+    transport::{boxed_stream, BoxedPeerStream, Connector, PeerConnected, PeerDial, PeerStream},
     utils,
 };
 
@@ -1890,6 +1891,7 @@ pub struct PeerConnection {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     connector: Arc<dyn Connector>,
+    encryption: EncryptionPolicy,
 }
 
 impl PeerConnection {
@@ -1899,6 +1901,7 @@ impl PeerConnection {
         peer_id: [u8; 20],
         handler: Arc<PeerHandler>,
         connector: Arc<dyn Connector>,
+        encryption: EncryptionPolicy,
     ) -> Self {
         Self {
             handler,
@@ -1907,6 +1910,7 @@ impl PeerConnection {
             info_hash,
             peer_id,
             connector,
+            encryption,
         }
     }
 
@@ -1915,8 +1919,6 @@ impl PeerConnection {
         peer_writer_rx: flume::Receiver<WriterRequest>,
         have_broadcast: tokio::sync::broadcast::Receiver<u32>,
     ) -> anyhow::Result<()> {
-        let mut stream = self.connector.dial(self.peer).await?;
-
         let protocol = Arc::new({
             let proto = Protocol::connect(self.peer, self.info_hash, self.peer_id)
                 .await?
@@ -1928,7 +1930,7 @@ impl PeerConnection {
                 proto.with_piece_count(count)
             }
         });
-        let handshake = protocol.complete_handshake(&mut stream).await?;
+        let (mut stream, handshake) = self.outgoing_connect_and_handshake(&protocol).await?;
         self.handler
             .set_fast_extension(handshake.supports_fast_extension());
         self.handler
@@ -1944,6 +1946,75 @@ impl PeerConnection {
         self.send_allowed_fast(&protocol, &mut stream).await?;
         self.manage_established(stream, protocol, peer_writer_rx, have_broadcast)
             .await
+    }
+
+    async fn outgoing_connect_and_handshake(
+        &self,
+        protocol: &Protocol,
+    ) -> anyhow::Result<(BoxedPeerStream, crate::handshake::Handshake)> {
+        let mut ours = crate::handshake::Handshake::outgoing(self.info_hash, self.peer_id);
+        if self.handler.advertise_dht {
+            ours.enable_dht();
+        }
+        let ia = ours.serialize();
+        let connected = self
+            .connector
+            .dial_peer(PeerDial {
+                addr: self.peer,
+                info_hash: self.info_hash,
+                initial_payload: ia.clone(),
+            })
+            .await?;
+        match self.finish_outgoing(protocol, connected).await {
+            Ok(result) => Ok(result),
+            Err(err) if self.encryption == EncryptionPolicy::PreferPlaintext => {
+                debug!(peer = %self.peer, error = %err, "plaintext handshake failed, retrying mse");
+                let stream = self.connector.dial(self.peer).await?;
+                let outcome = initiate(
+                    stream,
+                    self.info_hash,
+                    CRYPTO_PLAINTEXT | CRYPTO_RC4,
+                    &ia,
+                    true,
+                )
+                .await?;
+                let mut stream = boxed_stream(outcome.stream);
+                let handshake = Protocol::read_handshake(&mut stream).await?;
+                if handshake.info_hash != self.info_hash {
+                    anyhow::bail!("info hash mismatch after mse retry");
+                }
+                self.mark_encrypted(outcome.selected.is_rc4());
+                Ok((stream, handshake))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn finish_outgoing(
+        &self,
+        protocol: &Protocol,
+        connected: PeerConnected,
+    ) -> anyhow::Result<(BoxedPeerStream, crate::handshake::Handshake)> {
+        let mut stream = connected.stream;
+        self.mark_encrypted(connected.encrypted);
+        let handshake = if connected.sent_initial_payload {
+            Protocol::read_handshake(&mut stream).await?
+        } else {
+            protocol.complete_handshake(&mut stream).await?
+        };
+        if handshake.info_hash != self.info_hash {
+            anyhow::bail!("info hash mismatch");
+        }
+        Ok((stream, handshake))
+    }
+
+    fn mark_encrypted(&self, encrypted: bool) {
+        if !encrypted {
+            return;
+        }
+        if let Some(mut state) = self.handler.peers_state.states.get_mut(&self.peer) {
+            state.encrypted = true;
+        }
     }
 
     pub async fn manage_incoming_stream<S: PeerStream>(
@@ -2252,6 +2323,8 @@ pub struct SpawnPeerParams {
     pub incoming_fast_extension: Option<bool>,
     pub incoming_extension_protocol: Option<bool>,
     pub incoming_dht: Option<bool>,
+    pub incoming_encrypted: bool,
+    pub encryption: EncryptionPolicy,
     pub extensions: ExtensionRegistry,
     pub listen_port: u16,
     pub metadata: Arc<MetadataStore>,
@@ -2344,12 +2417,18 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
         if params.incoming_dht == Some(true) {
             handler.peer_dht.store(true, Ordering::Relaxed);
         }
+        if params.incoming_encrypted {
+            if let Some(mut state) = params.peer_states.states.get_mut(&params.peer) {
+                state.encrypted = true;
+            }
+        }
         let connection = PeerConnection::new(
             params.peer,
             params.info_hash,
             params.peer_id,
             handler.clone(),
             params.connector,
+            params.encryption,
         );
         let requester = handler.task_peer_chunk_requester();
         let uploader = handler.task_peer_uploader();
@@ -2816,6 +2895,7 @@ mod tests {
             *b"-BR0100-testdriver01",
             handler,
             connector,
+            crate::mse::EncryptionPolicy::Disabled,
         );
         let have_rx = tokio::sync::broadcast::channel(8).0.subscribe();
         (connection, peer_states, writer_rx, have_rx, dir)

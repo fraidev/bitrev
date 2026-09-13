@@ -140,6 +140,7 @@ pub struct PeerState {
     pub suggested_pieces: Vec<u32>,
     pub hash_failures: u32,
     pub snubbed: bool,
+    pub encrypted: bool,
     pub stats: Arc<PeerLiveStats>,
     pub writer_tx: Option<flume::Sender<WriterRequest>>,
 }
@@ -195,6 +196,7 @@ impl PeerState {
             suggested_pieces: Vec::new(),
             hash_failures: 0,
             snubbed: false,
+            encrypted: false,
             stats: Arc::new(PeerLiveStats::default()),
             writer_tx: None,
         }

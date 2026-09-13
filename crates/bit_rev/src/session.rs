@@ -19,12 +19,14 @@ use crate::protocol::Protocol;
 use crate::resume::{self, ResumeSnapshot};
 
 pub use crate::dht::{DhtOptions, DhtStats};
+use crate::mse::{self, EncryptionPolicy, MseConnector};
 pub use crate::resume::ResumeStatus;
 use crate::storage::Storage;
 use crate::torrent::Torrent;
 use crate::tracker_peers::TrackerPeers;
 use crate::transport::{
     boxed_stream, BoxedPeerStream, Connector, IncomingKind, IncomingStream, TcpConnector,
+    BT_HANDSHAKE_HEAD,
 };
 use crate::utils;
 use dashmap::DashMap;
@@ -67,6 +69,7 @@ pub struct SessionOptions {
     /// Directory for resume data and cached torrents. `None` disables persistence.
     pub state_dir: Option<PathBuf>,
     pub dht: DhtOptions,
+    pub encryption: EncryptionPolicy,
 }
 
 impl Default for SessionOptions {
@@ -77,6 +80,7 @@ impl Default for SessionOptions {
             max_peers_global: DEFAULT_MAX_PEERS_GLOBAL,
             state_dir: Some(util::paths::state_dir()),
             dht: DhtOptions::default(),
+            encryption: EncryptionPolicy::default(),
         }
     }
 }
@@ -319,6 +323,8 @@ impl Session {
     }
 
     pub fn with_connector(options: SessionOptions, connector: Arc<dyn Connector>) -> Self {
+        let connector: Arc<dyn Connector> =
+            Arc::new(MseConnector::new(connector, options.encryption));
         let session = Self {
             torrents: Arc::new(DashMap::new()),
             download_state: Arc::new(Mutex::new(DownloadState::Init)),
@@ -395,6 +401,7 @@ impl Session {
             connector: self.connector.clone(),
             dht: self.dht.clone(),
             download_state: self.download_state.clone(),
+            encryption: self.options.encryption,
         }
     }
 
@@ -485,6 +492,7 @@ impl Session {
         let connector = self.connector.clone();
         let pending = self.pending.clone();
         let dht = self.dht.clone();
+        let encryption = self.options.encryption;
 
         tokio::spawn(async move {
             let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -543,6 +551,7 @@ impl Session {
                                     connector,
                                     pending,
                                     dht,
+                                    encryption,
                                 },
                             )
                             .await;
@@ -701,6 +710,7 @@ impl Session {
                 self.options.max_peers_per_torrent,
                 self.options.max_peers_global,
                 self.connector.clone(),
+                self.options.encryption,
             ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
@@ -721,6 +731,7 @@ impl Session {
             self.options.max_peers_per_torrent,
             self.options.max_peers_global,
             self.connector.clone(),
+            self.options.encryption,
         ))
     }
 
@@ -1064,6 +1075,7 @@ impl Session {
                 dht: self.dht_peer_fields().2,
                 piece_tx: piece_tx_slot.clone(),
                 promote_notify: promote_notify.clone(),
+                encryption: self.options.encryption,
             })
             .await;
 
@@ -1429,6 +1441,7 @@ struct PeerInlet {
     connector: Arc<dyn Connector>,
     dht: Arc<Mutex<Option<DhtHandle>>>,
     download_state: Arc<Mutex<DownloadState>>,
+    encryption: EncryptionPolicy,
 }
 
 impl PeerInlet {
@@ -1511,6 +1524,7 @@ impl PeerInlet {
                 self.max_peers_per_torrent,
                 self.max_peers_global,
                 self.connector.clone(),
+                self.encryption,
             ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
@@ -1531,6 +1545,7 @@ impl PeerInlet {
             self.max_peers_per_torrent,
             self.max_peers_global,
             self.connector.clone(),
+            self.encryption,
         ))
     }
 }
@@ -1546,6 +1561,7 @@ pub struct IncomingPeerContext {
     pub connector: Arc<dyn Connector>,
     pub(crate) pending: Arc<DashMap<[u8; 20], Arc<PendingTorrent>>>,
     pub dht: Option<DhtHandle>,
+    pub encryption: EncryptionPolicy,
 }
 
 impl Session {
@@ -1561,6 +1577,7 @@ impl Session {
             connector: self.connector.clone(),
             pending: self.pending.clone(),
             dht: self.dht(),
+            encryption: self.options.encryption,
         }
     }
 
@@ -1577,7 +1594,34 @@ impl Session {
 
 /// Handshake lookup shared by the TCP listener and later uTP accepts.
 pub async fn accept_incoming(stream: BoxedPeerStream, addr: SocketAddr, ctx: IncomingPeerContext) {
-    accept_incoming_stream(IncomingStream::new(stream, addr), ctx).await;
+    let incoming = match peek_incoming(stream, addr).await {
+        Ok(incoming) => incoming,
+        Err(e) => {
+            debug!(%addr, error = %e, "incoming peek failed");
+            return;
+        }
+    };
+    accept_incoming_stream(incoming, ctx).await;
+}
+
+async fn peek_incoming(
+    mut stream: BoxedPeerStream,
+    addr: SocketAddr,
+) -> std::io::Result<IncomingStream> {
+    let mut prefix = vec![0u8; BT_HANDSHAKE_HEAD.len()];
+    match tokio::time::timeout(
+        crate::protocol::PeerTimeouts::default().handshake,
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut prefix),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(IncomingStream::with_peek(prefix, stream, addr)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "incoming peek timed out",
+        )),
+    }
 }
 
 pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerContext) {
@@ -1587,9 +1631,46 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         kind,
     } = incoming;
     debug!(%addr, ?kind, "accepting incoming peer");
-    if kind == IncomingKind::MaybeEncrypted {
-        // MSE (#7) will take this branch after peeking the first bytes.
-        debug!(%addr, "encrypted inbound not implemented, trying plaintext handshake");
+    let mut encrypted = false;
+    match kind {
+        IncomingKind::Plaintext => {
+            if !ctx.encryption.allows_plaintext() {
+                debug!(%addr, "refusing plaintext peer under require_encrypted");
+                return;
+            }
+        }
+        IncomingKind::MaybeEncrypted => {
+            if !ctx.encryption.allows_mse() {
+                debug!(%addr, "refusing mse peer under encryption=disabled");
+                return;
+            }
+            let policy = ctx.encryption;
+            let torrents = ctx.torrents.clone();
+            let pending = ctx.pending.clone();
+            match mse::respond(
+                stream,
+                |req2| {
+                    let keys: Vec<[u8; 20]> = torrents
+                        .iter()
+                        .map(|e| *e.key())
+                        .chain(pending.iter().map(|e| *e.key()))
+                        .collect();
+                    mse::lookup_skey(req2, keys.iter())
+                },
+                |provided| policy.select(provided),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    encrypted = outcome.selected.is_rc4();
+                    stream = boxed_stream(outcome.stream);
+                }
+                Err(e) => {
+                    debug!(%addr, error = %e, "incoming mse handshake failed");
+                    return;
+                }
+            }
+        }
     }
     let handshake = match Protocol::read_handshake(&mut stream).await {
         Ok(handshake) => handshake,
@@ -1647,6 +1728,8 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         torrent: target.torrent,
         choke_notify: target.choke_notify,
         incoming: Some(stream),
+        incoming_encrypted: encrypted,
+        encryption: ctx.encryption,
         global_peers: ctx.global_peers,
         max_peers_per_torrent: ctx.max_peers_per_torrent,
         max_peers_global: ctx.max_peers_global,
@@ -1719,6 +1802,7 @@ fn spawn_from_session(
     max_peers_per_torrent: usize,
     max_peers_global: usize,
     connector: Arc<dyn crate::transport::Connector>,
+    encryption: EncryptionPolicy,
 ) -> SpawnPeerParams {
     SpawnPeerParams {
         peer,
@@ -1737,6 +1821,8 @@ fn spawn_from_session(
         incoming_fast_extension: None,
         incoming_extension_protocol: None,
         incoming_dht: None,
+        incoming_encrypted: false,
+        encryption,
         extensions,
         listen_port,
         metadata: torrent.metadata.clone(),
@@ -1767,6 +1853,7 @@ fn spawn_from_pending(
     max_peers_per_torrent: usize,
     max_peers_global: usize,
     connector: Arc<dyn crate::transport::Connector>,
+    encryption: EncryptionPolicy,
 ) -> SpawnPeerParams {
     SpawnPeerParams {
         peer,
@@ -1785,6 +1872,8 @@ fn spawn_from_pending(
         incoming_fast_extension: None,
         incoming_extension_protocol: None,
         incoming_dht: None,
+        incoming_encrypted: false,
+        encryption,
         extensions,
         listen_port,
         metadata: pending.metadata.clone(),
@@ -2018,6 +2107,52 @@ mod incoming_tests {
         assert!(
             torrent.peer_states.states.contains_key(&addr),
             "incoming duplex should join by info hash"
+        );
+        assert!(
+            !torrent.peer_states.states.get(&addr).unwrap().encrypted,
+            "plaintext incoming is not marked encrypted"
+        );
+
+        drop(remote_task);
+        session.shutdown();
+    }
+
+    #[tokio::test]
+    async fn require_encrypted_refuses_plaintext_incoming() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::with_options(SessionOptions {
+            listen_port: 0,
+            state_dir: None,
+            encryption: EncryptionPolicy::RequireEncrypted,
+            ..SessionOptions::default()
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.wait_listening()).await;
+
+        let meta = tiny_meta();
+        let path = dir.path().join("tiny.bin");
+        session
+            .add_torrent(AddTorrentOptions::from(meta.clone()).output_dir(path))
+            .await
+            .expect("add torrent");
+
+        let addr: SocketAddr = "127.0.0.1:51414".parse().unwrap();
+        let (mut remote, server) = tokio::io::duplex(256);
+        let handshake = Handshake::outgoing(meta.info_hash, *b"-LC0001-0123456789ab");
+        let remote_task = tokio::spawn(async move {
+            let _ = remote.write_all(&handshake.serialize()).await;
+            let mut reply = [0u8; 68];
+            let _ = remote.read_exact(&mut reply).await;
+            remote
+        });
+
+        session.accept_incoming(boxed_stream(server), addr).await;
+
+        let torrent = session
+            .torrent_session(&meta.info_hash)
+            .expect("torrent registered");
+        assert!(
+            !torrent.peer_states.states.contains_key(&addr),
+            "require_encrypted must refuse a plaintext handshake"
         );
 
         drop(remote_task);

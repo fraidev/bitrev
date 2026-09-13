@@ -10,6 +10,7 @@ pub mod handshake;
 pub mod identity;
 pub mod magnet;
 pub mod message;
+pub mod mse;
 pub mod peer;
 pub mod peer_connection;
 pub mod peer_state;
