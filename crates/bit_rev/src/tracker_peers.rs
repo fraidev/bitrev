@@ -12,7 +12,7 @@ use crate::{
     file::TorrentMeta,
     identity::TrackerIdentity,
     peer::BencodeResponse,
-    peer_connection::{try_spawn_peer, FullPiece, SpawnPeerParams, TorrentDownloadedState},
+    peer_connection::{try_spawn_peer, FullPiece, Slot, SpawnPeerParams, TorrentDownloadedState},
     peer_state::PeerStates,
     session::{DownloadState, PieceResult},
     storage::Storage,
@@ -24,10 +24,10 @@ use crate::{
 pub struct PeerSpawnRuntime {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
-    pub storage: Arc<Storage>,
-    pub downloaded_state: Arc<TorrentDownloadedState>,
+    pub storage: Arc<Slot<Arc<Storage>>>,
+    pub downloaded_state: Arc<Slot<Arc<TorrentDownloadedState>>>,
     pub uploaded: Arc<AtomicU64>,
-    pub torrent: Arc<Torrent>,
+    pub torrent: Arc<Slot<Arc<Torrent>>>,
     pub choke_notify: Arc<Notify>,
     pub global_peers: Arc<AtomicUsize>,
     pub max_peers_per_torrent: usize,
@@ -39,6 +39,8 @@ pub struct PeerSpawnRuntime {
     pub advertise_dht: bool,
     pub dht_port: Option<u16>,
     pub dht: Option<crate::dht::DhtHandle>,
+    pub piece_tx: Arc<Slot<flume::Sender<FullPiece>>>,
+    pub promote_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +125,6 @@ impl TrackerPeers {
         debug!(trackers = ?all_tracker_urls, "connecting to trackers");
         let torrent_meta = self.torrent_meta.clone();
         let peer_states = self.peer_states.clone();
-        let piece_tx = self.piece_tx.clone();
         let have_broadcast = self.have_broadcast.clone();
         let download_state = self.download_state.clone();
         let cancel = self.cancel.clone();
@@ -144,63 +145,24 @@ impl TrackerPeers {
                 announce_key: identity.key(),
                 port: runtime.listen_port,
                 download_state: download_state.clone(),
-                torrent_downloaded_state: runtime.downloaded_state.clone(),
+                torrent_downloaded_state: runtime.downloaded_state.get(),
                 uploaded: runtime.uploaded.clone(),
             };
             let peer_states = peer_states.clone();
-            let piece_tx = piece_tx.clone();
             let have_broadcast = have_broadcast.clone();
             let download_state = download_state.clone();
             let shutdown = cancel.clone();
-            let runtime = PeerSpawnRuntime {
-                info_hash: runtime.info_hash,
-                peer_id: runtime.peer_id,
-                storage: runtime.storage.clone(),
-                downloaded_state: runtime.downloaded_state.clone(),
-                uploaded: runtime.uploaded.clone(),
-                torrent: runtime.torrent.clone(),
-                choke_notify: runtime.choke_notify.clone(),
-                global_peers: runtime.global_peers.clone(),
-                max_peers_per_torrent: runtime.max_peers_per_torrent,
-                max_peers_global: runtime.max_peers_global,
-                listen_port: runtime.listen_port,
-                extensions: runtime.extensions.clone(),
-                connector: runtime.connector.clone(),
-                metadata: runtime.metadata.clone(),
-                advertise_dht: runtime.advertise_dht,
-                dht_port: runtime.dht_port,
-                dht: runtime.dht.clone(),
-            };
+            let runtime = clone_runtime(&runtime);
             tokio::spawn(async move {
                 tracker::run_announce_loop(ctx, shutdown, |new_peers| {
                     let peer_states = peer_states.clone();
-                    let piece_tx = piece_tx.clone();
                     let have_broadcast = have_broadcast.clone();
                     let download_state = download_state.clone();
-                    let runtime = PeerSpawnRuntime {
-                        info_hash: runtime.info_hash,
-                        peer_id: runtime.peer_id,
-                        storage: runtime.storage.clone(),
-                        downloaded_state: runtime.downloaded_state.clone(),
-                        uploaded: runtime.uploaded.clone(),
-                        torrent: runtime.torrent.clone(),
-                        choke_notify: runtime.choke_notify.clone(),
-                        global_peers: runtime.global_peers.clone(),
-                        max_peers_per_torrent: runtime.max_peers_per_torrent,
-                        max_peers_global: runtime.max_peers_global,
-                        listen_port: runtime.listen_port,
-                        extensions: runtime.extensions.clone(),
-                        connector: runtime.connector.clone(),
-                        metadata: runtime.metadata.clone(),
-                        advertise_dht: runtime.advertise_dht,
-                        dht_port: runtime.dht_port,
-                        dht: runtime.dht.clone(),
-                    };
+                    let runtime = clone_runtime(&runtime);
                     async move {
                         process_peers(
                             new_peers,
                             peer_states,
-                            piece_tx,
                             have_broadcast,
                             download_state,
                             runtime,
@@ -214,10 +176,33 @@ impl TrackerPeers {
     }
 }
 
+fn clone_runtime(runtime: &PeerSpawnRuntime) -> PeerSpawnRuntime {
+    PeerSpawnRuntime {
+        info_hash: runtime.info_hash,
+        peer_id: runtime.peer_id,
+        storage: runtime.storage.clone(),
+        downloaded_state: runtime.downloaded_state.clone(),
+        uploaded: runtime.uploaded.clone(),
+        torrent: runtime.torrent.clone(),
+        choke_notify: runtime.choke_notify.clone(),
+        global_peers: runtime.global_peers.clone(),
+        max_peers_per_torrent: runtime.max_peers_per_torrent,
+        max_peers_global: runtime.max_peers_global,
+        listen_port: runtime.listen_port,
+        extensions: runtime.extensions.clone(),
+        connector: runtime.connector.clone(),
+        metadata: runtime.metadata.clone(),
+        advertise_dht: runtime.advertise_dht,
+        dht_port: runtime.dht_port,
+        dht: runtime.dht.clone(),
+        piece_tx: runtime.piece_tx.clone(),
+        promote_notify: runtime.promote_notify.clone(),
+    }
+}
+
 async fn process_peers(
     new_peers: Vec<std::net::SocketAddr>,
     peer_states: Arc<PeerStates>,
-    piece_tx: flume::Sender<FullPiece>,
     have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
     download_state: Arc<Mutex<DownloadState>>,
     runtime: PeerSpawnRuntime,
@@ -235,7 +220,7 @@ async fn process_peers(
             peer,
             info_hash: runtime.info_hash,
             peer_id: runtime.peer_id,
-            piece_tx: piece_tx.clone(),
+            piece_tx: runtime.piece_tx.clone(),
             have_broadcast: have_broadcast.clone(),
             torrent_downloaded_state: runtime.downloaded_state.clone(),
             peer_states: peer_states.clone(),
@@ -258,6 +243,7 @@ async fn process_peers(
             max_peers_per_torrent: runtime.max_peers_per_torrent,
             max_peers_global: runtime.max_peers_global,
             connector: runtime.connector.clone(),
+            promote_notify: runtime.promote_notify.clone(),
         });
     }
 }
