@@ -61,9 +61,16 @@ impl MseConnector {
         provide: u32,
         allow_plaintext: bool,
     ) -> io::Result<PeerConnected> {
-        let stream = self.inner.dial(req.addr).await?;
+        let connected = self
+            .inner
+            .dial_peer(PeerDial {
+                addr: req.addr,
+                info_hash: req.info_hash,
+                initial_payload: Vec::new(),
+            })
+            .await?;
         let outcome = initiate(
-            stream,
+            connected.stream,
             req.info_hash,
             provide,
             &req.initial_payload,
@@ -77,6 +84,7 @@ impl MseConnector {
         Ok(PeerConnected {
             encrypted: outcome.selected.is_rc4(),
             sent_initial_payload: true,
+            utp: connected.utp,
             stream: boxed_stream(outcome.stream),
         })
     }

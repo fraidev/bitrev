@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+mod race;
 mod tcp;
 
+pub use race::RacingConnector;
 pub use tcp::TcpConnector;
 
 /// Budget applied by [`TcpConnector`]. MSE wrappers and other connectors
@@ -41,6 +43,7 @@ pub struct PeerConnected {
     pub stream: BoxedPeerStream,
     pub encrypted: bool,
     pub sent_initial_payload: bool,
+    pub utp: bool,
 }
 
 pub type PeerDialFuture<'a> = Pin<Box<dyn Future<Output = io::Result<PeerConnected>> + Send + 'a>>;
@@ -56,6 +59,7 @@ pub trait Connector: Send + Sync {
                 stream,
                 encrypted: false,
                 sent_initial_payload: false,
+                utp: false,
             })
         })
     }
@@ -167,6 +171,7 @@ pub struct IncomingStream {
     pub stream: BoxedPeerStream,
     pub addr: SocketAddr,
     pub kind: IncomingKind,
+    pub utp: bool,
 }
 
 impl IncomingStream {
@@ -175,6 +180,7 @@ impl IncomingStream {
             stream,
             addr,
             kind: IncomingKind::Plaintext,
+            utp: false,
         }
     }
 
@@ -190,7 +196,12 @@ impl IncomingStream {
         } else {
             boxed_stream(PrefixedStream::new(prefix, stream))
         };
-        Self { stream, addr, kind }
+        Self {
+            stream,
+            addr,
+            kind,
+            utp: false,
+        }
     }
 }
 

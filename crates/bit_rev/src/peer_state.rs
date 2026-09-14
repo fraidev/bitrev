@@ -141,6 +141,7 @@ pub struct PeerState {
     pub hash_failures: u32,
     pub snubbed: bool,
     pub encrypted: bool,
+    pub utp: bool,
     pub stats: Arc<PeerLiveStats>,
     pub writer_tx: Option<flume::Sender<WriterRequest>>,
 }
@@ -197,6 +198,7 @@ impl PeerState {
             hash_failures: 0,
             snubbed: false,
             encrypted: false,
+            utp: false,
             stats: Arc::new(PeerLiveStats::default()),
             writer_tx: None,
         }

@@ -236,6 +236,7 @@ async fn process_peers(
             incoming_extension_protocol: None,
             incoming_dht: None,
             incoming_encrypted: false,
+            incoming_utp: false,
             encryption: runtime.encryption,
             extensions: runtime.extensions.clone(),
             listen_port: runtime.listen_port,

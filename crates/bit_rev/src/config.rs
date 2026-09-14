@@ -212,6 +212,10 @@ impl Config {
                 },
             },
             encryption: self.encryption.into(),
+            utp: crate::utp::UtpOptions {
+                enabled: self.utp.enabled,
+                port: 0,
+            },
         }
     }
 }
@@ -282,6 +286,8 @@ mod tests {
             options.encryption,
             crate::mse::EncryptionPolicy::PreferEncrypted
         );
+        assert!(options.utp.enabled);
+        assert!(!expected.utp.enabled);
     }
 
     #[test]
@@ -302,6 +308,20 @@ mod tests {
         assert!(!disabled.dht.enabled);
         assert_eq!(disabled.dht.port, 6999);
         assert!(disabled.dht.bootstrap_nodes.is_empty());
+    }
+
+    #[test]
+    fn session_options_maps_utp() {
+        let options = Config::default().session_options();
+        assert!(options.utp.enabled);
+        assert_eq!(options.utp.port, 0);
+
+        let disabled = Config {
+            utp: UtpConfig { enabled: false },
+            ..Config::default()
+        }
+        .session_options();
+        assert!(!disabled.utp.enabled);
     }
 
     #[test]

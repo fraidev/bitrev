@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,10 +25,12 @@ use crate::storage::Storage;
 use crate::torrent::Torrent;
 use crate::tracker_peers::TrackerPeers;
 use crate::transport::{
-    boxed_stream, BoxedPeerStream, Connector, IncomingKind, IncomingStream, TcpConnector,
-    BT_HANDSHAKE_HEAD,
+    boxed_stream, BoxedPeerStream, Connector, IncomingKind, IncomingStream, RacingConnector,
+    TcpConnector, BT_HANDSHAKE_HEAD,
 };
 use crate::utils;
+pub use crate::utp::UtpOptions;
+use crate::utp::{UtpBindState, UtpConnector, UtpSocket};
 use dashmap::DashMap;
 use flume::Receiver;
 use tokio::net::TcpListener;
@@ -70,6 +72,7 @@ pub struct SessionOptions {
     pub state_dir: Option<PathBuf>,
     pub dht: DhtOptions,
     pub encryption: EncryptionPolicy,
+    pub utp: UtpOptions,
 }
 
 impl Default for SessionOptions {
@@ -81,6 +84,7 @@ impl Default for SessionOptions {
             state_dir: Some(util::paths::state_dir()),
             dht: DhtOptions::default(),
             encryption: EncryptionPolicy::default(),
+            utp: UtpOptions::default(),
         }
     }
 }
@@ -123,6 +127,8 @@ pub struct Session {
     connector: Arc<dyn Connector>,
     pending: Arc<DashMap<[u8; 20], Arc<PendingTorrent>>>,
     dht: Arc<Mutex<Option<DhtHandle>>>,
+    utp: Arc<Mutex<Option<Arc<UtpSocket>>>>,
+    utp_bind: tokio::sync::watch::Sender<UtpBindState>,
     owns_lifecycle: bool,
 }
 
@@ -313,16 +319,40 @@ impl AddTorrentResult {
     }
 }
 
+fn bind_tcp_listener(port: u16) -> std::io::Result<TcpListener> {
+    let std_listener = std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))?;
+    std_listener.set_nonblocking(true)?;
+    TcpListener::from_std(std_listener)
+}
+
 impl Session {
     pub fn new() -> Self {
         Self::with_options(SessionOptions::default())
     }
 
     pub fn with_options(options: SessionOptions) -> Self {
-        Self::with_connector(options, Arc::new(TcpConnector::new()))
+        let (utp_tx, utp_rx) = tokio::sync::watch::channel(None);
+        let connector: Arc<dyn Connector> = if options.utp.enabled {
+            Arc::new(RacingConnector::new(
+                UtpConnector::deferred(utp_rx),
+                TcpConnector::new(),
+            ))
+        } else {
+            Arc::new(TcpConnector::new())
+        };
+        Self::with_connector_and_utp(options, connector, utp_tx)
     }
 
     pub fn with_connector(options: SessionOptions, connector: Arc<dyn Connector>) -> Self {
+        let (utp_tx, _utp_rx) = tokio::sync::watch::channel(None);
+        Self::with_connector_and_utp(options, connector, utp_tx)
+    }
+
+    fn with_connector_and_utp(
+        options: SessionOptions,
+        connector: Arc<dyn Connector>,
+        utp_bind: tokio::sync::watch::Sender<UtpBindState>,
+    ) -> Self {
         let connector: Arc<dyn Connector> =
             Arc::new(MseConnector::new(connector, options.encryption));
         let session = Self {
@@ -337,6 +367,8 @@ impl Session {
             connector,
             pending: Arc::new(DashMap::new()),
             dht: Arc::new(Mutex::new(None)),
+            utp: Arc::new(Mutex::new(None)),
+            utp_bind,
             owns_lifecycle: true,
         };
         session
@@ -360,6 +392,8 @@ impl Session {
             connector: self.connector.clone(),
             pending: self.pending.clone(),
             dht: self.dht.clone(),
+            utp: self.utp.clone(),
+            utp_bind: self.utp_bind.clone(),
             owns_lifecycle: false,
         }
     }
@@ -438,6 +472,20 @@ impl Session {
             .unwrap_or(self.options.listen_port)
     }
 
+    /// Loopback-facing address of the dedicated uTP UDP socket.
+    pub fn utp_local_addr(&self) -> Option<SocketAddr> {
+        let socket = self.utp.lock().unwrap().clone()?;
+        let addr = socket.local_addr().ok()?;
+        if addr.ip().is_unspecified() {
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                addr.port(),
+            ))
+        } else {
+            Some(addr)
+        }
+    }
+
     pub async fn wait_listening(&self) -> SocketAddr {
         loop {
             if let Some(addr) = *self.listen_addr.lock().unwrap() {
@@ -494,26 +542,34 @@ impl Session {
         let dht = self.dht.clone();
         let encryption = self.options.encryption;
 
-        tokio::spawn(async move {
-            let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
-            let listener = match TcpListener::bind(bind_addr).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    warn!(port, error = %e, "failed to bind listen port");
-                    return;
+        let listener = match bind_tcp_listener(port) {
+            Ok(listener) => listener,
+            Err(e) => {
+                warn!(port, error = %e, "failed to bind listen port");
+                if self.options.utp.enabled {
+                    let _ = self.utp_bind.send(Some(Err(())));
                 }
-            };
-            match listener.local_addr() {
-                Ok(addr) => {
-                    info!(%addr, "listening for incoming peers");
-                    *listen_addr.lock().unwrap() = Some(addr);
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to read listen address");
-                    return;
-                }
+                return;
             }
+        };
+        match listener.local_addr() {
+            Ok(addr) => {
+                info!(%addr, "listening for incoming peers");
+                *listen_addr.lock().unwrap() = Some(addr);
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to read listen address");
+                if self.options.utp.enabled {
+                    let _ = self.utp_bind.send(Some(Err(())));
+                }
+                return;
+            }
+        }
+        if self.options.utp.enabled {
+            self.bind_utp();
+        }
 
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -555,6 +611,63 @@ impl Session {
                                 },
                             )
                             .await;
+                        });
+                    }
+                }
+            }
+        });
+        if let Some(socket) = self.utp.lock().unwrap().clone() {
+            self.spawn_utp_accept(socket);
+        }
+    }
+
+    fn bind_utp(&self) {
+        let port = if self.options.utp.port != 0 {
+            self.options.utp.port
+        } else {
+            self.listen_port()
+        };
+        let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let socket = match UtpSocket::bind_std(bind_addr) {
+            Ok(socket) => socket,
+            Err(e) => {
+                warn!(port, error = %e, "uTP bind failed, trying an ephemeral port");
+                match UtpSocket::bind_std(SocketAddr::from(([0, 0, 0, 0], 0))) {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        warn!(error = %e, "failed to bind uTP socket");
+                        let _ = self.utp_bind.send(Some(Err(())));
+                        return;
+                    }
+                }
+            }
+        };
+        if let Ok(addr) = socket.local_addr() {
+            info!(%addr, "listening for incoming uTP peers");
+        }
+        let socket = Arc::new(socket);
+        *self.utp.lock().unwrap() = Some(socket.clone());
+        let _ = self.utp_bind.send(Some(Ok(socket)));
+    }
+
+    fn spawn_utp_accept(&self, socket: Arc<UtpSocket>) {
+        let cancel = self.cancel.clone();
+        let ctx = self.incoming_context();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    accepted = socket.accept() => {
+                        let (stream, addr) = match accepted {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                debug!(error = %e, "uTP accept failed");
+                                break;
+                            }
+                        };
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            accept_incoming_utp(boxed_stream(stream), addr, ctx).await;
                         });
                     }
                 }
@@ -1550,6 +1663,7 @@ impl PeerInlet {
     }
 }
 
+#[derive(Clone)]
 pub struct IncomingPeerContext {
     pub peer_id: [u8; 20],
     pub torrents: Arc<DashMap<[u8; 20], Arc<TorrentSession>>>,
@@ -1594,8 +1708,24 @@ impl Session {
 
 /// Handshake lookup shared by the TCP listener and later uTP accepts.
 pub async fn accept_incoming(stream: BoxedPeerStream, addr: SocketAddr, ctx: IncomingPeerContext) {
+    accept_incoming_kind(stream, addr, ctx, false).await;
+}
+
+async fn accept_incoming_utp(stream: BoxedPeerStream, addr: SocketAddr, ctx: IncomingPeerContext) {
+    accept_incoming_kind(stream, addr, ctx, true).await;
+}
+
+async fn accept_incoming_kind(
+    stream: BoxedPeerStream,
+    addr: SocketAddr,
+    ctx: IncomingPeerContext,
+    utp: bool,
+) {
     let incoming = match peek_incoming(stream, addr).await {
-        Ok(incoming) => incoming,
+        Ok(mut incoming) => {
+            incoming.utp = utp;
+            incoming
+        }
         Err(e) => {
             debug!(%addr, error = %e, "incoming peek failed");
             return;
@@ -1629,6 +1759,7 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         mut stream,
         addr,
         kind,
+        utp,
     } = incoming;
     debug!(%addr, ?kind, "accepting incoming peer");
     let mut encrypted = false;
@@ -1729,6 +1860,7 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         choke_notify: target.choke_notify,
         incoming: Some(stream),
         incoming_encrypted: encrypted,
+        incoming_utp: utp,
         encryption: ctx.encryption,
         global_peers: ctx.global_peers,
         max_peers_per_torrent: ctx.max_peers_per_torrent,
@@ -1822,6 +1954,7 @@ fn spawn_from_session(
         incoming_extension_protocol: None,
         incoming_dht: None,
         incoming_encrypted: false,
+        incoming_utp: false,
         encryption,
         extensions,
         listen_port,
@@ -1873,6 +2006,7 @@ fn spawn_from_pending(
         incoming_extension_protocol: None,
         incoming_dht: None,
         incoming_encrypted: false,
+        incoming_utp: false,
         encryption,
         extensions,
         listen_port,
@@ -2156,6 +2290,44 @@ mod incoming_tests {
         );
 
         drop(remote_task);
+        session.shutdown();
+    }
+
+    #[tokio::test]
+    async fn utp_enabled_binds_a_dedicated_udp_socket() {
+        let session = Session::with_options(SessionOptions {
+            listen_port: 0,
+            state_dir: None,
+            utp: crate::utp::UtpOptions {
+                enabled: true,
+                port: 0,
+            },
+            ..SessionOptions::default()
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.wait_listening()).await;
+        let tcp = session.wait_listening().await;
+        let utp = session.utp_local_addr().expect("uTP bound");
+        assert_eq!(
+            utp.port(),
+            tcp.port(),
+            "uTP uses the TCP listen port number"
+        );
+        session.shutdown();
+    }
+
+    #[tokio::test]
+    async fn utp_disabled_does_not_bind() {
+        let session = Session::with_options(SessionOptions {
+            listen_port: 0,
+            state_dir: None,
+            utp: crate::utp::UtpOptions {
+                enabled: false,
+                port: 0,
+            },
+            ..SessionOptions::default()
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.wait_listening()).await;
+        assert!(session.utp_local_addr().is_none());
         session.shutdown();
     }
 }

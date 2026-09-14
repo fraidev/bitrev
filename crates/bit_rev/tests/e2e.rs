@@ -707,3 +707,86 @@ async fn e2e_plaintext_leecher_joins_prefer_encrypted_seeder() {
     leecher.shutdown();
     seeder.shutdown();
 }
+
+async fn session_with_utp() -> Session {
+    let session = Session::with_options(SessionOptions {
+        listen_port: 0,
+        state_dir: None,
+        encryption: EncryptionPolicy::Disabled,
+        dht: bit_rev::session::DhtOptions {
+            enabled: false,
+            ..bit_rev::session::DhtOptions::default()
+        },
+        utp: bit_rev::session::UtpOptions {
+            enabled: true,
+            port: 0,
+        },
+        ..SessionOptions::default()
+    });
+    tokio::time::timeout(LISTEN_TIMEOUT, session.wait_listening())
+        .await
+        .expect("session listen timeout");
+    session
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_utp_two_sessions_through_lossy_relay() {
+    let fixture = Arc::new(TorrentFixture::single(
+        64 * 1024,
+        DEFAULT_PIECE_LENGTH,
+        0x5570_0005,
+    ));
+
+    let seed_dir = unique_temp_dir();
+    let seed_path = fixture.session_output(seed_dir.path());
+    std::fs::copy(&fixture.files[0].disk_path, &seed_path).expect("copy seed payload");
+
+    let seeder = session_with_utp().await;
+    seeder
+        .add_torrent(
+            AddTorrentOptions::from(fixture.torrent_meta.clone())
+                .output_dir(seed_path)
+                .seed(true),
+        )
+        .await
+        .expect("add seeder");
+    let _ = seeder.wait_listening().await;
+    let seeder_utp = seeder.utp_local_addr().expect("seeder uTP socket");
+
+    let relay = bit_rev::utp::LossyRelay::bind(bit_rev::utp::RelayConfig::lossy(0.05))
+        .await
+        .expect("lossy relay");
+    relay.set_backend(seeder_utp);
+
+    let download_dir = unique_temp_dir();
+    let output = fixture.session_output(download_dir.path());
+    let leecher = session_with_utp().await;
+    let added = add_download(&leecher, fixture.torrent_meta.clone(), output.clone()).await;
+    assert!(
+        leecher.connect_peer(&fixture.torrent_meta.info_hash, relay.local_addr()),
+        "leecher should dial the seeder through the uTP relay"
+    );
+    wait_for_completion(
+        &added.pr_rx,
+        &added.torrent,
+        &added.already_have,
+        Duration::from_secs(60),
+    )
+    .await;
+    fixture.assert_output_matches(&output);
+
+    let leecher_torrent = leecher
+        .torrent_session(&fixture.torrent_meta.info_hash)
+        .expect("leecher torrent");
+    assert!(
+        leecher_torrent
+            .peer_states
+            .states
+            .iter()
+            .any(|entry| entry.utp),
+        "lossy uTP download should mark the peer as utp"
+    );
+
+    leecher.shutdown();
+    seeder.shutdown();
+}
