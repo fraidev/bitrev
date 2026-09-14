@@ -1997,6 +1997,7 @@ impl PeerConnection {
     ) -> anyhow::Result<(BoxedPeerStream, crate::handshake::Handshake)> {
         let mut stream = connected.stream;
         self.mark_encrypted(connected.encrypted);
+        self.mark_utp(connected.utp);
         let handshake = if connected.sent_initial_payload {
             Protocol::read_handshake(&mut stream).await?
         } else {
@@ -2014,6 +2015,15 @@ impl PeerConnection {
         }
         if let Some(mut state) = self.handler.peers_state.states.get_mut(&self.peer) {
             state.encrypted = true;
+        }
+    }
+
+    fn mark_utp(&self, utp: bool) {
+        if !utp {
+            return;
+        }
+        if let Some(mut state) = self.handler.peers_state.states.get_mut(&self.peer) {
+            state.utp = true;
         }
     }
 
@@ -2324,6 +2334,7 @@ pub struct SpawnPeerParams {
     pub incoming_extension_protocol: Option<bool>,
     pub incoming_dht: Option<bool>,
     pub incoming_encrypted: bool,
+    pub incoming_utp: bool,
     pub encryption: EncryptionPolicy,
     pub extensions: ExtensionRegistry,
     pub listen_port: u16,
@@ -2420,6 +2431,11 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
         if params.incoming_encrypted {
             if let Some(mut state) = params.peer_states.states.get_mut(&params.peer) {
                 state.encrypted = true;
+            }
+        }
+        if params.incoming_utp {
+            if let Some(mut state) = params.peer_states.states.get_mut(&params.peer) {
+                state.utp = true;
             }
         }
         let connection = PeerConnection::new(

@@ -79,3 +79,10 @@ path = "fuzz_targets/krpc_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "utp_header"
+path = "fuzz_targets/utp_header.rs"
+test = false
+doc = false
+bench = false
