@@ -1,0 +1,45 @@
+name: Interop
+
+on:
+  schedule:
+    - cron: "29 5 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: Client interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run non-skipped scenarios
+        run: |
+          set -euo pipefail
+          for scenario in \
+            download-from-transmission \
+            seed-to-transmission \
+            download-from-qbittorrent \
+            seed-to-qbittorrent \
+            mixed-swarm \
+            private-torrent
+          do
+            echo "::group::${scenario}"
+            interop/run.sh "${scenario}"
+            echo "::endgroup::"
+          done
+
+      - name: Upload interop artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-out
+          path: interop/out/
+          if-no-files-found: ignore

@@ -20,7 +20,17 @@ use bit_rev::session::{AddTorrentOptions, AddTorrentResult, PieceResult, Session
 use bit_rev::torrent::Torrent;
 use tempfile::TempDir;
 
-pub use fixture::{FileSpec, TorrentFixture};
+pub use fixture::{FileSpec, PersistedFixture, TorrentFixture};
+
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 pub use http_tracker::{HttpAnnounceBody, MockHttpTracker, RecordedHttpRequest};
 pub use seeder::{SeederConfig, SeederPeer};
 pub use udp_tracker::{MockUdpTracker, RecordedUdpAnnounce, UdpAnnounceBody};
@@ -207,5 +217,40 @@ mod tests {
         assert!(crate::peak_rss_bytes().is_some_and(|n| n > 0));
         #[cfg(not(unix))]
         assert!(crate::peak_rss_bytes().is_none());
+    }
+
+    #[test]
+    fn hex_encode_lower_nibble() {
+        assert_eq!(crate::hex_encode(&[0x00, 0xab, 0xff]), "00abff");
+    }
+
+    #[test]
+    fn private_fixture_round_trip_and_persist() {
+        let fixture = crate::TorrentFixture::builder()
+            .single_file("payload.bin", 32 * 1024)
+            .piece_length(16 * 1024)
+            .announce("http://tracker:6969/announce")
+            .private(true)
+            .build();
+        assert!(fixture.torrent_meta.torrent_file.info.is_private());
+        assert!(!fixture.torrent().allows_dht());
+        assert!(!fixture.torrent().allows_pex());
+
+        let dir = crate::unique_temp_dir();
+        let persisted = fixture.persist_to(dir.path());
+        assert!(persisted.torrent_path.is_file());
+        assert!(persisted.data_dir.join("payload.bin").is_file());
+        assert_eq!(persisted.sha1_hex, fixture.payload_sha1_hex());
+        assert_eq!(
+            crate::hex_encode(&crate::sha1_file(&persisted.data_dir.join("payload.bin"))),
+            persisted.sha1_hex
+        );
+        let reloaded = bit_rev::file::from_filename(persisted.torrent_path.to_str().unwrap())
+            .expect("reload persisted torrent");
+        assert!(reloaded.torrent_file.info.is_private());
+        assert_eq!(
+            crate::hex_encode(&reloaded.info_hash),
+            persisted.info_hash_hex
+        );
     }
 }

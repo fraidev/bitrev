@@ -4,6 +4,7 @@ members = [
     "crates/cli",
     "crates/util",
     "crates/testkit",
+    "crates/interop",
 ]
 default-members = [
     "crates/bit_rev",

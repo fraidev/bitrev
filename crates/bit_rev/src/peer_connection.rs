@@ -1310,17 +1310,15 @@ impl PeerHandler {
             debug!("upload queue full, dropping request {:?}", req);
             self.send_reject(req);
             drop(queue);
-            self.request_storm
-                .lock()
-                .unwrap()
-                .on_queue_overflow()
-                .map_err(|_| anyhow::anyhow!("upload queue exceeded repeatedly"))?;
+            if let Some(state) = self.peers_state.states.get(&self.peer) {
+                state.stats.upload_notify.notify_one();
+            }
             return Ok(());
         }
         queue.push_back(req);
         drop(queue);
         if let Some(state) = self.peers_state.states.get(&self.peer) {
-            state.stats.upload_notify.notify_waiters();
+            state.stats.upload_notify.notify_one();
         }
         Ok(())
     }
@@ -1653,6 +1651,15 @@ impl PeerHandler {
                 debug!("peer is interested");
                 if let Some(mut state) = self.peers_state.states.get_mut(&self.peer) {
                     state.set_peer_interested(true);
+                    if self.downloaded().is_complete()
+                        && state.stats.am_choking.load(Ordering::Relaxed)
+                    {
+                        state.set_am_choking(false);
+                        if let Some(tx) = &state.writer_tx {
+                            let _ = tx.send(WriterRequest::Message(Message::Unchoke));
+                        }
+                        state.stats.upload_notify.notify_one();
+                    }
                 }
                 self.choke_notify.notify_waiters();
             }

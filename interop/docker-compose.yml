@@ -1,0 +1,144 @@
+name: bitrevinterop
+
+# Isolated bridge. RPC/WebUI ports are published on loopback for the host
+# runner. Peer ports stay on the compose network so clients see each other
+# by container DNS (tracker, transmission, qbittorrent, libtorrent, bitrev).
+
+services:
+  tracker:
+    image: wiltonsr/opentracker:open
+    platform: linux/amd64
+    restart: "no"
+    expose:
+      - "6969/tcp"
+      - "6969/udp"
+    networks:
+      btnet:
+        aliases: [tracker]
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+
+  transmission:
+    image: lscr.io/linuxserver/transmission:4.1.3
+    restart: "no"
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: Etc/UTC
+      USER: interop
+      PASS: interop
+      PEERPORT: "51413"
+    volumes:
+      - ${TRANSMISSION_CONFIG}:/config
+      - ${SHARED_DIR}:/shared
+    ports:
+      - "127.0.0.1:19091:9091"
+    expose:
+      - "51413/tcp"
+      - "51413/udp"
+    networks:
+      btnet:
+        aliases: [transmission]
+    depends_on: [tracker]
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:5.2.3
+    restart: "no"
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: Etc/UTC
+      WEBUI_PORT: "8080"
+      TORRENTING_PORT: "6881"
+    volumes:
+      - ${QBITTORRENT_CONFIG}:/config
+      - ${SHARED_DIR}:/shared
+    ports:
+      - "127.0.0.1:18080:8080"
+    expose:
+      - "6881/tcp"
+      - "6881/udp"
+    networks:
+      btnet:
+        aliases: [qbittorrent]
+    depends_on: [tracker]
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+
+  libtorrent:
+    build:
+      context: ./images/libtorrent
+    image: bitrev-interop-libtorrent:local
+    restart: "no"
+    command: ["-c", "import time; time.sleep(3600)"]
+    volumes:
+      - ${INTEROP_DIR}:/interop:ro
+      - ${SHARED_DIR}:/shared
+      - ${SCENARIO_OUT}:/out
+    expose:
+      - "6882/tcp"
+      - "6882/udp"
+    networks:
+      btnet:
+        aliases: [libtorrent]
+    depends_on: [tracker]
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+
+  bitrev:
+    build:
+      context: ./images/runtime
+      args:
+        BASE: ${BITREV_RUNTIME_BASE:-debian:bookworm-slim}
+    image: bitrev-interop-runtime:local
+    restart: "no"
+    profiles: ["bitrev"]
+    volumes:
+      - ${INTEROP_BIN}:/usr/local/bin/bitrev-interop:ro
+      - ${SHARED_DIR}:/shared
+      - ${SCENARIO_OUT}:/out
+    working_dir: /shared
+    networks:
+      btnet:
+        aliases: [bitrev]
+    depends_on: [tracker]
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:4.0.20
+    restart: "no"
+    profiles: ["sonarr"]
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: Etc/UTC
+    volumes:
+      - ${SHARED_DIR}/sonarr-config:/config
+      - ${SHARED_DIR}:/shared
+    ports:
+      - "127.0.0.1:18989:8989"
+    networks:
+      btnet:
+        aliases: [sonarr]
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+
+networks:
+  btnet:
+    driver: bridge
+    internal: false

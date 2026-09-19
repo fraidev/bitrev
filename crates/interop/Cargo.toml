@@ -1,0 +1,21 @@
+[package]
+name = "interop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Fixture generator and bitrev driver for the Docker interop harness"
+
+[[bin]]
+name = "bitrev-interop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bit_rev = { path = "../bit_rev" }
+clap.workspace = true
+flume.workspace = true
+sha1_smol.workspace = true
+testkit = { path = "../testkit" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
