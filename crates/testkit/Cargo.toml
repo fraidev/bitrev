@@ -1,0 +1,20 @@
+[package]
+name = "testkit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared fixtures and in-process peers for bitrev tests, benches, and examples"
+
+[dependencies]
+bit_rev = { path = "../bit_rev" }
+anyhow.workspace = true
+flume.workspace = true
+libc = "0.2"
+rand.workspace = true
+serde.workspace = true
+serde_bencode.workspace = true
+serde_bytes.workspace = true
+sha1_smol.workspace = true
+tempfile = "3.10"
+tokio.workspace = true
+tokio-util.workspace = true

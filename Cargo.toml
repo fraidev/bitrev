@@ -3,11 +3,13 @@ members = [
     "crates/bit_rev",
     "crates/cli",
     "crates/util",
+    "crates/testkit",
 ]
 default-members = [
     "crates/bit_rev",
     "crates/cli",
     "crates/util",
+    "crates/testkit",
 ]
 resolver = "3"
 edition = "2024"

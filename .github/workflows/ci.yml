@@ -70,6 +70,27 @@ jobs:
     - name: Run cargo build (release)
       run: cargo build --release --all-features --workspace
 
+  bench-smoke:
+    name: Bench smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v4
+
+    - name: Install toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Micro bench smoke
+      run: cargo bench -- --test
+
+    - name: Macro bench smoke
+      run: |
+        set -euo pipefail
+        cargo run --release -p bit_rev --example bench_swarm -- --size-mib 64 --json \
+          | tee /tmp/bench_swarm.json
+        python3 -c "import json; json.load(open('/tmp/bench_swarm.json'))"
+
   security_audit:
     name: Security Audit
     runs-on: ubuntu-latest
