@@ -15,9 +15,7 @@ use crate::session::{AddTorrentOptions, Session, SessionOptions};
 use crate::utils;
 
 fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut hasher = sha1_smol::Sha1::new();
-    hasher.update(data);
-    hasher.digest().bytes()
+    utils::sha1_digest(data)
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

@@ -51,13 +51,16 @@ impl TokenSecrets {
 }
 
 fn hash_token(secret: &[u8; 16], ip: IpAddr) -> [u8; 20] {
-    let mut hasher = sha1_smol::Sha1::new();
-    hasher.update(secret);
     match ip {
-        IpAddr::V4(v4) => hasher.update(&v4.octets()),
-        IpAddr::V6(v6) => hasher.update(&v6.octets()),
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            crate::utils::sha1_parts(&[secret, &octets])
+        }
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            crate::utils::sha1_parts(&[secret, &octets])
+        }
     }
-    hasher.digest().bytes()
 }
 
 #[cfg(test)]

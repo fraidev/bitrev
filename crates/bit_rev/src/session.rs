@@ -19,9 +19,11 @@ use crate::protocol::Protocol;
 use crate::resume::{self, ResumeSnapshot};
 
 pub use crate::dht::{DhtOptions, DhtStats};
+use crate::hash::PieceHasher;
 use crate::mse::{self, EncryptionPolicy, MseConnector};
 pub use crate::resume::ResumeStatus;
-use crate::storage::Storage;
+pub use crate::storage::Preallocate;
+use crate::storage::{Storage, StorageOptions};
 use crate::torrent::Torrent;
 use crate::tracker_peers::TrackerPeers;
 use crate::transport::{
@@ -73,6 +75,9 @@ pub struct SessionOptions {
     pub dht: DhtOptions,
     pub encryption: EncryptionPolicy,
     pub utp: UtpOptions,
+    pub preallocate: Preallocate,
+    /// Piece LRU for the seeding read path. 0 disables it (the default).
+    pub piece_cache_pieces: usize,
 }
 
 impl Default for SessionOptions {
@@ -85,6 +90,8 @@ impl Default for SessionOptions {
             dht: DhtOptions::default(),
             encryption: EncryptionPolicy::default(),
             utp: UtpOptions::default(),
+            preallocate: Preallocate::default(),
+            piece_cache_pieces: 0,
         }
     }
 }
@@ -130,6 +137,7 @@ pub struct Session {
     utp: Arc<Mutex<Option<Arc<UtpSocket>>>>,
     utp_bind: tokio::sync::watch::Sender<UtpBindState>,
     owns_lifecycle: bool,
+    hasher: Arc<PieceHasher>,
 }
 
 pub(crate) struct PendingTorrent {
@@ -370,6 +378,7 @@ impl Session {
             utp: Arc::new(Mutex::new(None)),
             utp_bind,
             owns_lifecycle: true,
+            hasher: Arc::new(PieceHasher::new()),
         };
         session
             .extensions
@@ -395,6 +404,7 @@ impl Session {
             utp: self.utp.clone(),
             utp_bind: self.utp_bind.clone(),
             owns_lifecycle: false,
+            hasher: self.hasher.clone(),
         }
     }
 
@@ -918,7 +928,16 @@ impl Session {
             name,
             private: false,
         });
-        let storage = Storage::open(&torrent, &output_dir).await?;
+        let storage = Storage::open_with(
+            &torrent,
+            &output_dir,
+            StorageOptions {
+                preallocate: Preallocate::Off,
+                piece_cache_pieces: 0,
+                hasher: self.hasher.clone(),
+            },
+        )
+        .await?;
         let (piece_tx, _piece_rx) = flume::unbounded();
         let (pr_tx, pr_rx) = flume::unbounded();
         let pending = Arc::new(PendingTorrent {
@@ -1029,7 +1048,20 @@ impl Session {
             _ => false,
         };
 
-        let storage = Storage::open(&torrent, &output_dir).await?;
+        let storage = Storage::open_with(
+            &torrent,
+            &output_dir,
+            StorageOptions {
+                preallocate: if seed {
+                    Preallocate::Off
+                } else {
+                    self.options.preallocate
+                },
+                piece_cache_pieces: self.options.piece_cache_pieces,
+                hasher: self.hasher.clone(),
+            },
+        )
+        .await?;
 
         let (pr_tx, pr_rx) = if let Some(pending) = reuse.as_ref() {
             (pending.pr_tx.clone(), pending.pr_rx.clone())
@@ -1236,9 +1268,19 @@ impl Session {
                     continue;
                 }
                 if downloaded_writer.is_complete() {
-                    let mut done = persist_completed_at.lock().unwrap();
-                    if done.is_none() {
-                        *done = Some(resume::now_unix());
+                    let should_sync = {
+                        let mut done = persist_completed_at.lock().unwrap();
+                        if done.is_none() {
+                            *done = Some(resume::now_unix());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_sync {
+                        if let Err(e) = storage_writer.sync_all().await {
+                            debug!(error = %e, "failed to sync files on completion");
+                        }
                     }
                 }
                 if let Some(state_dir) = persist_state_dir.as_ref() {
@@ -2175,9 +2217,7 @@ mod incoming_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn sha1(data: &[u8]) -> [u8; 20] {
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(data);
-        hasher.digest().bytes()
+        utils::sha1_digest(data)
     }
 
     fn tiny_meta() -> TorrentMeta {

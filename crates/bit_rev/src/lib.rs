@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod extension;
 pub mod file;
 pub mod handshake;
+pub mod hash;
 pub mod identity;
 pub mod magnet;
 pub mod message;

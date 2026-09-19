@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context};
 use bit_rev::config::{Config, EncryptionMode};
+use bit_rev::session::Preallocate;
 
 use crate::args::Cli;
 
@@ -87,6 +88,9 @@ fn apply_env(config: &mut Config, env: &impl Fn(&str) -> Option<String>) -> anyh
     }
     if let Some(v) = env("BITREV_DOWNLOAD_DIR") {
         config.download_dir = PathBuf::from(v);
+    }
+    if let Some(v) = env("BITREV_PREALLOCATE") {
+        config.preallocate = parse_preallocate(&v)?;
     }
     if let Some(v) = env_parse(env, "BITREV_MAX_PEERS_PER_TORRENT")? {
         config.max_peers_per_torrent = v;
@@ -209,6 +213,15 @@ fn parse_bool(key: &str, value: &str) -> anyhow::Result<bool> {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
         _ => anyhow::bail!("invalid boolean for {key}: {value}"),
+    }
+}
+
+fn parse_preallocate(value: &str) -> anyhow::Result<Preallocate> {
+    match value {
+        "sparse" => Ok(Preallocate::Sparse),
+        "full" => Ok(Preallocate::Full),
+        "off" => Ok(Preallocate::Off),
+        _ => anyhow::bail!("invalid BITREV_PREALLOCATE: {value}"),
     }
 }
 

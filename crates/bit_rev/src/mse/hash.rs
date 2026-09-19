@@ -1,9 +1,5 @@
 pub fn sha1(parts: &[&[u8]]) -> [u8; 20] {
-    let mut hasher = sha1_smol::Sha1::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.digest().bytes()
+    crate::utils::sha1_parts(parts)
 }
 
 pub fn hash_req1(s: &[u8; 96]) -> [u8; 20] {

@@ -86,9 +86,7 @@ fn bench_message_parse(c: &mut Criterion) {
 }
 
 fn sha1_of(data: &[u8]) -> [u8; 20] {
-    let mut hasher = sha1_smol::Sha1::new();
-    hasher.update(data);
-    hasher.digest().bytes()
+    bit_rev::utils::sha1_digest(data)
 }
 
 fn bench_sha1_piece(c: &mut Criterion) {

@@ -152,6 +152,29 @@ a paper.
 | message_parse / piece_16kib | 407.05 ns |
 | sha1_piece / 256kib | 211.22 µs |
 | sha1_piece / 1mib | 839.25 µs |
+
+## After storage (#75)
+
+Same machine. `sha1` crate (hardware SHA-1) replaced `sha1_smol` for
+piece hashing. Positional I/O, sparse preallocation, hashing on
+`spawn_blocking`.
+
+Command:
+`cargo run --release -p bit_rev --example bench_swarm -- --size-mib 1024 --seeders 4 --json`
+
+### Localhost swarm (1 GiB, 256 KiB pieces, 4 session seeders)
+
+| | wall-clock | MiB/s | peak RSS | user CPU | sys CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| before | 15.844 s | 64.63 | 1095024640 B | 3.297 s | 6.005 s |
+| after | 1.987 s | 515.27 | 29474816 B | 2.499 s | 3.477 s |
+
+### sha1_piece (criterion median)
+
+| bench | before (`sha1_smol`) | after (`sha1`) |
+| --- | ---: | ---: |
+| 256kib | 211.22 µs | 185.90 µs |
+| 1mib | 839.25 µs | 738.42 µs |
 | map_piece_to_files / 128_files | 1.227 µs |
 | build_tracker_url | 393.21 ns |
 | resume / encode | 1.244 µs |

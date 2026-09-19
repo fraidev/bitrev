@@ -26,9 +26,7 @@ pub fn generate_allowed_fast(
     let mut seen = HashSet::with_capacity(target);
 
     while set.len() < target {
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(&x);
-        let digest = hasher.digest().bytes();
+        let digest = crate::utils::sha1_digest(&x);
         x.clear();
         x.extend_from_slice(&digest);
 

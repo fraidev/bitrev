@@ -468,6 +468,12 @@ impl TorrentDownloadedState {
         }
     }
 
+    pub fn clear_piece_chunks(&self, index: u32) {
+        if let Some(pw) = self.pieces.get(index as usize) {
+            pw.chuncks.lock().unwrap().clear();
+        }
+    }
+
     /// First successful hash for this piece wins. Write failure clears via `remove_downloaded`.
     pub fn claim_write(&self, index: u32) -> bool {
         self.pieces
@@ -1625,7 +1631,10 @@ impl PeerHandler {
         }
     }
 
-    fn on_received_message(&self, message: crate::message::Message) -> Result<(), anyhow::Error> {
+    async fn on_received_message(
+        &self,
+        message: crate::message::Message,
+    ) -> Result<(), anyhow::Error> {
         self.drain_download_cancels();
         match message {
             Message::Choke => {
@@ -1791,10 +1800,13 @@ impl PeerHandler {
                     .set_downloaded_if_all_chunks(piece_chunk.index)
                 {
                     let buf = full_piece.chunk_to_buf();
+                    let expected = full_piece.piece_work.hash;
+                    let (buf, ok) = self.storage().hasher().verify_owned(expected, buf).await;
 
-                    if utils::check_integrity(full_piece.piece_work.hash.as_ref(), &buf) {
+                    if ok {
                         trace!("piece index {} is correct", piece_chunk.index);
                         if self.downloaded().claim_write(piece_chunk.index) {
+                            self.downloaded().clear_piece_chunks(piece_chunk.index);
                             let full_piece = FullPiece {
                                 index: piece_chunk.index,
                                 length: full_piece.piece_work.length,
@@ -2267,7 +2279,7 @@ impl PeerConnection {
                     Frame::Message(msg) => {
                         last_inbound = tokio::time::Instant::now();
                         seen_first = true;
-                        if let Err(e) = self.handler.on_received_message(msg) {
+                        if let Err(e) = self.handler.on_received_message(msg).await {
                             debug!("error processing message: {:?}", e);
                             break;
                         }
@@ -2840,9 +2852,7 @@ mod tests {
     }
 
     fn sha1(data: &[u8]) -> [u8; 20] {
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(data);
-        hasher.digest().bytes()
+        crate::utils::sha1_digest(data)
     }
 
     fn tiny_meta() -> crate::file::TorrentMeta {

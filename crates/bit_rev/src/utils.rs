@@ -27,11 +27,21 @@ pub fn calculate_block_size(piece_length: u32, requested: u32) -> u32 {
     BLOCK_SIZE
 }
 
+pub fn sha1_digest(buf: &[u8]) -> [u8; 20] {
+    sha1_parts(&[buf])
+}
+
+pub fn sha1_parts(parts: &[&[u8]]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
 pub fn check_integrity(hash: &[u8], buf: &[u8]) -> bool {
-    let mut hasher = sha1_smol::Sha1::new();
-    hasher.update(buf);
-    let result = hasher.digest().bytes();
-    result == hash
+    sha1_digest(buf) == hash
 }
 
 pub fn generate_peer_id() -> [u8; 20] {
