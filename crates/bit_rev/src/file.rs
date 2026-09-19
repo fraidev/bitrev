@@ -92,9 +92,7 @@ impl TorrentMeta {
     pub fn new(torrent_file: TorrentFile) -> Result<Self> {
         validate_torrent_file(&torrent_file)?;
         let info_bytes: Arc<[u8]> = ser::to_bytes(&torrent_file.info)?.into();
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(&info_bytes);
-        let info_hash = hasher.digest().bytes();
+        let info_hash = crate::utils::sha1_digest(&info_bytes);
         Ok(Self::from_validated(torrent_file, info_hash, info_bytes))
     }
 
@@ -114,9 +112,7 @@ impl TorrentMeta {
             created_by: None,
         };
         validate_torrent_file(&torrent_file)?;
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(info_bytes.as_ref());
-        let info_hash = hasher.digest().bytes();
+        let info_hash = crate::utils::sha1_digest(info_bytes.as_ref());
         Ok(Self::from_validated(torrent_file, info_hash, info_bytes))
     }
 
@@ -148,9 +144,7 @@ pub fn from_bytes(content: &[u8]) -> Result<TorrentMeta> {
     let torrent = de::from_bytes::<TorrentFile>(content)?;
     validate_torrent_file(&torrent)?;
     let info_bytes = raw_info_dict(content)?;
-    let mut hasher = sha1_smol::Sha1::new();
-    hasher.update(info_bytes);
-    let info_hash = hasher.digest().bytes();
+    let info_hash = crate::utils::sha1_digest(info_bytes);
     Ok(TorrentMeta::from_validated(
         torrent,
         info_hash,
@@ -906,9 +900,7 @@ mod tests {
         assert_eq!(meta.info_hash, decode_info_hash(EXTRA_INFO_HASH_HEX));
 
         let raw_info = raw_info_dict(&bytes).expect("raw info");
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(raw_info);
-        assert_eq!(meta.info_hash, hasher.digest().bytes());
+        assert_eq!(meta.info_hash, crate::utils::sha1_digest(raw_info));
         assert_eq!(meta.info_bytes.as_ref(), raw_info);
 
         let reencoded = ser::to_bytes(&meta.torrent_file.info).expect("re-encode info");

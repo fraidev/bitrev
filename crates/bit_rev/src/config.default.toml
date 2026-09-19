@@ -5,6 +5,9 @@
 # Directory where torrent data is written.
 download_dir = "."
 
+# File preallocation: sparse | full | off
+preallocate = "sparse"
+
 # TCP listen port announced to trackers.
 port = 6881
 

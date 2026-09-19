@@ -259,9 +259,7 @@ impl MetadataStore {
         }
         assembled.truncate(fetch.size);
 
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(&assembled);
-        if hasher.digest().bytes() != self.info_hash {
+        if crate::utils::sha1_digest(&assembled) != self.info_hash {
             let contributors: Vec<PeerAddr> = fetch.contributors.iter().copied().collect();
             let sole = contributors.len() == 1;
             inner.fetch = None;
@@ -625,9 +623,7 @@ mod tests {
     }
 
     fn sha1(data: &[u8]) -> [u8; 20] {
-        let mut hasher = sha1_smol::Sha1::new();
-        hasher.update(data);
-        hasher.digest().bytes()
+        crate::utils::sha1_digest(data)
     }
 
     fn peer_info(size: Option<i64>) -> PeerExtensionInfo {

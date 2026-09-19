@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -211,18 +212,45 @@ pub fn apply_bitfield(state: &TorrentDownloadedState, bitfield: &Bitfield) {
     }
 }
 
-pub async fn verify_existing_pieces(storage: &storage::Storage, state: &TorrentDownloadedState) {
+pub async fn verify_existing_pieces(
+    storage: &Arc<storage::Storage>,
+    state: &TorrentDownloadedState,
+) {
     let torrent = storage.torrent();
-    for i in 0..torrent.piece_hashes.len() {
-        let length = utils::calculate_piece_size(torrent, i) as u32;
-        if length == 0 {
-            continue;
-        }
-        match storage.read_block(i as u32, 0, length).await {
-            Ok(buf) if utils::check_integrity(&torrent.piece_hashes[i], &buf) => {
-                state.mark_downloaded(i as u32);
+    let hasher = storage.hasher().clone();
+    let permits = hasher.permits();
+    let count = torrent.piece_hashes.len();
+    let mut next = 0;
+    let mut in_flight = 0;
+    let mut set = tokio::task::JoinSet::new();
+
+    loop {
+        while in_flight < permits && next < count {
+            let length = utils::calculate_piece_size(torrent, next) as u32;
+            if length == 0 {
+                next += 1;
+                continue;
             }
-            _ => {}
+            let index = next as u32;
+            let expected = torrent.piece_hashes[next];
+            next += 1;
+            in_flight += 1;
+            let storage = Arc::clone(storage);
+            let hasher = hasher.clone();
+            set.spawn(async move {
+                match storage.read_block(index, 0, length).await {
+                    Ok(buf) => hasher.verify(expected, buf).await.then_some(index),
+                    Err(_) => None,
+                }
+            });
+        }
+        match set.join_next().await {
+            Some(Ok(Some(index))) => {
+                in_flight -= 1;
+                state.mark_downloaded(index);
+            }
+            Some(_) => in_flight -= 1,
+            None => break,
         }
     }
 }
@@ -395,6 +423,18 @@ mod tests {
         mismatch = layout;
         mismatch[0].length += 1;
         assert!(!files_match(&mismatch, &torrent, &file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_match_accepts_preallocated_size() {
+        let dir = temp_dir("prealloc");
+        let file = dir.join("out.bin");
+        std::fs::File::create(&file).unwrap().set_len(8).unwrap();
+        let torrent = torrent_one_file("out.bin", 8);
+        let layout = collect_file_layout(&torrent, &file);
+        assert_eq!(layout[0].length, 8);
+        assert!(files_match(&layout, &torrent, &file));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,10 +1,13 @@
 mod common;
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bit_rev::mse::EncryptionPolicy;
+use bit_rev::resume::{self, ResumeData, RESUME_VERSION};
 use bit_rev::session::{AddTorrentOptions, Session, SessionOptions};
+use serde_bytes::ByteBuf;
 
 use common::{
     add_download, test_session, unique_temp_dir, wait_for_completion, FileSpec, HttpAnnounceBody,
@@ -425,7 +428,7 @@ async fn slow_peer_does_not_block_download() {
 #[ignore = "512 MiB fixture; run with --ignored"]
 async fn large_file_stays_memory_bounded() {
     const LARGE: u64 = 512 * 1024 * 1024;
-    const RSS_BOUND: u64 = 400 * 1024 * 1024;
+    const RSS_BOUND: u64 = LARGE / 8 + 64 * 1024 * 1024;
 
     let fixture = Arc::new(
         TorrentFixture::builder()
@@ -457,11 +460,104 @@ async fn large_file_stays_memory_bounded() {
     )
     .await;
     session.shutdown();
+    let rss = common::peak_rss_bytes();
     fixture.assert_output_matches(&output);
 
-    if let Some(rss) = common::peak_rss_bytes() {
+    if let Some(rss) = rss {
         assert!(rss < RSS_BOUND, "peak RSS {rss} exceeded bound {RSS_BOUND}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recheck_does_not_stall_other_download() {
+    const BIG: u64 = 64 * 1024 * 1024;
+    let big = TorrentFixture::builder()
+        .single_file("big.bin", BIG)
+        .piece_length(256 * 1024)
+        .seed(0x4EC0_0001)
+        .keep_payload(false)
+        .build();
+    let small = Arc::new(TorrentFixture::single(
+        64 * 1024,
+        DEFAULT_PIECE_LENGTH,
+        0x4EC0_0002,
+    ));
+    let small_seeders = start_seeders(
+        &small,
+        vec![SeederConfig::all_pieces().peer_id(unique_peer_id(9))],
+    )
+    .await;
+
+    let state_dir = unique_temp_dir();
+    let torrent = big.torrent();
+    let output = big.files[0].disk_path.clone();
+    let layout = resume::collect_file_layout(&torrent, &output);
+    let resume_data = ResumeData {
+        version: RESUME_VERSION,
+        info_hash: ByteBuf::from(big.torrent_meta.info_hash.to_vec()),
+        bitfield: ByteBuf::from(vec![0u8; torrent.piece_hashes.len().div_ceil(8)]),
+        output_dir: output.to_string_lossy().into_owned(),
+        files: layout,
+        uploaded: 0,
+        downloaded: 0,
+        torrent_path: String::new(),
+        paused: 0,
+        added_at: 1,
+        completed_at: 0,
+    };
+    resume::save(
+        &resume::resume_path(state_dir.path(), &big.torrent_meta.info_hash),
+        &resume_data,
+    )
+    .unwrap();
+
+    let recheck_session = test_session(Some(state_dir.path().to_path_buf())).await;
+    let download_session = test_session(None).await;
+
+    let tracker = MockHttpTracker::start(vec![HttpAnnounceBody::peers(
+        1800,
+        vec![small_seeders[0].addr],
+    )])
+    .await;
+    let small_meta = small.meta_with_trackers(Some(tracker.url.clone()), None);
+    let download_dir = unique_temp_dir();
+    let small_output = small.session_output(download_dir.path());
+
+    let recheck = async {
+        recheck_session
+            .add_torrent(
+                AddTorrentOptions::from(big.torrent_meta.clone())
+                    .output_dir(output)
+                    .verify(true),
+            )
+            .await
+            .expect("recheck add")
+    };
+    let download = async {
+        let started = Instant::now();
+        let added = add_download(&download_session, small_meta, small_output.clone()).await;
+        wait_for_completion(
+            &added.pr_rx,
+            &added.torrent,
+            &added.already_have,
+            Duration::from_secs(8),
+        )
+        .await;
+        started.elapsed()
+    };
+
+    let (added, dl_time) = tokio::join!(recheck, download);
+    assert_eq!(
+        added.resume_status,
+        bit_rev::session::ResumeStatus::SlowPath
+    );
+    assert!(
+        dl_time < Duration::from_secs(8),
+        "small download stalled during recheck: {dl_time:?}"
+    );
+    recheck_session.shutdown();
+    download_session.shutdown();
+    small.assert_output_matches(&small_output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -594,6 +690,14 @@ async fn never_unchoke_seeder_does_not_stall_download() {
     assert!(seeders[1].blocks_sent() + seeders[2].blocks_sent() > 0);
 }
 
+fn loopback_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
 async fn session_with_encryption(encryption: EncryptionPolicy) -> Session {
     let session = Session::with_options(SessionOptions {
         listen_port: 0,
@@ -632,7 +736,7 @@ async fn e2e_require_encrypted_two_sessions() {
         )
         .await
         .expect("add seeder");
-    let seeder_addr = seeder.wait_listening().await;
+    let seeder_addr = loopback_addr(seeder.wait_listening().await);
 
     let download_dir = unique_temp_dir();
     let output = fixture.session_output(download_dir.path());
@@ -688,7 +792,7 @@ async fn e2e_plaintext_leecher_joins_prefer_encrypted_seeder() {
         )
         .await
         .expect("add seeder");
-    let seeder_addr = seeder.wait_listening().await;
+    let seeder_addr = loopback_addr(seeder.wait_listening().await);
 
     let download_dir = unique_temp_dir();
     let output = fixture.session_output(download_dir.path());

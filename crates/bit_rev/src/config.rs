@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::dht::DhtOptions;
 use crate::file::AnnounceParams;
 use crate::session::{
-    SessionOptions, DEFAULT_LISTEN_PORT, DEFAULT_MAX_PEERS_GLOBAL, DEFAULT_MAX_PEERS_PER_TORRENT,
+    Preallocate, SessionOptions, DEFAULT_LISTEN_PORT, DEFAULT_MAX_PEERS_GLOBAL,
+    DEFAULT_MAX_PEERS_PER_TORRENT,
 };
 
 /// Session and engine settings loaded from TOML, env, and CLI flags.
@@ -17,6 +18,7 @@ use crate::session::{
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub download_dir: PathBuf,
+    pub preallocate: Preallocate,
     pub port: u16,
     pub max_peers_per_torrent: usize,
     pub max_connections: usize,
@@ -102,6 +104,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             download_dir: PathBuf::from("."),
+            preallocate: Preallocate::Sparse,
             port: DEFAULT_LISTEN_PORT,
             max_peers_per_torrent: DEFAULT_MAX_PEERS_PER_TORRENT,
             max_connections: DEFAULT_MAX_PEERS_GLOBAL,
@@ -216,6 +219,8 @@ impl Config {
                 enabled: self.utp.enabled,
                 port: 0,
             },
+            preallocate: self.preallocate,
+            piece_cache_pieces: 0,
         }
     }
 }
@@ -264,6 +269,8 @@ mod tests {
         assert_eq!(options.listen_port, 6999);
         assert_eq!(options.max_peers_per_torrent, 10);
         assert_eq!(options.max_peers_global, 20);
+        assert_eq!(options.preallocate, Preallocate::Sparse);
+        assert_eq!(options.piece_cache_pieces, 0);
         assert_eq!(
             options.state_dir.as_deref(),
             Some(util::paths::state_dir().as_path())
@@ -322,6 +329,26 @@ mod tests {
         }
         .session_options();
         assert!(!disabled.utp.enabled);
+    }
+
+    #[test]
+    fn session_options_maps_preallocate() {
+        assert_eq!(
+            Config::default().session_options().preallocate,
+            Preallocate::Sparse
+        );
+        let full = Config {
+            preallocate: Preallocate::Full,
+            ..Config::default()
+        }
+        .session_options();
+        assert_eq!(full.preallocate, Preallocate::Full);
+        let off = Config {
+            preallocate: Preallocate::Off,
+            ..Config::default()
+        }
+        .session_options();
+        assert_eq!(off.preallocate, Preallocate::Off);
     }
 
     #[test]

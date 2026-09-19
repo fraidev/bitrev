@@ -1,13 +1,16 @@
-use std::io::SeekFrom;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use serde::{Deserialize, Serialize};
 
+use crate::hash::PieceHasher;
 use crate::torrent::Torrent;
-use crate::utils::{calculate_piece_size, map_piece_to_files};
+use crate::utils::{calculate_piece_size, map_piece_to_files, PieceFileMapping};
+
+mod preallocate;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -19,9 +22,117 @@ pub enum StorageError {
     BlockOutOfBounds { index: u32, begin: u32, length: u32 },
 }
 
+/// How `Storage::open` grows files for a fresh download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Preallocate {
+    /// `set_len` only. Sparse on every target OS. Default.
+    #[default]
+    Sparse,
+    /// `fallocate` / `F_PREALLOCATE`, falling back to sparse.
+    Full,
+    /// Leave the file size alone.
+    Off,
+}
+
+#[derive(Clone)]
+pub struct StorageOptions {
+    pub preallocate: Preallocate,
+    /// Number of pieces kept in the read cache. 0 disables it.
+    pub piece_cache_pieces: usize,
+    pub hasher: Arc<PieceHasher>,
+}
+
+impl Default for StorageOptions {
+    fn default() -> Self {
+        Self {
+            preallocate: Preallocate::Sparse,
+            piece_cache_pieces: 0,
+            hasher: Arc::new(PieceHasher::new()),
+        }
+    }
+}
+
+struct StorageFile {
+    #[allow(dead_code)]
+    path: PathBuf,
+    /// Shared fd for positional I/O. Write-locked for `set_len` and relocation.
+    file: RwLock<Arc<File>>,
+}
+
+impl StorageFile {
+    fn handle(&self) -> Arc<File> {
+        self.file.read().expect("storage file lock").clone()
+    }
+
+    fn allocate(&self, len: u64, mode: Preallocate) -> io::Result<()> {
+        if len == 0 || mode == Preallocate::Off {
+            return Ok(());
+        }
+        let file = self.file.write().expect("storage file lock");
+        let current = file.metadata()?.len();
+        if current >= len {
+            return Ok(());
+        }
+        match mode {
+            Preallocate::Off => Ok(()),
+            Preallocate::Sparse => file.set_len(len),
+            Preallocate::Full => preallocate::allocate_full(&file, len),
+        }
+    }
+}
+
+struct PieceCache {
+    capacity: usize,
+    map: HashMap<u32, Vec<u8>>,
+    order: VecDeque<u32>,
+}
+
+impl PieceCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, index: u32) -> Option<&[u8]> {
+        if !self.map.contains_key(&index) {
+            return None;
+        }
+        self.order.retain(|&i| i != index);
+        self.order.push_back(index);
+        self.map.get(&index).map(|v| v.as_slice())
+    }
+
+    fn put(&mut self, index: u32, data: Vec<u8>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.map.contains_key(&index) {
+            self.order.retain(|&i| i != index);
+        } else if self.map.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.order.push_back(index);
+        self.map.insert(index, data);
+    }
+
+    fn invalidate(&mut self, index: u32) {
+        self.map.remove(&index);
+        self.order.retain(|&i| i != index);
+    }
+}
+
 pub struct Storage {
     torrent: Torrent,
-    files: Vec<Mutex<File>>,
+    files: Vec<StorageFile>,
+    cache: Mutex<PieceCache>,
+    cache_capacity: usize,
+    hasher: Arc<PieceHasher>,
 }
 
 /// Resolve the on-disk path for torrent file `file_index`.
@@ -51,32 +162,25 @@ impl Storage {
         torrent: &Torrent,
         output_dir: impl AsRef<Path>,
     ) -> Result<Arc<Self>, StorageError> {
-        let output_dir = output_dir.as_ref();
-        let mut files = Vec::with_capacity(torrent.files.len());
+        Self::open_with(torrent, output_dir, StorageOptions::default()).await
+    }
 
-        for file_index in 0..torrent.files.len() {
-            let disk_path = file_path(torrent, output_dir, file_index);
+    pub async fn open_with(
+        torrent: &Torrent,
+        output_dir: impl AsRef<Path>,
+        opts: StorageOptions,
+    ) -> Result<Arc<Self>, StorageError> {
+        let torrent = torrent.clone();
+        let output_dir = output_dir.as_ref().to_path_buf();
+        spawn_blocking_io(move || open_sync(&torrent, &output_dir, opts)).await
+    }
 
-            if let Some(parent) = disk_path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-            }
+    pub fn hasher(&self) -> &PieceHasher {
+        &self.hasher
+    }
 
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&disk_path)
-                .await?;
-            files.push(Mutex::new(file));
-        }
-
-        Ok(Arc::new(Self {
-            torrent: torrent.clone(),
-            files,
-        }))
+    pub fn torrent(&self) -> &Torrent {
+        &self.torrent
     }
 
     pub async fn write_piece(&self, index: u32, buf: &[u8]) -> Result<(), StorageError> {
@@ -92,20 +196,10 @@ impl Storage {
         }
 
         let mappings = map_piece_to_files(&self.torrent, index as usize);
-        let mut buf_offset = 0;
-        for mapping in mappings {
-            let slice = &buf[buf_offset..buf_offset + mapping.length];
-            {
-                let mut file = self.files[mapping.file_index].lock().await;
-                file.seek(SeekFrom::Start(mapping.file_offset as u64))
-                    .await?;
-                file.write_all(slice).await?;
-                file.sync_data().await?;
-            }
-            buf_offset += mapping.length;
-        }
-
-        Ok(())
+        let files = self.file_handles();
+        let buf = buf.to_vec();
+        self.invalidate_cache(index);
+        spawn_blocking_io(move || write_mapped(&files, &mappings, &buf)).await
     }
 
     pub async fn read_block(
@@ -127,38 +221,75 @@ impl Storage {
             });
         }
 
-        let window_start = begin_us;
-        let window_end = begin_us + length_us;
-        let mappings = map_piece_to_files(&self.torrent, index as usize);
-
-        let mut out = Vec::with_capacity(length_us);
-        let mut piece_offset = 0;
-        for mapping in mappings {
-            let map_start = piece_offset;
-            let map_end = piece_offset + mapping.length;
-            let overlap_start = map_start.max(window_start);
-            let overlap_end = map_end.min(window_end);
-
-            if overlap_start < overlap_end {
-                let file_offset = mapping.file_offset + (overlap_start - map_start);
-                let read_len = overlap_end - overlap_start;
-                let mut chunk = vec![0u8; read_len];
-                {
-                    let mut file = self.files[mapping.file_index].lock().await;
-                    file.seek(SeekFrom::Start(file_offset as u64)).await?;
-                    file.read_exact(&mut chunk).await?;
-                }
-                out.extend_from_slice(&chunk);
-            }
-
-            piece_offset = map_end;
+        if let Some(hit) = self.cache_get(index, begin_us, length_us) {
+            return Ok(hit);
         }
 
-        Ok(out)
+        let mappings = map_piece_to_files(&self.torrent, index as usize);
+        let files = self.file_handles();
+        let cache_capacity = self.cache_capacity;
+        let piece = spawn_blocking_io(move || {
+            if cache_capacity > 0 {
+                read_mapped(&files, &mappings, 0, piece_size)
+            } else {
+                read_mapped(&files, &mappings, begin_us, length_us)
+            }
+        })
+        .await?;
+
+        if self.cache_capacity > 0 {
+            let out = piece[begin_us..begin_us + length_us].to_vec();
+            self.cache_put(index, piece);
+            Ok(out)
+        } else {
+            Ok(piece)
+        }
     }
 
-    pub fn torrent(&self) -> &Torrent {
-        &self.torrent
+    /// `sync_all` every file. Call on torrent completion and before a move (#37).
+    pub async fn sync_all(&self) -> Result<(), StorageError> {
+        let files = self.file_handles();
+        spawn_blocking_io(move || {
+            for file in files {
+                file.sync_all()?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    fn file_handles(&self) -> Vec<Arc<File>> {
+        self.files.iter().map(StorageFile::handle).collect()
+    }
+
+    fn cache_get(&self, index: u32, begin: usize, length: usize) -> Option<Vec<u8>> {
+        if self.cache_capacity == 0 {
+            return None;
+        }
+        let mut cache = self.cache.lock().expect("piece cache lock");
+        cache
+            .get(index)
+            .map(|piece| piece[begin..begin + length].to_vec())
+    }
+
+    fn cache_put(&self, index: u32, data: Vec<u8>) {
+        if self.cache_capacity == 0 {
+            return;
+        }
+        self.cache
+            .lock()
+            .expect("piece cache lock")
+            .put(index, data);
+    }
+
+    fn invalidate_cache(&self, index: u32) {
+        if self.cache_capacity == 0 {
+            return;
+        }
+        self.cache
+            .lock()
+            .expect("piece cache lock")
+            .invalidate(index);
     }
 
     fn check_piece_index(&self, index: u32) -> Result<(), StorageError> {
@@ -166,6 +297,168 @@ impl Storage {
             return Err(StorageError::PieceOutOfRange(index));
         }
         Ok(())
+    }
+}
+
+fn open_sync(
+    torrent: &Torrent,
+    output_dir: &Path,
+    opts: StorageOptions,
+) -> io::Result<Arc<Storage>> {
+    let mut files = Vec::with_capacity(torrent.files.len());
+
+    for file_index in 0..torrent.files.len() {
+        let disk_path = file_path(torrent, output_dir, file_index);
+
+        if let Some(parent) = disk_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&disk_path)?;
+        let storage_file = StorageFile {
+            path: disk_path,
+            file: RwLock::new(Arc::new(file)),
+        };
+        let length = torrent.files[file_index].length.max(0) as u64;
+        storage_file.allocate(length, opts.preallocate)?;
+        files.push(storage_file);
+    }
+
+    Ok(Arc::new(Storage {
+        torrent: torrent.clone(),
+        files,
+        cache: Mutex::new(PieceCache::new(opts.piece_cache_pieces)),
+        cache_capacity: opts.piece_cache_pieces,
+        hasher: opts.hasher,
+    }))
+}
+
+fn write_mapped(files: &[Arc<File>], mappings: &[PieceFileMapping], buf: &[u8]) -> io::Result<()> {
+    let mut buf_offset = 0;
+    for mapping in mappings {
+        let slice = &buf[buf_offset..buf_offset + mapping.length];
+        if !slice.is_empty() {
+            write_at(
+                &files[mapping.file_index],
+                slice,
+                mapping.file_offset as u64,
+            )?;
+        }
+        buf_offset += mapping.length;
+    }
+    Ok(())
+}
+
+fn read_mapped(
+    files: &[Arc<File>],
+    mappings: &[PieceFileMapping],
+    window_start: usize,
+    window_len: usize,
+) -> io::Result<Vec<u8>> {
+    let window_end = window_start + window_len;
+    let mut out = Vec::with_capacity(window_len);
+    let mut piece_offset = 0;
+    for mapping in mappings {
+        let map_start = piece_offset;
+        let map_end = piece_offset + mapping.length;
+        let overlap_start = map_start.max(window_start);
+        let overlap_end = map_end.min(window_end);
+
+        if overlap_start < overlap_end {
+            let file_offset = mapping.file_offset + (overlap_start - map_start);
+            let read_len = overlap_end - overlap_start;
+            let mut chunk = vec![0u8; read_len];
+            read_at(&files[mapping.file_index], &mut chunk, file_offset as u64)?;
+            out.extend_from_slice(&chunk);
+        }
+
+        piece_offset = map_end;
+    }
+    Ok(out)
+}
+
+fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = positional_write(file, buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(ErrorKind::WriteZero, "write_at returned 0"));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+fn read_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = positional_read(file, buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "read_at returned 0",
+            ));
+        }
+        let tmp = buf;
+        buf = &mut tmp[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn positional_write(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+#[cfg(unix)]
+fn positional_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn positional_write(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
+#[cfg(windows)]
+fn positional_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positional_write(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write(buf)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positional_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read(buf)
+}
+
+async fn spawn_blocking_io<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, io::Error> + Send + 'static,
+) -> Result<T, StorageError> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(StorageError::Io(e)),
+        Err(e) => Err(StorageError::Io(io::Error::other(e))),
     }
 }
 
@@ -234,6 +527,12 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn disk_len(dir: &Path, torrent: &Torrent, index: usize) -> u64 {
+        std::fs::metadata(file_path(torrent, dir, index))
+            .unwrap()
+            .len()
     }
 
     #[tokio::test]
@@ -335,5 +634,147 @@ mod tests {
 
         let got = storage.read_block(0, 0, 25).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn last_short_piece_and_zero_length_file() {
+        let t = torrent(&[20, 0, 20], 30);
+        let tmp = TempDir::new();
+        let storage = Storage::open(&t, tmp.path()).await.unwrap();
+
+        let data: Vec<u8> = (0..30).map(|i| (i as u8).wrapping_add(7)).collect();
+        storage.write_piece(0, &data).await.unwrap();
+
+        let got = storage.read_block(0, 0, 30).await.unwrap();
+        assert_eq!(got, data);
+        assert_eq!(disk_len(tmp.path(), &t, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn preallocate_sparse_sets_file_sizes() {
+        let t = torrent(&[100, 50], 40);
+        let tmp = TempDir::new();
+        let _storage = Storage::open_with(
+            &t,
+            tmp.path(),
+            StorageOptions {
+                preallocate: Preallocate::Sparse,
+                ..StorageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(disk_len(tmp.path(), &t, 0), 100);
+        assert_eq!(disk_len(tmp.path(), &t, 1), 50);
+    }
+
+    #[tokio::test]
+    async fn preallocate_full_sets_file_sizes() {
+        let t = torrent(&[80], 40);
+        let tmp = TempDir::new();
+        let path = tmp.path().join("full.bin");
+        let _storage = Storage::open_with(
+            &t,
+            &path,
+            StorageOptions {
+                preallocate: Preallocate::Full,
+                ..StorageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 80);
+    }
+
+    #[tokio::test]
+    async fn preallocate_off_leaves_empty_file() {
+        let t = torrent(&[100], 40);
+        let tmp = TempDir::new();
+        let path = tmp.path().join("off.bin");
+        let _storage = Storage::open_with(
+            &t,
+            &path,
+            StorageOptions {
+                preallocate: Preallocate::Off,
+                ..StorageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn preallocate_does_not_shrink_or_touch_matching_size() {
+        let t = torrent(&[40], 40);
+        let tmp = TempDir::new();
+        let path = tmp.path().join("keep.bin");
+        let expected: Vec<u8> = (0..40).map(|i| i as u8).collect();
+        std::fs::write(&path, &expected).unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let storage = Storage::open_with(
+            &t,
+            &path,
+            StorageOptions {
+                preallocate: Preallocate::Sparse,
+                ..StorageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after);
+        assert_eq!(storage.read_block(0, 0, 40).await.unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reads_during_writes() {
+        let t = torrent(&[1024 * 1024], 16 * 1024);
+        let tmp = TempDir::new();
+        let path = tmp.path().join("rw.bin");
+        let storage = Storage::open(&t, &path).await.unwrap();
+        let writer = storage.clone();
+        let reader = storage.clone();
+        let piece = vec![0xABu8; 16 * 1024];
+        let piece_for_write = piece.clone();
+
+        let write = tokio::spawn(async move {
+            for i in 0..64u32 {
+                writer.write_piece(i, &piece_for_write).await.unwrap();
+            }
+        });
+        let read = tokio::spawn(async move {
+            for i in 0..128u32 {
+                let _ = reader.read_block(i % 64, 0, 16 * 1024).await;
+            }
+        });
+        write.await.unwrap();
+        read.await.unwrap();
+        let got = storage.read_block(0, 0, 16 * 1024).await.unwrap();
+        assert_eq!(got, piece);
+    }
+
+    #[tokio::test]
+    async fn piece_cache_serves_hot_range() {
+        let t = torrent(&[80], 40);
+        let tmp = TempDir::new();
+        let path = tmp.path().join("cache.bin");
+        let storage = Storage::open_with(
+            &t,
+            &path,
+            StorageOptions {
+                piece_cache_pieces: 16,
+                ..StorageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let data: Vec<u8> = (0..40).collect();
+        storage.write_piece(0, &data).await.unwrap();
+        let a = storage.read_block(0, 0, 10).await.unwrap();
+        let b = storage.read_block(0, 10, 10).await.unwrap();
+        assert_eq!(a, &data[0..10]);
+        assert_eq!(b, &data[10..20]);
     }
 }
