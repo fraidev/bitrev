@@ -1,7 +1,9 @@
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::dht::{DhtHandle, PeerSink};
 use crate::discovery::DiscoverySource;
@@ -45,6 +47,176 @@ pub enum DownloadState {
     Init,
     Downloading,
     Paused,
+}
+
+/// Info hash used as a stable torrent handle. Display is 40 lowercase hex chars.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TorrentId(pub [u8; 20]);
+
+impl TorrentId {
+    pub fn new(info_hash: [u8; 20]) -> Self {
+        Self(info_hash)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+
+    pub fn to_bytes(self) -> [u8; 20] {
+        self.0
+    }
+}
+
+impl From<[u8; 20]> for TorrentId {
+    fn from(info_hash: [u8; 20]) -> Self {
+        Self(info_hash)
+    }
+}
+
+impl fmt::Display for TorrentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TorrentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TorrentId({self})")
+    }
+}
+
+/// Per-torrent lifecycle. `Queued` and `Moving` exist for later issues and are
+/// never entered here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TorrentState {
+    Checking,
+    Metadata,
+    Downloading,
+    Seeding,
+    Paused,
+    Queued,
+    Moving,
+    Error(String),
+}
+
+impl TorrentState {
+    fn transfer_enabled(&self) -> bool {
+        matches!(
+            self,
+            TorrentState::Downloading | TorrentState::Seeding | TorrentState::Metadata
+        )
+    }
+
+    fn error_message(&self) -> Option<String> {
+        match self {
+            TorrentState::Error(message) => Some(message.clone()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TorrentSnapshot {
+    pub id: TorrentId,
+    pub name: String,
+    pub info_hash: [u8; 20],
+    pub state: TorrentState,
+    pub error: Option<String>,
+    pub progress: f64,
+    pub downloaded: u64,
+    pub uploaded: u64,
+    pub left: u64,
+    pub size: u64,
+    pub download_rate: u64,
+    pub upload_rate: u64,
+    pub peers: u32,
+    pub seeds: u32,
+    pub save_path: PathBuf,
+    pub torrent_path: PathBuf,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub sequential: bool,
+    pub added_at: i64,
+    pub completed_at: Option<i64>,
+    pub piece_count: u32,
+    pub pieces_have: u32,
+    pub ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionEvent {
+    Added {
+        id: TorrentId,
+    },
+    Removed {
+        id: TorrentId,
+    },
+    StateChanged {
+        id: TorrentId,
+        state: TorrentState,
+    },
+    Progress {
+        id: TorrentId,
+        snapshot: Box<TorrentSnapshot>,
+    },
+    Completed {
+        id: TorrentId,
+    },
+    Error {
+        id: TorrentId,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransferStats {
+    pub downloaded: u64,
+    pub uploaded: u64,
+    pub download_rate: u64,
+    pub upload_rate: u64,
+    pub torrents: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    #[error("torrent {0} not found")]
+    NotFound(TorrentId),
+    #[error("torrent {0} has no metadata yet")]
+    NoMetadata(TorrentId),
+}
+
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+const RATE_TICK: Duration = Duration::from_secs(1);
+const RATE_EMA_ALPHA: f64 = 0.2;
+
+#[derive(Debug, Default)]
+struct RateSample {
+    last_downloaded: u64,
+    last_uploaded: u64,
+    download_rate: f64,
+    upload_rate: f64,
+    initialized: bool,
+}
+
+impl RateSample {
+    fn tick(&mut self, downloaded: u64, uploaded: u64, dt: f64) {
+        if !self.initialized {
+            self.last_downloaded = downloaded;
+            self.last_uploaded = uploaded;
+            self.initialized = true;
+            return;
+        }
+        let dt = if dt > 0.0 { dt } else { 1.0 };
+        let inst_dl = downloaded.saturating_sub(self.last_downloaded) as f64 / dt;
+        let inst_ul = uploaded.saturating_sub(self.last_uploaded) as f64 / dt;
+        self.download_rate = RATE_EMA_ALPHA * inst_dl + (1.0 - RATE_EMA_ALPHA) * self.download_rate;
+        self.upload_rate = RATE_EMA_ALPHA * inst_ul + (1.0 - RATE_EMA_ALPHA) * self.upload_rate;
+        self.last_downloaded = downloaded;
+        self.last_uploaded = uploaded;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +275,7 @@ pub struct TorrentSession {
     pub peer_states: Arc<PeerStates>,
     pub piece_tx: flume::Sender<crate::peer_connection::FullPiece>,
     pub have_broadcast: Arc<tokio::sync::broadcast::Sender<u32>>,
+    pub torrent_state: Arc<Mutex<TorrentState>>,
     pub download_state: Arc<Mutex<DownloadState>>,
     pub uploaded: Arc<AtomicU64>,
     pub torrent: Arc<Torrent>,
@@ -113,6 +286,12 @@ pub struct TorrentSession {
     pub completed_at: Arc<Mutex<Option<i64>>>,
     pub torrent_cache_path: PathBuf,
     pub metadata: Arc<MetadataStore>,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub sequential: bool,
+    pub file_priorities: Vec<i64>,
+    pub pr_rx: Receiver<PieceResult>,
+    rates: Arc<Mutex<RateSample>>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,11 +317,13 @@ pub struct Session {
     utp_bind: tokio::sync::watch::Sender<UtpBindState>,
     owns_lifecycle: bool,
     hasher: Arc<PieceHasher>,
+    event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
 }
 
 pub(crate) struct PendingTorrent {
     metadata: Arc<MetadataStore>,
     peer_states: Arc<PeerStates>,
+    torrent_state: Arc<Mutex<TorrentState>>,
     download_state: Arc<Mutex<DownloadState>>,
     uploaded: Arc<AtomicU64>,
     choke_notify: Arc<Notify>,
@@ -156,6 +337,15 @@ pub(crate) struct PendingTorrent {
     output_dir: PathBuf,
     pr_tx: flume::Sender<PieceResult>,
     pr_rx: Receiver<PieceResult>,
+    added_at: i64,
+    start_paused: bool,
+    verify: bool,
+    skip_checking: bool,
+    category: String,
+    tags: Vec<String>,
+    sequential: bool,
+    file_priorities: Vec<i64>,
+    rates: Arc<Mutex<RateSample>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -207,6 +397,12 @@ pub struct AddTorrentOptions {
     output_dir: Option<PathBuf>,
     seed: bool,
     verify: bool,
+    paused: Option<bool>,
+    category: String,
+    tags: Vec<String>,
+    sequential: bool,
+    skip_checking: bool,
+    file_priorities: Vec<i64>,
 }
 
 impl AddTorrentOptions {
@@ -218,6 +414,12 @@ impl AddTorrentOptions {
             output_dir: None,
             seed: false,
             verify: false,
+            paused: None,
+            category: String::new(),
+            tags: Vec::new(),
+            sequential: false,
+            skip_checking: false,
+            file_priorities: Vec::new(),
         }
     }
 
@@ -233,6 +435,12 @@ impl AddTorrentOptions {
             output_dir: None,
             seed: false,
             verify: false,
+            paused: None,
+            category: String::new(),
+            tags: Vec::new(),
+            sequential: false,
+            skip_checking: false,
+            file_priorities: Vec::new(),
         }
     }
 
@@ -258,6 +466,40 @@ impl AddTorrentOptions {
         self.verify = verify;
         self
     }
+
+    pub fn save_path(self, dir: impl Into<PathBuf>) -> Self {
+        self.output_dir(dir)
+    }
+
+    pub fn paused(mut self, paused: bool) -> Self {
+        self.paused = Some(paused);
+        self
+    }
+
+    pub fn category(mut self, category: impl Into<String>) -> Self {
+        self.category = category.into();
+        self
+    }
+
+    pub fn tags(mut self, tags: impl Into<Vec<String>>) -> Self {
+        self.tags = tags.into();
+        self
+    }
+
+    pub fn sequential(mut self, sequential: bool) -> Self {
+        self.sequential = sequential;
+        self
+    }
+
+    pub fn skip_checking(mut self, skip: bool) -> Self {
+        self.skip_checking = skip;
+        self
+    }
+
+    pub fn file_priorities(mut self, priorities: impl Into<Vec<i64>>) -> Self {
+        self.file_priorities = priorities.into();
+        self
+    }
 }
 
 impl From<TorrentMeta> for AddTorrentOptions {
@@ -280,12 +522,12 @@ impl TryFrom<&str> for AddTorrentOptions {
 }
 
 pub struct AddTorrentResult {
+    pub id: TorrentId,
     pub torrent: Torrent,
     pub torrent_meta: Option<TorrentMeta>,
     pub pr_rx: Receiver<PieceResult>,
     pub resume_status: ResumeStatus,
     pub already_have: Vec<PieceResult>,
-    info_hash: [u8; 20],
     fetching_metadata: bool,
     metadata: Arc<MetadataStore>,
     peer_states: Arc<PeerStates>,
@@ -294,7 +536,7 @@ pub struct AddTorrentResult {
 
 impl AddTorrentResult {
     pub fn info_hash(&self) -> [u8; 20] {
-        self.info_hash
+        self.id.0
     }
 
     pub fn is_fetching_metadata(&self) -> bool {
@@ -363,6 +605,7 @@ impl Session {
     ) -> Self {
         let connector: Arc<dyn Connector> =
             Arc::new(MseConnector::new(connector, options.encryption));
+        let (event_tx, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let session = Self {
             torrents: Arc::new(DashMap::new()),
             download_state: Arc::new(Mutex::new(DownloadState::Init)),
@@ -379,12 +622,14 @@ impl Session {
             utp_bind,
             owns_lifecycle: true,
             hasher: Arc::new(PieceHasher::new()),
+            event_tx,
         };
         session
             .extensions
             .register(|ctx| Box::new(UtMetadata::new(ctx.clone())));
         session.spawn_listener();
         session.start_dht();
+        session.spawn_tick();
         session
     }
 
@@ -405,7 +650,80 @@ impl Session {
             utp_bind: self.utp_bind.clone(),
             owns_lifecycle: false,
             hasher: self.hasher.clone(),
+            event_tx: self.event_tx.clone(),
         }
+    }
+
+    /// Reload torrents persisted under `options.state_dir`. One-shot callers
+    /// should keep using `new` / `with_options`.
+    pub async fn open(options: SessionOptions) -> anyhow::Result<Self> {
+        let session = Self::with_options(options);
+        session.load_persisted().await;
+        Ok(session)
+    }
+
+    async fn load_persisted(&self) {
+        let Some(state_dir) = self.options.state_dir.clone() else {
+            return;
+        };
+        for path in resume::list_resume_files(&state_dir) {
+            match resume::load_optional(&path) {
+                Ok(Some(data)) => {
+                    if let Err(e) = self.restore_resume(&state_dir, data).await {
+                        warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "skipping resume entry"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    warn!(path = %path.display(), "skipping unreadable resume file");
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping resume entry"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn restore_resume(
+        &self,
+        state_dir: &std::path::Path,
+        data: resume::ResumeData,
+    ) -> anyhow::Result<()> {
+        let Some(info_hash) = data.info_hash() else {
+            anyhow::bail!("resume file info hash is not 20 bytes");
+        };
+        let cached = resume::torrent_cache_path(state_dir, &info_hash);
+        let torrent_path =
+            if !data.torrent_path.is_empty() && std::path::Path::new(&data.torrent_path).exists() {
+                PathBuf::from(&data.torrent_path)
+            } else {
+                cached
+            };
+        if !torrent_path.exists() {
+            anyhow::bail!("cached torrent missing at {}", torrent_path.display());
+        }
+        let Some(path_str) = torrent_path.to_str() else {
+            anyhow::bail!("cached torrent path is not utf-8");
+        };
+        let meta = file::from_filename(path_str)?;
+        self.add_torrent(
+            AddTorrentOptions::from(meta)
+                .output_dir(PathBuf::from(&data.output_dir))
+                .paused(data.is_paused())
+                .category(data.category.clone())
+                .tags(data.tags.clone())
+                .sequential(data.is_sequential())
+                .file_priorities(data.file_priorities.clone()),
+        )
+        .await?;
+        Ok(())
     }
 
     fn start_dht(&self) {
@@ -444,7 +762,6 @@ impl Session {
             max_peers_global: self.options.max_peers_global,
             connector: self.connector.clone(),
             dht: self.dht.clone(),
-            download_state: self.download_state.clone(),
             encryption: self.options.encryption,
         }
     }
@@ -686,30 +1003,19 @@ impl Session {
     }
 
     pub fn start_downloading(&self) {
-        {
-            let mut state = self.download_state.lock().unwrap();
-            *state = DownloadState::Downloading;
-        }
-        for entry in self.torrents.iter() {
-            entry
-                .value()
-                .tracker
-                .set_download_state(DownloadState::Downloading);
-        }
-        if let Some(dht) = self.dht() {
-            dht.set_all_active(true);
-        }
+        self.resume_all();
     }
 
-    pub fn pause(&self) {
+    pub fn pause_all(&self) {
         {
             let mut state = self.download_state.lock().unwrap();
             *state = DownloadState::Paused;
         }
         for entry in self.torrents.iter() {
-            let torrent = entry.value();
-            torrent.tracker.set_download_state(DownloadState::Paused);
-            choke_all_peers(&torrent.peer_states);
+            self.apply_pause(entry.value(), TorrentId::new(*entry.key()));
+        }
+        for entry in self.pending.iter() {
+            self.apply_pending_pause(entry.value(), TorrentId::new(*entry.key()));
         }
         if let Some(dht) = self.dht() {
             dht.set_all_active(false);
@@ -717,22 +1023,152 @@ impl Session {
         self.spawn_flush_resume();
     }
 
-    pub fn resume(&self) {
+    pub fn resume_all(&self) {
         {
             let mut state = self.download_state.lock().unwrap();
             *state = DownloadState::Downloading;
         }
         for entry in self.torrents.iter() {
-            let torrent = entry.value();
-            torrent
-                .tracker
-                .set_download_state(DownloadState::Downloading);
-            torrent.choke_notify.notify_waiters();
+            self.apply_resume(entry.value(), TorrentId::new(*entry.key()));
+        }
+        for entry in self.pending.iter() {
+            self.apply_pending_resume(entry.value(), TorrentId::new(*entry.key()));
         }
         if let Some(dht) = self.dht() {
             dht.set_all_active(true);
         }
         self.spawn_flush_resume();
+    }
+
+    pub fn pause(&self, id: TorrentId) -> Result<(), ControlError> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            self.apply_pause(torrent.value(), id);
+            if let Some(dht) = self.dht() {
+                dht.set_active(id.0, false);
+            }
+            self.spawn_flush_one(torrent.value().clone());
+            return Ok(());
+        }
+        if let Some(pending) = self.pending.get(&id.0) {
+            self.apply_pending_pause(pending.value(), id);
+            if let Some(dht) = self.dht() {
+                dht.set_active(id.0, false);
+            }
+            return Ok(());
+        }
+        Err(ControlError::NotFound(id))
+    }
+
+    pub fn resume(&self, id: TorrentId) -> Result<(), ControlError> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            self.apply_resume(torrent.value(), id);
+            {
+                let mut state = self.download_state.lock().unwrap();
+                *state = DownloadState::Downloading;
+            }
+            if let Some(dht) = self.dht() {
+                dht.set_active(id.0, true);
+            }
+            self.spawn_flush_one(torrent.value().clone());
+            return Ok(());
+        }
+        if let Some(pending) = self.pending.get(&id.0) {
+            self.apply_pending_resume(pending.value(), id);
+            {
+                let mut state = self.download_state.lock().unwrap();
+                *state = DownloadState::Downloading;
+            }
+            if let Some(dht) = self.dht() {
+                dht.set_active(id.0, true);
+            }
+            return Ok(());
+        }
+        Err(ControlError::NotFound(id))
+    }
+
+    pub fn list(&self) -> Vec<TorrentSnapshot> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in self.torrents.iter() {
+            seen.insert(*entry.key());
+            out.push(torrent_snapshot(entry.value()));
+        }
+        for entry in self.pending.iter() {
+            if seen.contains(entry.key()) {
+                continue;
+            }
+            out.push(pending_snapshot(*entry.key(), entry.value()));
+        }
+        out
+    }
+
+    pub fn snapshot(&self, id: TorrentId) -> Option<TorrentSnapshot> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            return Some(torrent_snapshot(torrent.value()));
+        }
+        self.pending
+            .get(&id.0)
+            .map(|pending| pending_snapshot(id.0, pending.value()))
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SessionEvent> {
+        self.event_tx.subscribe()
+    }
+
+    pub fn transfer_stats(&self) -> TransferStats {
+        let mut stats = TransferStats::default();
+        for entry in self.torrents.iter() {
+            let torrent = entry.value();
+            stats.downloaded += torrent.downloaded_state.downloaded_bytes();
+            stats.uploaded += torrent.uploaded.load(Ordering::Relaxed);
+            let rates = torrent.rates.lock().unwrap();
+            stats.download_rate += rates.download_rate.max(0.0).round() as u64;
+            stats.upload_rate += rates.upload_rate.max(0.0).round() as u64;
+            stats.torrents += 1;
+        }
+        for entry in self.pending.iter() {
+            if self.torrents.contains_key(entry.key()) {
+                continue;
+            }
+            let pending = entry.value();
+            stats.downloaded += pending.downloaded_state.get().downloaded_bytes();
+            stats.uploaded += pending.uploaded.load(Ordering::Relaxed);
+            let rates = pending.rates.lock().unwrap();
+            stats.download_rate += rates.download_rate.max(0.0).round() as u64;
+            stats.upload_rate += rates.upload_rate.max(0.0).round() as u64;
+            stats.torrents += 1;
+        }
+        stats
+    }
+
+    pub async fn recheck(&self, id: TorrentId) -> Result<(), ControlError> {
+        if self.pending.contains_key(&id.0) && !self.torrents.contains_key(&id.0) {
+            return Err(ControlError::NoMetadata(id));
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        let previous = torrent.torrent_state.lock().unwrap().clone();
+        let stay_paused = previous == TorrentState::Paused;
+        self.set_torrent_state(&torrent, id, TorrentState::Checking);
+        torrent.downloaded_state.clear_all_downloaded();
+        resume::verify_existing_pieces(&torrent.storage, &torrent.downloaded_state).await;
+        if torrent.downloaded_state.is_complete() {
+            let mut done = torrent.completed_at.lock().unwrap();
+            if done.is_none() {
+                *done = Some(resume::now_unix());
+            }
+        }
+        let next = if stay_paused {
+            TorrentState::Paused
+        } else {
+            active_state(&torrent.downloaded_state)
+        };
+        self.set_torrent_state(&torrent, id, next);
+        self.spawn_flush_one(torrent);
+        Ok(())
     }
 
     pub fn get_download_state(&self) -> DownloadState {
@@ -808,6 +1244,117 @@ impl Session {
         });
     }
 
+    fn spawn_flush_one(&self, torrent: Arc<TorrentSession>) {
+        let Some(state_dir) = self.options.state_dir.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = persist_torrent(&state_dir, &torrent) {
+                warn!(
+                    name = %torrent.torrent.name,
+                    error = %e,
+                    "failed to persist resume data"
+                );
+            }
+        });
+    }
+
+    fn emit(&self, event: SessionEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    fn set_torrent_state(&self, torrent: &TorrentSession, id: TorrentId, state: TorrentState) {
+        let changed = {
+            let mut current = torrent.torrent_state.lock().unwrap();
+            if *current == state {
+                false
+            } else {
+                *current = state.clone();
+                true
+            }
+        };
+        sync_download_state(&torrent.download_state, &state);
+        if matches!(
+            state,
+            TorrentState::Paused | TorrentState::Checking | TorrentState::Error(_)
+        ) {
+            choke_all_peers(&torrent.peer_states);
+        } else if state.transfer_enabled() {
+            torrent.choke_notify.notify_waiters();
+        }
+        if changed {
+            self.emit(SessionEvent::StateChanged { id, state });
+        }
+    }
+
+    fn apply_pause(&self, torrent: &TorrentSession, id: TorrentId) {
+        self.set_torrent_state(torrent, id, TorrentState::Paused);
+    }
+
+    fn apply_resume(&self, torrent: &TorrentSession, id: TorrentId) {
+        let next = active_state(&torrent.downloaded_state);
+        self.set_torrent_state(torrent, id, next);
+    }
+
+    fn apply_pending_pause(&self, pending: &PendingTorrent, id: TorrentId) {
+        let changed = {
+            let mut current = pending.torrent_state.lock().unwrap();
+            if *current == TorrentState::Paused {
+                false
+            } else {
+                *current = TorrentState::Paused;
+                true
+            }
+        };
+        sync_download_state(&pending.download_state, &TorrentState::Paused);
+        choke_all_peers(&pending.peer_states);
+        if changed {
+            self.emit(SessionEvent::StateChanged {
+                id,
+                state: TorrentState::Paused,
+            });
+        }
+    }
+
+    fn apply_pending_resume(&self, pending: &PendingTorrent, id: TorrentId) {
+        let changed = {
+            let mut current = pending.torrent_state.lock().unwrap();
+            if *current == TorrentState::Metadata {
+                false
+            } else {
+                *current = TorrentState::Metadata;
+                true
+            }
+        };
+        sync_download_state(&pending.download_state, &TorrentState::Metadata);
+        pending.choke_notify.notify_waiters();
+        if changed {
+            self.emit(SessionEvent::StateChanged {
+                id,
+                state: TorrentState::Metadata,
+            });
+        }
+    }
+
+    fn spawn_tick(&self) {
+        let torrents = self.torrents.clone();
+        let pending = self.pending.clone();
+        let event_tx = self.event_tx.clone();
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RATE_TICK);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        tick_session(&torrents, &pending, &event_tx);
+                    }
+                }
+            }
+        });
+    }
+
     fn dht_peer_fields(&self) -> (bool, Option<u16>, Option<DhtHandle>) {
         match self.dht() {
             Some(dht) => (true, Some(dht.udp_port()), Some(dht)),
@@ -862,14 +1409,48 @@ impl Session {
         self.torrents.get(info_hash).map(|entry| entry.clone())
     }
 
-    pub fn remove_torrent(&self, info_hash: &[u8; 20]) {
-        if let Some((_, torrent)) = self.torrents.remove(info_hash) {
-            torrent.tracker.shutdown();
+    pub fn remove_torrent(&self, id: TorrentId, delete_files: bool) -> Result<(), ControlError> {
+        let torrent = self.torrents.remove(&id.0).map(|(_, t)| t);
+        let pending = self.pending.remove(&id.0).map(|(_, p)| p);
+        if torrent.is_none() && pending.is_none() {
+            return Err(ControlError::NotFound(id));
         }
-        self.pending.remove(info_hash);
         if let Some(dht) = self.dht() {
-            dht.remove_torrent(*info_hash);
+            dht.remove_torrent(id.0);
         }
+        if let Some(torrent) = torrent {
+            disconnect_all_peers(&torrent.peer_states);
+            torrent.tracker.shutdown();
+            if let Some(state_dir) = self.options.state_dir.as_ref() {
+                let resume_file = resume::resume_path(state_dir, &id.0);
+                if let Err(e) = std::fs::remove_file(&resume_file) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        debug!(path = %resume_file.display(), error = %e, "failed to delete resume file");
+                    }
+                }
+                if !torrent.torrent_cache_path.as_os_str().is_empty() {
+                    if let Err(e) = std::fs::remove_file(&torrent.torrent_cache_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            debug!(
+                                path = %torrent.torrent_cache_path.display(),
+                                error = %e,
+                                "failed to delete cached torrent"
+                            );
+                        }
+                    }
+                }
+            }
+            if delete_files {
+                delete_torrent_files(&torrent.torrent, &torrent.output_dir);
+            }
+        } else if let Some(pending) = pending {
+            disconnect_all_peers(&pending.peer_states);
+            if delete_files {
+                delete_torrent_files(&pending.torrent.get(), &pending.output_dir);
+            }
+        }
+        self.emit(SessionEvent::Removed { id });
+        Ok(())
     }
 
     pub async fn add_torrent_by_info_hash(
@@ -892,6 +1473,25 @@ impl Session {
             });
         }
 
+        let dummy = AddTorrentOptions {
+            source: AddSource::Magnet(crate::magnet::Magnet {
+                info_hash,
+                display_name: None,
+                trackers: Vec::new(),
+                peers: Vec::new(),
+                webseeds: Vec::new(),
+            }),
+            name: resume::info_hash_hex(&info_hash),
+            output_dir: opts.output_dir.clone(),
+            seed: false,
+            verify: false,
+            paused: None,
+            category: String::new(),
+            tags: Vec::new(),
+            sequential: false,
+            skip_checking: false,
+            file_priorities: Vec::new(),
+        };
         let pending = self
             .register_pending(
                 info_hash,
@@ -899,6 +1499,7 @@ impl Session {
                 Vec::new(),
                 opts.output_dir
                     .unwrap_or_else(|| std::env::temp_dir().join("bitrev-metadata")),
+                &dummy,
             )
             .await?;
         Ok(MetadataHandle {
@@ -914,6 +1515,7 @@ impl Session {
         name: String,
         trackers: Vec<String>,
         output_dir: PathBuf,
+        opts: &AddTorrentOptions,
     ) -> anyhow::Result<Arc<PendingTorrent>> {
         if let Some(pending) = self.pending.get(&info_hash) {
             return Ok(pending.clone());
@@ -940,10 +1542,15 @@ impl Session {
         .await?;
         let (piece_tx, _piece_rx) = flume::unbounded();
         let (pr_tx, pr_rx) = flume::unbounded();
+        let start_paused = opts.paused.unwrap_or(false);
+        let torrent_state = Arc::new(Mutex::new(TorrentState::Metadata));
+        let download_state = Arc::new(Mutex::new(DownloadState::Init));
+        sync_download_state(&download_state, &TorrentState::Metadata);
         let pending = Arc::new(PendingTorrent {
             metadata,
             peer_states: Arc::new(PeerStates::default()),
-            download_state: self.download_state.clone(),
+            torrent_state,
+            download_state,
             uploaded: Arc::new(AtomicU64::new(0)),
             choke_notify: Arc::new(Notify::new()),
             have_broadcast: Arc::new(tokio::sync::broadcast::channel(8).0),
@@ -956,6 +1563,15 @@ impl Session {
             output_dir,
             pr_tx,
             pr_rx,
+            added_at: resume::now_unix(),
+            start_paused,
+            verify: opts.verify,
+            skip_checking: opts.skip_checking,
+            category: opts.category.clone(),
+            tags: opts.tags.clone(),
+            sequential: opts.sequential,
+            file_priorities: opts.file_priorities.clone(),
+            rates: Arc::new(Mutex::new(RateSample::default())),
         });
         self.pending.insert(info_hash, pending.clone());
         Ok(pending)
@@ -965,38 +1581,47 @@ impl Session {
         &self,
         add_torrent: AddTorrentOptions,
     ) -> anyhow::Result<AddTorrentResult> {
-        match add_torrent.source {
-            AddSource::Magnet(magnet) => {
-                return self
-                    .add_magnet(
-                        magnet,
-                        add_torrent.output_dir,
-                        add_torrent.seed,
-                        add_torrent.verify,
-                    )
-                    .await;
-            }
+        match &add_torrent.source {
+            AddSource::Magnet(magnet) => self.add_magnet(magnet.clone(), add_torrent).await,
             AddSource::Meta(torrent_meta) => {
-                self.add_torrent_meta(
-                    *torrent_meta,
-                    add_torrent.output_dir,
-                    add_torrent.seed,
-                    add_torrent.verify,
-                    None,
-                )
-                .await
+                self.add_torrent_meta((**torrent_meta).clone(), add_torrent, None)
+                    .await
             }
+        }
+    }
+
+    fn result_from_existing(&self, existing: &TorrentSession) -> AddTorrentResult {
+        let torrent = existing.torrent.clone();
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(Some(torrent.clone()));
+        let _ = ready_tx;
+        AddTorrentResult {
+            id: TorrentId::new(torrent.info_hash),
+            torrent: (*torrent).clone(),
+            torrent_meta: Some(existing.torrent_meta.clone()),
+            pr_rx: existing.pr_rx.clone(),
+            resume_status: ResumeStatus::FastPath,
+            already_have: already_have_from(&existing.downloaded_state),
+            fetching_metadata: false,
+            metadata: existing.metadata.clone(),
+            peer_states: existing.peer_states.clone(),
+            ready: ready_rx,
         }
     }
 
     async fn add_torrent_meta(
         &self,
         torrent_meta: TorrentMeta,
-        output_dir: Option<PathBuf>,
-        seed: bool,
-        verify: bool,
+        add_torrent: AddTorrentOptions,
         reuse: Option<Arc<PendingTorrent>>,
     ) -> anyhow::Result<AddTorrentResult> {
+        if reuse.is_none() {
+            if let Some(existing) = self.torrents.get(&torrent_meta.info_hash) {
+                return Ok(self.result_from_existing(existing.value()));
+            }
+            if let Some(pending) = self.pending.get(&torrent_meta.info_hash) {
+                return Ok(result_from_pending(pending.value(), torrent_meta.info_hash));
+            }
+        }
         let torrent = Torrent::new(&torrent_meta)?;
         if torrent.is_private() {
             let disabled: Vec<&str> = torrent
@@ -1011,7 +1636,38 @@ impl Session {
             );
         }
         let torrent = Arc::new(torrent);
-        let output_dir = output_dir.unwrap_or_else(|| PathBuf::from(&torrent.name));
+        let output_dir = add_torrent
+            .output_dir
+            .clone()
+            .or_else(|| reuse.as_ref().map(|p| p.output_dir.clone()))
+            .unwrap_or_else(|| PathBuf::from(&torrent.name));
+        let seed = add_torrent.seed;
+        let skip_checking =
+            add_torrent.skip_checking || reuse.as_ref().is_some_and(|p| p.skip_checking);
+        let verify =
+            (add_torrent.verify || reuse.as_ref().is_some_and(|p| p.verify)) && !skip_checking;
+        let category = if add_torrent.category.is_empty() {
+            reuse
+                .as_ref()
+                .map(|p| p.category.clone())
+                .unwrap_or_default()
+        } else {
+            add_torrent.category.clone()
+        };
+        let tags = if add_torrent.tags.is_empty() {
+            reuse.as_ref().map(|p| p.tags.clone()).unwrap_or_default()
+        } else {
+            add_torrent.tags.clone()
+        };
+        let sequential = add_torrent.sequential || reuse.as_ref().is_some_and(|p| p.sequential);
+        let file_priorities = if add_torrent.file_priorities.is_empty() {
+            reuse
+                .as_ref()
+                .map(|p| p.file_priorities.clone())
+                .unwrap_or_default()
+        } else {
+            add_torrent.file_priorities.clone()
+        };
 
         let torrent_cache_path = if let Some(state_dir) = self.options.state_dir.as_ref() {
             resume::cache_torrent_file(
@@ -1044,6 +1700,7 @@ impl Session {
         let resume_unreadable = resume_existed && loaded_resume.is_none();
 
         let fast_path = match &loaded_resume {
+            Some(_) if skip_checking => true,
             Some(data) if !verify => resume::files_match(&data.files, &torrent, &output_dir),
             _ => false,
         };
@@ -1155,7 +1812,32 @@ impl Session {
             }
         }
 
-        let start_paused = loaded_resume.as_ref().is_some_and(|data| data.is_paused());
+        let start_paused = match add_torrent.paused {
+            Some(paused) => paused,
+            None => {
+                reuse.as_ref().is_some_and(|p| p.start_paused)
+                    || loaded_resume.as_ref().is_some_and(|data| data.is_paused())
+            }
+        };
+        let initial_state = if start_paused {
+            TorrentState::Paused
+        } else {
+            active_state(&downloaded_state)
+        };
+        let download_state = reuse
+            .as_ref()
+            .map(|p| p.download_state.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(DownloadState::Init)));
+        let torrent_state = reuse
+            .as_ref()
+            .map(|p| p.torrent_state.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(initial_state.clone())));
+        *torrent_state.lock().unwrap() = initial_state.clone();
+        sync_download_state(&download_state, &initial_state);
+        let rates = reuse
+            .as_ref()
+            .map(|p| p.rates.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(RateSample::default())));
 
         let metadata = reuse
             .as_ref()
@@ -1190,7 +1872,7 @@ impl Session {
             peer_states.clone(),
             have_broadcast.clone(),
             pr_rx.clone(),
-            self.download_state.clone(),
+            download_state.clone(),
         );
         piece_tx_slot.set(tracker_stream.piece_tx.clone());
 
@@ -1227,8 +1909,7 @@ impl Session {
         if let Some(dht) = self.dht() {
             match tracker_stream.register_source(DiscoverySource::Dht) {
                 Ok(()) => {
-                    let active = !start_paused
-                        && *self.download_state.lock().unwrap() != DownloadState::Paused;
+                    let active = initial_state.transfer_enabled();
                     dht.add_torrent(torrent.info_hash, listen_port, active);
                 }
                 Err(denied) => {
@@ -1240,6 +1921,7 @@ impl Session {
         spawn_choke_loop(
             peer_states.clone(),
             downloaded_state.clone(),
+            download_state.clone(),
             choke_notify.clone(),
             tracker_stream.cancel_token(),
         );
@@ -1250,12 +1932,18 @@ impl Session {
         let downloaded_writer = downloaded_state.clone();
         let persist_state_dir = self.options.state_dir.clone();
         let persist_output_dir = output_dir.clone();
-        let persist_torrent = torrent.clone();
+        let persist_meta_torrent = torrent.clone();
         let persist_uploaded = uploaded.clone();
-        let persist_download_state = self.download_state.clone();
+        let persist_torrent_state = torrent_state.clone();
         let persist_added_at = added_at;
         let persist_completed_at = completed_at.clone();
         let persist_cache_path = torrent_cache_path.clone();
+        let persist_category = category.clone();
+        let persist_tags = tags.clone();
+        let persist_sequential = sequential;
+        let persist_file_priorities = file_priorities.clone();
+        let event_tx = self.event_tx.clone();
+        let completed_id = TorrentId::new(torrent.info_hash);
         tokio::spawn(async move {
             loop {
                 let piece = match piece_rx.recv_async().await {
@@ -1268,7 +1956,7 @@ impl Session {
                     continue;
                 }
                 if downloaded_writer.is_complete() {
-                    let should_sync = {
+                    let first_complete = {
                         let mut done = persist_completed_at.lock().unwrap();
                         if done.is_none() {
                             *done = Some(resume::now_unix());
@@ -1277,24 +1965,45 @@ impl Session {
                             false
                         }
                     };
-                    if should_sync {
+                    if first_complete {
                         if let Err(e) = storage_writer.sync_all().await {
                             debug!(error = %e, "failed to sync files on completion");
+                        }
+                        let _ = event_tx.send(SessionEvent::Completed { id: completed_id });
+                        let was_downloading = {
+                            let mut state = persist_torrent_state.lock().unwrap();
+                            if *state == TorrentState::Downloading {
+                                *state = TorrentState::Seeding;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if was_downloading {
+                            let _ = event_tx.send(SessionEvent::StateChanged {
+                                id: completed_id,
+                                state: TorrentState::Seeding,
+                            });
                         }
                     }
                 }
                 if let Some(state_dir) = persist_state_dir.as_ref() {
+                    let paused = *persist_torrent_state.lock().unwrap() == TorrentState::Paused;
                     if let Err(e) = persist_from_parts(
                         state_dir,
-                        &persist_torrent.info_hash,
+                        &persist_meta_torrent.info_hash,
                         &persist_output_dir,
-                        &persist_torrent,
+                        &persist_meta_torrent,
                         &downloaded_writer,
                         persist_uploaded.load(Ordering::Relaxed),
-                        *persist_download_state.lock().unwrap() == DownloadState::Paused,
+                        paused,
                         &persist_cache_path,
                         persist_added_at,
                         *persist_completed_at.lock().unwrap(),
+                        &persist_category,
+                        &persist_tags,
+                        persist_sequential,
+                        &persist_file_priorities,
                     ) {
                         debug!(error = %e, "failed to persist resume after piece write");
                     }
@@ -1323,7 +2032,8 @@ impl Session {
             peer_states: peer_states.clone(),
             piece_tx,
             have_broadcast,
-            download_state: self.download_state.clone(),
+            torrent_state,
+            download_state,
             uploaded,
             torrent: torrent.clone(),
             torrent_meta: torrent_meta.clone(),
@@ -1333,7 +2043,14 @@ impl Session {
             completed_at,
             torrent_cache_path,
             metadata: metadata.clone(),
+            category,
+            tags,
+            sequential,
+            file_priorities,
+            pr_rx: pr_rx.clone(),
+            rates,
         });
+        let id = TorrentId::new(torrent.info_hash);
         self.torrents
             .insert(torrent.info_hash, torrent_session.clone());
 
@@ -1348,17 +2065,31 @@ impl Session {
         }
 
         if let Some(state_dir) = self.options.state_dir.clone() {
+            if let Err(e) = persist_torrent(&state_dir, &torrent_session) {
+                warn!(
+                    name = %torrent_session.torrent.name,
+                    error = %e,
+                    "failed to persist resume data on add"
+                );
+            }
             spawn_resume_timer(torrent_session, state_dir, self.cancel.clone());
         }
 
-        if start_paused {
-            self.pause();
-        } else {
-            self.start_downloading();
+        if initial_state.transfer_enabled() {
+            let mut global = self.download_state.lock().unwrap();
+            if *global != DownloadState::Paused {
+                *global = DownloadState::Downloading;
+            }
         }
 
+        self.emit(SessionEvent::Added { id });
+        self.emit(SessionEvent::StateChanged {
+            id,
+            state: initial_state,
+        });
+
         Ok(AddTorrentResult {
-            info_hash: torrent.info_hash,
+            id,
             torrent: (*torrent).clone(),
             torrent_meta: Some(torrent_meta),
             pr_rx,
@@ -1374,54 +2105,34 @@ impl Session {
     async fn add_magnet(
         &self,
         magnet: Magnet,
-        output_dir: Option<PathBuf>,
-        _seed: bool,
-        verify: bool,
+        add_torrent: AddTorrentOptions,
     ) -> anyhow::Result<AddTorrentResult> {
         if let Some(existing) = self.torrents.get(&magnet.info_hash) {
-            let torrent = existing.torrent.clone();
-            let (ready_tx, ready_rx) = tokio::sync::watch::channel(Some(torrent.clone()));
-            let _ = ready_tx;
-            let already_have: Vec<PieceResult> = existing
-                .downloaded_state
-                .pieces
-                .iter()
-                .filter(|pw| pw.downloaded.load(Ordering::Relaxed))
-                .map(|pw| PieceResult {
-                    index: pw.piece_work.index,
-                    length: pw.piece_work.length,
-                })
-                .collect();
-            let (_, pr_rx) = flume::unbounded();
-            return Ok(AddTorrentResult {
-                info_hash: magnet.info_hash,
-                torrent: (*torrent).clone(),
-                torrent_meta: Some(existing.torrent_meta.clone()),
-                pr_rx,
-                resume_status: ResumeStatus::FastPath,
-                already_have,
-                fetching_metadata: false,
-                metadata: existing.metadata.clone(),
-                peer_states: existing.peer_states.clone(),
-                ready: ready_rx,
-            });
+            return Ok(self.result_from_existing(existing.value()));
+        }
+        if let Some(pending) = self.pending.get(&magnet.info_hash) {
+            return Ok(result_from_pending(pending.value(), magnet.info_hash));
         }
 
-        let output_dir = output_dir.unwrap_or_else(|| PathBuf::from(magnet.name_or_hash()));
-        let already_pending = self.pending.contains_key(&magnet.info_hash);
+        let output_dir = add_torrent
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(magnet.name_or_hash()));
         let pending = self
             .register_pending(
                 magnet.info_hash,
                 magnet.name_or_hash(),
                 magnet.trackers.clone(),
-                output_dir.clone(),
+                output_dir,
+                &add_torrent,
             )
             .await?;
 
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
         let placeholder = pending.torrent.get();
+        let id = TorrentId::new(magnet.info_hash);
         let result = AddTorrentResult {
-            info_hash: magnet.info_hash,
+            id,
             torrent: (*placeholder).clone(),
             torrent_meta: None,
             pr_rx: pending.pr_rx.clone(),
@@ -1433,7 +2144,12 @@ impl Session {
             ready: ready_rx,
         };
 
-        self.start_downloading();
+        {
+            let mut global = self.download_state.lock().unwrap();
+            if *global != DownloadState::Paused {
+                *global = DownloadState::Downloading;
+            }
+        }
 
         if !magnet.peers.is_empty() {
             self.add_peers(
@@ -1445,28 +2161,41 @@ impl Session {
 
         if let Some(dht) = self.dht() {
             let listen_port = self.listen_port();
-            dht.add_torrent(magnet.info_hash, listen_port, true);
+            dht.add_torrent(
+                magnet.info_hash,
+                listen_port,
+                pending.torrent_state.lock().unwrap().transfer_enabled(),
+            );
         }
 
-        if already_pending {
-            return Ok(result);
-        }
+        self.emit(SessionEvent::Added { id });
+        self.emit(SessionEvent::StateChanged {
+            id,
+            state: TorrentState::Metadata,
+        });
 
         let promoter = self.share();
+        let pending_task = pending.clone();
 
         tokio::spawn(async move {
-            let bytes = pending.metadata.wait().await;
+            let bytes = pending_task.metadata.wait().await;
             let mut meta = match TorrentMeta::from_info_bytes(bytes) {
                 Ok(meta) => meta,
                 Err(e) => {
                     warn!(error = %e, "failed to parse fetched metadata");
+                    let mut state = pending_task.torrent_state.lock().unwrap();
+                    *state = TorrentState::Error(e.to_string());
+                    let _ = promoter.event_tx.send(SessionEvent::Error {
+                        id,
+                        message: e.to_string(),
+                    });
                     return;
                 }
             };
-            if !pending.trackers.is_empty() {
-                meta.torrent_file.announce = Some(pending.trackers[0].clone());
+            if !pending_task.trackers.is_empty() {
+                meta.torrent_file.announce = Some(pending_task.trackers[0].clone());
                 meta.torrent_file.announce_list = Some(
-                    pending
+                    pending_task
                         .trackers
                         .iter()
                         .cloned()
@@ -1475,14 +2204,18 @@ impl Session {
                 );
             }
 
+            let mut opts = AddTorrentOptions::from(meta.clone());
+            opts.output_dir = Some(pending_task.output_dir.clone());
+            opts.verify = pending_task.verify;
+            opts.skip_checking = pending_task.skip_checking;
+            opts.paused = Some(pending_task.start_paused);
+            opts.category = pending_task.category.clone();
+            opts.tags = pending_task.tags.clone();
+            opts.sequential = pending_task.sequential;
+            opts.file_priorities = pending_task.file_priorities.clone();
+
             match promoter
-                .add_torrent_meta(
-                    meta,
-                    Some(pending.output_dir.clone()),
-                    false,
-                    verify,
-                    Some(pending.clone()),
-                )
+                .add_torrent_meta(meta, opts, Some(pending_task.clone()))
                 .await
             {
                 Ok(added) => {
@@ -1490,6 +2223,12 @@ impl Session {
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to promote magnet after metadata");
+                    let mut state = pending_task.torrent_state.lock().unwrap();
+                    *state = TorrentState::Error(e.to_string());
+                    let _ = promoter.event_tx.send(SessionEvent::Error {
+                        id,
+                        message: e.to_string(),
+                    });
                 }
             }
         });
@@ -1510,6 +2249,10 @@ fn persist_from_parts(
     torrent_path: &std::path::Path,
     added_at: i64,
     completed_at: Option<i64>,
+    category: &str,
+    tags: &[String],
+    sequential: bool,
+    file_priorities: &[i64],
 ) -> Result<PathBuf, resume::ResumeError> {
     resume::persist(
         state_dir,
@@ -1523,6 +2266,10 @@ fn persist_from_parts(
             torrent_path,
             added_at,
             completed_at,
+            category,
+            tags,
+            sequential,
+            file_priorities,
         },
     )
 }
@@ -1538,10 +2285,14 @@ fn persist_torrent(
         &torrent.torrent,
         &torrent.downloaded_state,
         torrent.uploaded.load(Ordering::Relaxed),
-        *torrent.download_state.lock().unwrap() == DownloadState::Paused,
+        *torrent.torrent_state.lock().unwrap() == TorrentState::Paused,
         &torrent.torrent_cache_path,
         torrent.added_at,
         *torrent.completed_at.lock().unwrap(),
+        &torrent.category,
+        &torrent.tags,
+        torrent.sequential,
+        &torrent.file_priorities,
     )
 }
 
@@ -1556,8 +2307,11 @@ fn spawn_resume_timer(torrent: Arc<TorrentSession>, state_dir: PathBuf, cancel: 
                 _ = cancel.cancelled() => break,
                 _ = torrent_cancel.cancelled() => break,
                 _ = interval.tick() => {
-                    let downloading =
-                        *torrent.download_state.lock().unwrap() == DownloadState::Downloading;
+                    let downloading = torrent
+                        .torrent_state
+                        .lock()
+                        .unwrap()
+                        .transfer_enabled();
                     if downloading {
                         if let Err(e) = persist_torrent(&state_dir, &torrent) {
                             debug!(error = %e, "periodic resume persist failed");
@@ -1567,6 +2321,265 @@ fn spawn_resume_timer(torrent: Arc<TorrentSession>, state_dir: PathBuf, cancel: 
             }
         }
     });
+}
+
+fn already_have_from(downloaded_state: &TorrentDownloadedState) -> Vec<PieceResult> {
+    downloaded_state
+        .pieces
+        .iter()
+        .filter(|pw| pw.downloaded.load(Ordering::Relaxed))
+        .map(|pw| PieceResult {
+            index: pw.piece_work.index,
+            length: pw.piece_work.length,
+        })
+        .collect()
+}
+
+fn result_from_pending(pending: &PendingTorrent, info_hash: [u8; 20]) -> AddTorrentResult {
+    let torrent = pending.torrent.get();
+    let fetching = pending.metadata.info_bytes().is_none();
+    let (ready_tx, ready_rx) = if fetching {
+        tokio::sync::watch::channel(None)
+    } else {
+        tokio::sync::watch::channel(Some(torrent.clone()))
+    };
+    let _ = ready_tx;
+    AddTorrentResult {
+        id: TorrentId::new(info_hash),
+        torrent: (*torrent).clone(),
+        torrent_meta: None,
+        pr_rx: pending.pr_rx.clone(),
+        resume_status: ResumeStatus::Fresh,
+        already_have: Vec::new(),
+        fetching_metadata: fetching,
+        metadata: pending.metadata.clone(),
+        peer_states: pending.peer_states.clone(),
+        ready: ready_rx,
+    }
+}
+
+fn active_state(downloaded: &TorrentDownloadedState) -> TorrentState {
+    if downloaded.is_complete() {
+        TorrentState::Seeding
+    } else {
+        TorrentState::Downloading
+    }
+}
+
+fn sync_download_state(download_state: &Mutex<DownloadState>, state: &TorrentState) {
+    *download_state.lock().unwrap() = if state.transfer_enabled() {
+        DownloadState::Downloading
+    } else {
+        DownloadState::Paused
+    };
+}
+
+fn connected_peer_counts(peer_states: &PeerStates, piece_count: usize) -> (u32, u32) {
+    let mut peers = 0u32;
+    let mut seeds = 0u32;
+    for state in peer_states.states.iter() {
+        if state.writer_tx.is_none() {
+            continue;
+        }
+        peers += 1;
+        if piece_count > 0 && (0..piece_count).all(|i| state.bitfield.has_piece(i)) {
+            seeds += 1;
+        }
+    }
+    (peers, seeds)
+}
+
+fn snapshot_rates(rates: &Mutex<RateSample>) -> (u64, u64) {
+    let rates = rates.lock().unwrap();
+    (
+        rates.download_rate.max(0.0).round() as u64,
+        rates.upload_rate.max(0.0).round() as u64,
+    )
+}
+
+fn torrent_snapshot(torrent: &TorrentSession) -> TorrentSnapshot {
+    let state = torrent.torrent_state.lock().unwrap().clone();
+    let downloaded = torrent.downloaded_state.downloaded_bytes();
+    let uploaded = torrent.uploaded.load(Ordering::Relaxed);
+    let left = torrent.downloaded_state.left_bytes();
+    let size = torrent.torrent.length.max(0) as u64;
+    let piece_count = torrent.downloaded_state.piece_count() as u32;
+    let pieces_have = torrent.downloaded_state.have_count();
+    let (peers, seeds) = connected_peer_counts(&torrent.peer_states, piece_count as usize);
+    let (download_rate, upload_rate) = snapshot_rates(&torrent.rates);
+    TorrentSnapshot {
+        id: TorrentId::new(torrent.torrent.info_hash),
+        name: torrent.torrent.name.clone(),
+        info_hash: torrent.torrent.info_hash,
+        error: state.error_message(),
+        state,
+        progress: if size == 0 {
+            0.0
+        } else {
+            downloaded as f64 / size as f64
+        },
+        downloaded,
+        uploaded,
+        left,
+        size,
+        download_rate,
+        upload_rate,
+        peers,
+        seeds,
+        save_path: torrent.output_dir.clone(),
+        torrent_path: torrent.torrent_cache_path.clone(),
+        category: torrent.category.clone(),
+        tags: torrent.tags.clone(),
+        sequential: torrent.sequential,
+        added_at: torrent.added_at,
+        completed_at: *torrent.completed_at.lock().unwrap(),
+        piece_count,
+        pieces_have,
+        ratio: if downloaded == 0 {
+            0.0
+        } else {
+            uploaded as f64 / downloaded as f64
+        },
+    }
+}
+
+fn pending_snapshot(info_hash: [u8; 20], pending: &PendingTorrent) -> TorrentSnapshot {
+    let torrent = pending.torrent.get();
+    let state = pending.torrent_state.lock().unwrap().clone();
+    let downloaded_state = pending.downloaded_state.get();
+    let downloaded = downloaded_state.downloaded_bytes();
+    let uploaded = pending.uploaded.load(Ordering::Relaxed);
+    let left = downloaded_state.left_bytes();
+    let size = torrent.length.max(0) as u64;
+    let piece_count = downloaded_state.piece_count() as u32;
+    let pieces_have = downloaded_state.have_count();
+    let (peers, seeds) = connected_peer_counts(&pending.peer_states, piece_count as usize);
+    let (download_rate, upload_rate) = snapshot_rates(&pending.rates);
+    TorrentSnapshot {
+        id: TorrentId::new(info_hash),
+        name: torrent.name.clone(),
+        info_hash,
+        error: state.error_message(),
+        state,
+        progress: if size == 0 {
+            0.0
+        } else {
+            downloaded as f64 / size as f64
+        },
+        downloaded,
+        uploaded,
+        left,
+        size,
+        download_rate,
+        upload_rate,
+        peers,
+        seeds,
+        save_path: pending.output_dir.clone(),
+        torrent_path: PathBuf::new(),
+        category: pending.category.clone(),
+        tags: pending.tags.clone(),
+        sequential: pending.sequential,
+        added_at: pending.added_at,
+        completed_at: None,
+        piece_count,
+        pieces_have,
+        ratio: 0.0,
+    }
+}
+
+fn tick_session(
+    torrents: &DashMap<[u8; 20], Arc<TorrentSession>>,
+    pending: &DashMap<[u8; 20], Arc<PendingTorrent>>,
+    event_tx: &tokio::sync::broadcast::Sender<SessionEvent>,
+) {
+    for entry in torrents.iter() {
+        let torrent = entry.value();
+        let downloaded = torrent.downloaded_state.downloaded_bytes();
+        let uploaded = torrent.uploaded.load(Ordering::Relaxed);
+        torrent
+            .rates
+            .lock()
+            .unwrap()
+            .tick(downloaded, uploaded, RATE_TICK.as_secs_f64());
+        if torrent.downloaded_state.is_complete() {
+            let first = {
+                let mut done = torrent.completed_at.lock().unwrap();
+                if done.is_none() {
+                    *done = Some(resume::now_unix());
+                    true
+                } else {
+                    false
+                }
+            };
+            if first {
+                let _ = event_tx.send(SessionEvent::Completed {
+                    id: TorrentId::new(*entry.key()),
+                });
+                let mut state = torrent.torrent_state.lock().unwrap();
+                if *state == TorrentState::Downloading {
+                    *state = TorrentState::Seeding;
+                    let _ = event_tx.send(SessionEvent::StateChanged {
+                        id: TorrentId::new(*entry.key()),
+                        state: TorrentState::Seeding,
+                    });
+                }
+            }
+        }
+        let state = torrent.torrent_state.lock().unwrap().clone();
+        if matches!(
+            state,
+            TorrentState::Downloading
+                | TorrentState::Seeding
+                | TorrentState::Metadata
+                | TorrentState::Checking
+        ) {
+            let snapshot = torrent_snapshot(torrent);
+            let _ = event_tx.send(SessionEvent::Progress {
+                id: snapshot.id,
+                snapshot: Box::new(snapshot),
+            });
+        }
+    }
+    for entry in pending.iter() {
+        if torrents.contains_key(entry.key()) {
+            continue;
+        }
+        let pending = entry.value();
+        let downloaded = pending.downloaded_state.get().downloaded_bytes();
+        let uploaded = pending.uploaded.load(Ordering::Relaxed);
+        pending
+            .rates
+            .lock()
+            .unwrap()
+            .tick(downloaded, uploaded, RATE_TICK.as_secs_f64());
+        let state = pending.torrent_state.lock().unwrap().clone();
+        if matches!(state, TorrentState::Metadata | TorrentState::Checking) {
+            let snapshot = pending_snapshot(*entry.key(), pending);
+            let _ = event_tx.send(SessionEvent::Progress {
+                id: snapshot.id,
+                snapshot: Box::new(snapshot),
+            });
+        }
+    }
+}
+
+fn disconnect_all_peers(peer_states: &PeerStates) {
+    for state in peer_states.states.iter() {
+        if let Some(tx) = &state.writer_tx {
+            let _ = tx.send(WriterRequest::Disconnect);
+        }
+    }
+}
+
+fn delete_torrent_files(torrent: &Torrent, output_dir: &std::path::Path) {
+    for index in 0..torrent.files.len() {
+        let path = crate::storage::file_path(torrent, output_dir, index);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                debug!(path = %path.display(), error = %e, "failed to delete torrent file");
+            }
+        }
+    }
 }
 
 fn choke_all_peers(peer_states: &PeerStates) {
@@ -1595,7 +2608,6 @@ struct PeerInlet {
     max_peers_global: usize,
     connector: Arc<dyn Connector>,
     dht: Arc<Mutex<Option<DhtHandle>>>,
-    download_state: Arc<Mutex<DownloadState>>,
     encryption: EncryptionPolicy,
 }
 
@@ -1631,17 +2643,25 @@ impl PeerInlet {
         if !allowed {
             return 0;
         }
-        if *self.download_state.lock().unwrap() != DownloadState::Downloading {
+        let (peer_states, max_per, transferring) =
+            if let Some(torrent) = self.torrents.get(info_hash) {
+                (
+                    torrent.peer_states.clone(),
+                    self.max_peers_per_torrent,
+                    *torrent.download_state.lock().unwrap() == DownloadState::Downloading,
+                )
+            } else if let Some(pending) = self.pending.get(info_hash) {
+                (
+                    pending.peer_states.clone(),
+                    self.max_peers_per_torrent,
+                    *pending.download_state.lock().unwrap() == DownloadState::Downloading,
+                )
+            } else {
+                return 0;
+            };
+        if !transferring {
             return 0;
         }
-
-        let (peer_states, max_per) = if let Some(torrent) = self.torrents.get(info_hash) {
-            (torrent.peer_states.clone(), self.max_peers_per_torrent)
-        } else if let Some(pending) = self.pending.get(info_hash) {
-            (pending.peer_states.clone(), self.max_peers_per_torrent)
-        } else {
-            return 0;
-        };
 
         let mut added = 0;
         for addr in addrs {
@@ -2068,6 +3088,7 @@ fn spawn_from_pending(
 fn spawn_choke_loop(
     peer_states: Arc<PeerStates>,
     downloaded_state: Arc<TorrentDownloadedState>,
+    download_state: Arc<Mutex<DownloadState>>,
     choke_notify: Arc<Notify>,
     cancel: CancellationToken,
 ) {
@@ -2081,6 +3102,10 @@ fn spawn_choke_loop(
                 _ = choke_notify.notified() => false,
                 _ = interval.tick() => true,
             };
+            if *download_state.lock().unwrap() != DownloadState::Downloading {
+                choke_all_peers(&peer_states);
+                continue;
+            }
             apply_choke(
                 &peer_states,
                 downloaded_state.is_complete(),
@@ -2185,7 +3210,7 @@ impl Default for Session {
 
 #[cfg(test)]
 mod add_options_tests {
-    use super::AddTorrentOptions;
+    use super::{AddTorrentOptions, TorrentId};
 
     #[test]
     fn from_path_is_fallible() {
@@ -2203,6 +3228,19 @@ mod add_options_tests {
             .expect("parse magnet");
         assert!(opts.is_magnet());
         assert_eq!(opts.name(), hex);
+    }
+
+    #[test]
+    fn torrent_id_displays_lowercase_hex() {
+        let id = TorrentId::new([
+            0x0f, 0xab, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02,
+        ]);
+        assert_eq!(id.to_string(), "0fab00112233445566778899aabbccddeeff0102");
+        assert_eq!(
+            format!("{id:?}"),
+            "TorrentId(0fab00112233445566778899aabbccddeeff0102)"
+        );
     }
 }
 

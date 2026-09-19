@@ -204,6 +204,10 @@ proptest! {
             paused,
             added_at,
             completed_at,
+            category: String::new(),
+            tags: Vec::new(),
+            sequential: 0,
+            file_priorities: Vec::new(),
         };
         let bytes = resume::encode(&data).expect("encode");
         let loaded = resume::decode(&bytes).expect("decode");

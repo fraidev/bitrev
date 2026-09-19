@@ -12,7 +12,8 @@ use crate::storage;
 use crate::torrent::Torrent;
 use crate::utils;
 
-pub const RESUME_VERSION: i64 = 1;
+pub const RESUME_VERSION: i64 = 2;
+pub const RESUME_VERSION_V1: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResumeError {
@@ -47,6 +48,14 @@ pub struct ResumeData {
     pub added_at: i64,
     #[serde(default)]
     pub completed_at: i64,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub sequential: i64,
+    #[serde(default)]
+    pub file_priorities: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +79,10 @@ impl ResumeData {
         (self.completed_at > 0).then_some(self.completed_at)
     }
 
+    pub fn is_sequential(&self) -> bool {
+        self.sequential != 0
+    }
+
     pub fn bitfield(&self) -> Bitfield {
         Bitfield::new(self.bitfield.to_vec())
     }
@@ -85,6 +98,23 @@ pub fn resume_path(state_dir: &Path, info_hash: &[u8; 20]) -> PathBuf {
 
 pub fn torrent_cache_path(state_dir: &Path, info_hash: &[u8; 20]) -> PathBuf {
     util::paths::torrents_dir(state_dir).join(format!("{}.torrent", info_hash_hex(info_hash)))
+}
+
+/// Resume files under `<state_dir>/resume/*.resume`, sorted by path.
+pub fn list_resume_files(state_dir: &Path) -> Vec<PathBuf> {
+    let dir = util::paths::resume_dir(state_dir);
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return paths;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("resume") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
 }
 
 pub fn tmp_path(path: &Path) -> PathBuf {
@@ -116,7 +146,7 @@ pub fn decode(bytes: &[u8]) -> Result<ResumeData, ResumeError> {
     crate::file::check_bencode_depth(bytes).map_err(|e| ResumeError::Decode(e.to_string()))?;
     let data: ResumeData =
         serde_bencode::from_bytes(bytes).map_err(|e| ResumeError::Decode(e.to_string()))?;
-    if data.version != RESUME_VERSION {
+    if data.version != RESUME_VERSION && data.version != RESUME_VERSION_V1 {
         return Err(ResumeError::UnsupportedVersion(data.version));
     }
     if data.info_hash.len() != 20 {
@@ -279,6 +309,10 @@ pub struct ResumeSnapshot<'a> {
     pub torrent_path: &'a Path,
     pub added_at: i64,
     pub completed_at: Option<i64>,
+    pub category: &'a str,
+    pub tags: &'a [String],
+    pub sequential: bool,
+    pub file_priorities: &'a [i64],
 }
 
 pub fn snapshot(snap: ResumeSnapshot<'_>) -> ResumeData {
@@ -295,6 +329,10 @@ pub fn snapshot(snap: ResumeSnapshot<'_>) -> ResumeData {
         paused: i64::from(snap.paused),
         added_at: snap.added_at,
         completed_at: snap.completed_at.unwrap_or(0),
+        category: snap.category.to_string(),
+        tags: snap.tags.to_vec(),
+        sequential: i64::from(snap.sequential),
+        file_priorities: snap.file_priorities.to_vec(),
     }
 }
 
@@ -337,6 +375,10 @@ mod tests {
             paused: 1,
             added_at: 1_700_000_000,
             completed_at: 0,
+            category: String::new(),
+            tags: Vec::new(),
+            sequential: 0,
+            file_priorities: Vec::new(),
         }
     }
 
@@ -405,6 +447,64 @@ mod tests {
             decode(&bytes),
             Err(ResumeError::UnsupportedVersion(99))
         ));
+    }
+
+    #[test]
+    fn v1_resume_loads_with_v2_defaults() {
+        #[derive(Serialize)]
+        struct ResumeV1 {
+            version: i64,
+            info_hash: ByteBuf,
+            bitfield: ByteBuf,
+            output_dir: String,
+            files: Vec<ResumeFile>,
+            uploaded: i64,
+            downloaded: i64,
+            torrent_path: String,
+            paused: i64,
+            added_at: i64,
+            completed_at: i64,
+        }
+        let bytes = serde_bencode::to_bytes(&ResumeV1 {
+            version: RESUME_VERSION_V1,
+            info_hash: ByteBuf::from(vec![0xab; 20]),
+            bitfield: ByteBuf::from(vec![0b1010_0000]),
+            output_dir: "/tmp/out.bin".into(),
+            files: vec![ResumeFile {
+                path: vec!["out.bin".into()],
+                length: 16,
+                mtime: 1_700_000_000,
+            }],
+            uploaded: 11,
+            downloaded: 16,
+            torrent_path: "/tmp/torrents/ab.torrent".into(),
+            paused: 1,
+            added_at: 1_700_000_000,
+            completed_at: 0,
+        })
+        .unwrap();
+        let loaded = decode(&bytes).unwrap();
+        assert_eq!(loaded.version, RESUME_VERSION_V1);
+        assert!(loaded.is_paused());
+        assert!(loaded.category.is_empty());
+        assert!(loaded.tags.is_empty());
+        assert!(!loaded.is_sequential());
+        assert!(loaded.file_priorities.is_empty());
+    }
+
+    #[test]
+    fn list_resume_files_finds_sorted_resume_suffix() {
+        let dir = temp_dir("list");
+        let resume = util::paths::resume_dir(&dir);
+        std::fs::create_dir_all(&resume).unwrap();
+        std::fs::write(resume.join("b.resume"), b"x").unwrap();
+        std::fs::write(resume.join("a.resume"), b"x").unwrap();
+        std::fs::write(resume.join("ignore.txt"), b"x").unwrap();
+        let listed = list_resume_files(&dir);
+        assert_eq!(listed.len(), 2);
+        assert!(listed[0].ends_with("a.resume"));
+        assert!(listed[1].ends_with("b.resume"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

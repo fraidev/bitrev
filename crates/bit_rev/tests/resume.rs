@@ -399,6 +399,10 @@ async fn fast_path_trusts_bitfield_when_mtimes_match() {
         paused: 0,
         added_at: 1,
         completed_at: 0,
+        category: String::new(),
+        tags: Vec::new(),
+        sequential: 0,
+        file_priorities: Vec::new(),
     };
     resume::save(
         &resume::resume_path(&state_dir, &meta.info_hash),
@@ -444,6 +448,10 @@ async fn slow_path_on_mtime_mismatch_rehashes() {
         paused: 0,
         added_at: 1,
         completed_at: 0,
+        category: String::new(),
+        tags: Vec::new(),
+        sequential: 0,
+        file_priorities: Vec::new(),
     };
     resume::save(
         &resume::resume_path(&state_dir, &meta.info_hash),
@@ -486,6 +494,10 @@ async fn verify_flag_forces_slow_path() {
         paused: 0,
         added_at: 1,
         completed_at: 0,
+        category: String::new(),
+        tags: Vec::new(),
+        sequential: 0,
+        file_priorities: Vec::new(),
     };
     resume::save(
         &resume::resume_path(&state_dir, &meta.info_hash),
@@ -543,17 +555,20 @@ async fn paused_flag_survives_restart() {
         .add_torrent(AddTorrentOptions::from(meta.clone()).output_dir(output.clone()))
         .await
         .unwrap();
-    first.pause();
+    first.pause_all();
     first.flush_resume().await;
     assert!(first.is_paused());
     drop(first);
 
     let second = test_session(Some(state_dir.clone()));
-    second
-        .add_torrent(AddTorrentOptions::from(meta).output_dir(output))
+    let added = second
+        .add_torrent(AddTorrentOptions::from(meta.clone()).output_dir(output))
         .await
         .unwrap();
-    assert!(second.is_paused());
+    let snap = second
+        .snapshot(added.id)
+        .expect("paused torrent should be listed");
+    assert_eq!(snap.state, bit_rev::session::TorrentState::Paused);
     drop(second);
     let _ = std::fs::remove_dir_all(&state_dir);
 }
@@ -575,5 +590,41 @@ async fn torrent_metainfo_is_cached_on_add() {
     let loaded = bit_rev::file::from_filename(cached.to_str().unwrap()).unwrap();
     assert_eq!(loaded.info_hash, meta.info_hash);
     drop(session);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn session_open_reloads_from_state_dir() {
+    const PIECE_LEN: i64 = 16_384;
+    let data = generated_payload(PIECE_LEN as usize);
+    let meta = torrent_meta("open.bin", &data, PIECE_LEN);
+    let state_dir = unique_temp_dir("resume-open");
+    let output = state_dir.join("out.bin");
+
+    let first = test_session(Some(state_dir.clone()));
+    first
+        .add_torrent(
+            AddTorrentOptions::from(meta.clone())
+                .output_dir(output)
+                .paused(true),
+        )
+        .await
+        .unwrap();
+    first.flush_resume().await;
+    drop(first);
+
+    let second = Session::open(SessionOptions {
+        listen_port: 0,
+        state_dir: Some(state_dir.clone()),
+        ..SessionOptions::default()
+    })
+    .await
+    .expect("open previous session");
+    let _ = tokio::time::timeout(Duration::from_secs(2), second.wait_listening()).await;
+    let listed = second.list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].info_hash, meta.info_hash);
+    assert_eq!(listed[0].state, bit_rev::session::TorrentState::Paused);
+    drop(second);
     let _ = std::fs::remove_dir_all(&state_dir);
 }

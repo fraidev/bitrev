@@ -504,6 +504,10 @@ async fn recheck_does_not_stall_other_download() {
         paused: 0,
         added_at: 1,
         completed_at: 0,
+        category: String::new(),
+        tags: Vec::new(),
+        sequential: 0,
+        file_priorities: Vec::new(),
     };
     resume::save(
         &resume::resume_path(state_dir.path(), &big.torrent_meta.info_hash),
