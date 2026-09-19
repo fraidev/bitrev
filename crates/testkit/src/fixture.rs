@@ -12,7 +12,7 @@ use serde_bencode::ser;
 use serde_bytes::ByteBuf;
 use tempfile::TempDir;
 
-use super::sha1_bytes;
+use super::{hex_encode, sha1_bytes};
 
 const STREAM_CHUNK: usize = 64 * 1024;
 
@@ -59,6 +59,17 @@ pub struct FixtureBuilder {
     announce: Option<String>,
     announce_list: Option<Vec<Vec<String>>>,
     keep_payload: bool,
+    private: bool,
+}
+
+/// Torrent and payload copied out of the fixture temp dir.
+#[derive(Debug, Clone)]
+pub struct PersistedFixture {
+    pub dir: PathBuf,
+    pub torrent_path: PathBuf,
+    pub data_dir: PathBuf,
+    pub sha1_hex: String,
+    pub info_hash_hex: String,
 }
 
 impl FixtureBuilder {
@@ -71,6 +82,7 @@ impl FixtureBuilder {
             announce: None,
             announce_list: None,
             keep_payload: true,
+            private: false,
         }
     }
 
@@ -113,6 +125,11 @@ impl FixtureBuilder {
 
     pub fn keep_payload(mut self, keep: bool) -> Self {
         self.keep_payload = keep;
+        self
+    }
+
+    pub fn private(mut self, private: bool) -> Self {
+        self.private = private;
         self
     }
 
@@ -165,6 +182,68 @@ impl TorrentFixture {
 
     pub fn payload_bytes(&self) -> Option<&[u8]> {
         self.payload.as_deref()
+    }
+
+    pub fn payload_sha1(&self) -> [u8; 20] {
+        if let Some(payload) = &self.payload {
+            return sha1_bytes(payload);
+        }
+        let mut hasher = sha1_smol::Sha1::new();
+        let mut buf = vec![0u8; STREAM_CHUNK];
+        for file in &self.files {
+            let mut f = std::fs::File::open(&file.disk_path).expect("open fixture file");
+            loop {
+                let n = f.read(&mut buf).expect("read fixture file");
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+        }
+        hasher.digest().bytes()
+    }
+
+    pub fn payload_sha1_hex(&self) -> String {
+        hex_encode(&self.payload_sha1())
+    }
+
+    pub fn info_hash_hex(&self) -> String {
+        hex_encode(&self.torrent_meta.info_hash)
+    }
+
+    /// Copy the `.torrent` and payload files into `dir` so they outlive this fixture.
+    pub fn persist_to(&self, dir: impl AsRef<Path>) -> PersistedFixture {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir).expect("create persist dir");
+        let torrent_path = dir.join(format!("{}.torrent", self.name));
+        std::fs::write(&torrent_path, &self.torrent_bytes).expect("write torrent");
+
+        let data_dir = dir.join("data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        for file in &self.files {
+            let mut dest = data_dir.clone();
+            for component in &file.path {
+                dest.push(component);
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).expect("create persist parent");
+            }
+            std::fs::copy(&file.disk_path, &dest).expect("copy payload file");
+        }
+
+        let sha1_hex = self.payload_sha1_hex();
+        let info_hash_hex = self.info_hash_hex();
+        std::fs::write(dir.join("payload.sha1"), format!("{sha1_hex}\n")).expect("write sha1");
+        std::fs::write(dir.join("info-hash.txt"), format!("{info_hash_hex}\n"))
+            .expect("write info hash");
+
+        PersistedFixture {
+            dir: dir.to_path_buf(),
+            torrent_path,
+            data_dir,
+            sha1_hex,
+            info_hash_hex,
+        }
     }
 
     pub fn set_announce(&mut self, announce: impl Into<String>) {
@@ -375,7 +454,7 @@ impl TorrentFixture {
                 md5sum: None,
                 length,
                 files,
-                private: None,
+                private: if builder.private { Some(1) } else { None },
                 path: None,
                 root_hash: None,
             },

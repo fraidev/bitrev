@@ -1535,7 +1535,7 @@ fn choke_all_peers(peer_states: &PeerStates) {
             if let Some(tx) = &state.writer_tx {
                 let _ = tx.send(WriterRequest::Message(Message::Choke));
             }
-            state.stats.upload_notify.notify_waiters();
+            state.stats.upload_notify.notify_one();
         }
     }
 }
@@ -1827,8 +1827,9 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         debug!(%addr, "refusing banned incoming peer");
         return;
     }
+    let advertise_dht = ctx.dht.is_some() && target.torrent.get().allows_dht();
     let mut reply = Handshake::outgoing(handshake.info_hash, ctx.peer_id);
-    if ctx.dht.is_some() {
+    if advertise_dht {
         reply.enable_dht();
     }
     if let Err(e) = Protocol::write_handshake(&mut stream, &reply).await {
@@ -1846,7 +1847,7 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         extensions: ctx.extensions,
         listen_port: ctx.listen_port,
         metadata: target.metadata,
-        advertise_dht: ctx.dht.is_some(),
+        advertise_dht,
         dht_port: ctx.dht.as_ref().map(|d| d.udp_port()),
         dht: ctx.dht,
         piece_tx: target.piece_tx,
@@ -1959,7 +1960,7 @@ fn spawn_from_session(
         extensions,
         listen_port,
         metadata: torrent.metadata.clone(),
-        advertise_dht,
+        advertise_dht: advertise_dht && torrent.torrent.allows_dht(),
         dht_port,
         dht,
         global_peers,
@@ -2011,7 +2012,7 @@ fn spawn_from_pending(
         extensions,
         listen_port,
         metadata: pending.metadata.clone(),
-        advertise_dht,
+        advertise_dht: advertise_dht && pending.torrent.get().allows_dht(),
         dht_port,
         dht,
         global_peers,
@@ -2111,7 +2112,7 @@ fn apply_choke(
                 if let Some(tx) = &state.writer_tx {
                     let _ = tx.send(WriterRequest::Message(Message::Choke));
                 }
-                state.stats.upload_notify.notify_waiters();
+                state.stats.upload_notify.notify_one();
             }
             ChokeAction::Unchoke => {
                 state.set_am_choking(false);
@@ -2120,7 +2121,7 @@ fn apply_choke(
                 if let Some(tx) = &state.writer_tx {
                     let _ = tx.send(WriterRequest::Message(Message::Unchoke));
                 }
-                state.stats.upload_notify.notify_waiters();
+                state.stats.upload_notify.notify_one();
             }
         }
     }
