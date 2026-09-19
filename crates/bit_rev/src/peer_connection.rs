@@ -140,6 +140,19 @@ impl TorrentDownloadedState {
             .sum()
     }
 
+    pub fn have_count(&self) -> u32 {
+        self.pieces
+            .iter()
+            .filter(|pw| pw.downloaded.load(Ordering::Relaxed))
+            .count() as u32
+    }
+
+    pub fn clear_all_downloaded(&self) {
+        for index in 0..self.pieces.len() {
+            self.remove_downloaded(index as u32);
+        }
+    }
+
     pub fn left_bytes(&self) -> u64 {
         self.pieces
             .iter()

@@ -212,6 +212,10 @@ fn sample_resume() -> ResumeData {
         paused: 1,
         added_at: 1_700_000_000,
         completed_at: 0,
+        category: String::new(),
+        tags: Vec::new(),
+        sequential: 0,
+        file_priorities: Vec::new(),
     }
 }
 
