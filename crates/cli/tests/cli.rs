@@ -19,6 +19,7 @@ fn help_lists_every_flag() {
         "--seed",
         "--no-seed",
         "--verify",
+        "--sequential",
         "--config",
         "--quiet",
         "-q",

@@ -106,6 +106,19 @@ pub fn select_piece(
     best.choose(rng).copied()
 }
 
+/// Prefer list first (first/last pieces, then caller hints), then lowest index.
+pub fn select_sequential(candidates: &[u32], prefer: &[u32]) -> Option<u32> {
+    if candidates.is_empty() {
+        return None;
+    }
+    for &index in prefer {
+        if candidates.contains(&index) {
+            return Some(index);
+        }
+    }
+    candidates.iter().copied().min()
+}
+
 pub fn seeded_rng(seed: u64) -> StdRng {
     use rand::SeedableRng;
     StdRng::seed_from_u64(seed)
@@ -311,5 +324,14 @@ mod tests {
         let avail = Availability::new(1);
         let mut rng = seeded_rng(1);
         assert!(select_piece(&[], &[], &avail, 4, 4, &mut rng).is_none());
+        assert!(select_sequential(&[], &[0]).is_none());
+    }
+
+    #[test]
+    fn sequential_prefers_list_then_lowest_index() {
+        let candidates = [3u32, 1, 5, 0, 4];
+        assert_eq!(select_sequential(&candidates, &[4, 5]), Some(4));
+        assert_eq!(select_sequential(&candidates, &[9]), Some(0));
+        assert_eq!(select_sequential(&candidates, &[]), Some(0));
     }
 }

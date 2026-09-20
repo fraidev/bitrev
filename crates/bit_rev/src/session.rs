@@ -1,7 +1,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,12 +17,14 @@ use crate::peer_connection::{
     try_spawn_peer, PieceWorkState, Slot, SpawnPeerParams, TorrentDownloadedState,
 };
 use crate::peer_state::PeerStates;
+use crate::priority;
 use crate::protocol::Protocol;
 use crate::resume::{self, ResumeSnapshot};
 
 pub use crate::dht::{DhtOptions, DhtStats};
 use crate::hash::PieceHasher;
 use crate::mse::{self, EncryptionPolicy, MseConnector};
+pub use crate::priority::{FileInfo, FilePriority};
 pub use crate::resume::ResumeStatus;
 pub use crate::storage::Preallocate;
 use crate::storage::{Storage, StorageOptions};
@@ -186,6 +188,8 @@ pub enum ControlError {
     NotFound(TorrentId),
     #[error("torrent {0} has no metadata yet")]
     NoMetadata(TorrentId),
+    #[error("torrent {id} has no file {index}")]
+    NoSuchFile { id: TorrentId, index: usize },
 }
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -288,8 +292,6 @@ pub struct TorrentSession {
     pub metadata: Arc<MetadataStore>,
     pub category: String,
     pub tags: Vec<String>,
-    pub sequential: bool,
-    pub file_priorities: Vec<i64>,
     pub pr_rx: Receiver<PieceResult>,
     rates: Arc<Mutex<RateSample>>,
 }
@@ -343,8 +345,8 @@ pub(crate) struct PendingTorrent {
     skip_checking: bool,
     category: String,
     tags: Vec<String>,
-    sequential: bool,
-    file_priorities: Vec<i64>,
+    sequential: std::sync::atomic::AtomicBool,
+    file_priorities: Mutex<Vec<FilePriority>>,
     rates: Arc<Mutex<RateSample>>,
 }
 
@@ -402,7 +404,7 @@ pub struct AddTorrentOptions {
     tags: Vec<String>,
     sequential: bool,
     skip_checking: bool,
-    file_priorities: Vec<i64>,
+    file_priorities: Vec<FilePriority>,
 }
 
 impl AddTorrentOptions {
@@ -496,7 +498,7 @@ impl AddTorrentOptions {
         self
     }
 
-    pub fn file_priorities(mut self, priorities: impl Into<Vec<i64>>) -> Self {
+    pub fn file_priorities(mut self, priorities: impl Into<Vec<FilePriority>>) -> Self {
         self.file_priorities = priorities.into();
         self
     }
@@ -720,7 +722,7 @@ impl Session {
                 .category(data.category.clone())
                 .tags(data.tags.clone())
                 .sequential(data.is_sequential())
-                .file_priorities(data.file_priorities.clone()),
+                .file_priorities(FilePriority::decode_list(&data.file_priorities)),
         )
         .await?;
         Ok(())
@@ -1138,6 +1140,147 @@ impl Session {
         self.pending
             .get(&id.0)
             .map(|pending| pending_snapshot(id.0, pending.value()))
+    }
+
+    pub fn set_file_priority(
+        &self,
+        id: TorrentId,
+        file_index: usize,
+        priority: FilePriority,
+    ) -> Result<(), ControlError> {
+        if let Some(pending) = self.pending.get(&id.0) {
+            if !self.torrents.contains_key(&id.0) {
+                let mut prios = pending.file_priorities.lock().unwrap();
+                if file_index >= prios.len() {
+                    prios.resize(file_index + 1, FilePriority::Normal);
+                }
+                prios[file_index] = priority;
+                return Ok(());
+            }
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        let cancels = torrent
+            .downloaded_state
+            .set_file_priority(file_index, priority)
+            .ok_or(ControlError::NoSuchFile {
+                id,
+                index: file_index,
+            })?;
+        send_priority_cancels(&torrent.peer_states, cancels);
+        self.after_content_change(&torrent, id);
+        Ok(())
+    }
+
+    pub fn set_file_priorities(
+        &self,
+        id: TorrentId,
+        priorities: Vec<FilePriority>,
+    ) -> Result<(), ControlError> {
+        if let Some(pending) = self.pending.get(&id.0) {
+            if !self.torrents.contains_key(&id.0) {
+                *pending.file_priorities.lock().unwrap() = priorities;
+                return Ok(());
+            }
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        let cancels = torrent.downloaded_state.apply_file_priorities(&priorities);
+        send_priority_cancels(&torrent.peer_states, cancels);
+        self.after_content_change(&torrent, id);
+        Ok(())
+    }
+
+    pub fn file_priorities(&self, id: TorrentId) -> Result<Vec<FilePriority>, ControlError> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            return Ok(torrent.downloaded_state.file_priorities());
+        }
+        if let Some(pending) = self.pending.get(&id.0) {
+            return Ok(pending.file_priorities.lock().unwrap().clone());
+        }
+        Err(ControlError::NotFound(id))
+    }
+
+    pub fn files(&self, id: TorrentId) -> Result<Vec<FileInfo>, ControlError> {
+        if self.pending.contains_key(&id.0) && !self.torrents.contains_key(&id.0) {
+            return Err(ControlError::NoMetadata(id));
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        let prios = torrent.downloaded_state.file_priorities();
+        let downloaded = torrent.downloaded_state.clone();
+        Ok(torrent
+            .torrent
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let length = file.length.max(0) as u64;
+                let have = priority::file_have_bytes(&torrent.torrent, index, |piece| {
+                    downloaded.has_piece(piece)
+                });
+                FileInfo {
+                    index,
+                    path: priority::file_path(file),
+                    length,
+                    progress: if length == 0 {
+                        1.0
+                    } else {
+                        have as f64 / length as f64
+                    },
+                    priority: prios.get(index).copied().unwrap_or(FilePriority::Normal),
+                }
+            })
+            .collect())
+    }
+
+    pub fn set_sequential(&self, id: TorrentId, sequential: bool) -> Result<(), ControlError> {
+        if let Some(pending) = self.pending.get(&id.0) {
+            if !self.torrents.contains_key(&id.0) {
+                pending.sequential.store(sequential, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        torrent.downloaded_state.set_sequential(sequential);
+        self.spawn_flush_one(torrent);
+        Ok(())
+    }
+
+    fn after_content_change(&self, torrent: &Arc<TorrentSession>, id: TorrentId) {
+        let state = torrent.torrent_state.lock().unwrap().clone();
+        if state != TorrentState::Paused && state != TorrentState::Checking {
+            let next = active_state(&torrent.downloaded_state);
+            self.set_torrent_state(torrent, id, next);
+        }
+        if torrent.downloaded_state.is_complete() {
+            let first = {
+                let mut done = torrent.completed_at.lock().unwrap();
+                if done.is_none() {
+                    *done = Some(resume::now_unix());
+                    true
+                } else {
+                    false
+                }
+            };
+            if first {
+                self.emit(SessionEvent::Completed { id });
+            }
+        }
+        self.spawn_flush_one(torrent.clone());
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SessionEvent> {
@@ -1598,8 +1741,8 @@ impl Session {
             skip_checking: opts.skip_checking,
             category: opts.category.clone(),
             tags: opts.tags.clone(),
-            sequential: opts.sequential,
-            file_priorities: opts.file_priorities.clone(),
+            sequential: AtomicBool::new(opts.sequential),
+            file_priorities: Mutex::new(opts.file_priorities.clone()),
             rates: Arc::new(Mutex::new(RateSample::default())),
         });
         self.pending.insert(info_hash, pending.clone());
@@ -1688,14 +1831,17 @@ impl Session {
         } else {
             add_torrent.tags.clone()
         };
-        let sequential = add_torrent.sequential || reuse.as_ref().is_some_and(|p| p.sequential);
-        let file_priorities = if add_torrent.file_priorities.is_empty() {
+        let mut sequential = add_torrent.sequential
+            || reuse
+                .as_ref()
+                .is_some_and(|p| p.sequential.load(Ordering::Relaxed));
+        let mut file_priorities = if !add_torrent.file_priorities.is_empty() {
+            add_torrent.file_priorities.clone()
+        } else {
             reuse
                 .as_ref()
-                .map(|p| p.file_priorities.clone())
+                .map(|p| p.file_priorities.lock().unwrap().clone())
                 .unwrap_or_default()
-        } else {
-            add_torrent.file_priorities.clone()
         };
 
         let torrent_cache_path = if let Some(state_dir) = self.options.state_dir.as_ref() {
@@ -1806,6 +1952,13 @@ impl Session {
                 .map(PieceWorkState::new)
                 .collect(),
         ));
+        if let Some(data) = &loaded_resume {
+            sequential = sequential || data.is_sequential();
+            if file_priorities.is_empty() {
+                file_priorities = FilePriority::decode_list(&data.file_priorities);
+            }
+        }
+        downloaded_state.install_content(&torrent, sequential, &file_priorities);
 
         let resume_status = if seed {
             downloaded_state.mark_all_downloaded();
@@ -1969,8 +2122,6 @@ impl Session {
         let persist_cache_path = torrent_cache_path.clone();
         let persist_category = category.clone();
         let persist_tags = tags.clone();
-        let persist_sequential = sequential;
-        let persist_file_priorities = file_priorities.clone();
         let event_tx = self.event_tx.clone();
         let completed_id = TorrentId::new(torrent.info_hash);
         tokio::spawn(async move {
@@ -2031,8 +2182,8 @@ impl Session {
                         *persist_completed_at.lock().unwrap(),
                         &persist_category,
                         &persist_tags,
-                        persist_sequential,
-                        &persist_file_priorities,
+                        downloaded_writer.sequential(),
+                        &downloaded_writer.file_priorities_resume(),
                     ) {
                         debug!(error = %e, "failed to persist resume after piece write");
                     }
@@ -2074,8 +2225,6 @@ impl Session {
             metadata: metadata.clone(),
             category,
             tags,
-            sequential,
-            file_priorities,
             pr_rx: pr_rx.clone(),
             rates,
         });
@@ -2240,8 +2389,8 @@ impl Session {
             opts.paused = Some(pending_task.start_paused);
             opts.category = pending_task.category.clone();
             opts.tags = pending_task.tags.clone();
-            opts.sequential = pending_task.sequential;
-            opts.file_priorities = pending_task.file_priorities.clone();
+            opts.sequential = pending_task.sequential.load(Ordering::Relaxed);
+            opts.file_priorities = pending_task.file_priorities.lock().unwrap().clone();
 
             match promoter
                 .add_torrent_meta(meta, opts, Some(pending_task.clone()))
@@ -2263,6 +2412,29 @@ impl Session {
         });
 
         Ok(result)
+    }
+}
+
+fn send_priority_cancels(
+    peer_states: &PeerStates,
+    cancels: Vec<(PeerAddr, crate::message::BlockRequest)>,
+) {
+    if cancels.is_empty() {
+        return;
+    }
+    let mut reqs: Vec<crate::message::BlockRequest> =
+        cancels.into_iter().map(|(_, req)| req).collect();
+    reqs.sort_by_key(|req| (req.index, req.begin, req.length));
+    reqs.dedup();
+    for state in peer_states.states.iter() {
+        if let Some(tx) = &state.writer_tx {
+            for req in &reqs {
+                state.stats.download_cancels.lock().unwrap().push(*req);
+                let _ = tx.send(WriterRequest::Message(crate::message::format_cancel(
+                    req.index, req.begin, req.length,
+                )));
+            }
+        }
     }
 }
 
@@ -2320,8 +2492,8 @@ fn persist_torrent(
         *torrent.completed_at.lock().unwrap(),
         &torrent.category,
         &torrent.tags,
-        torrent.sequential,
-        &torrent.file_priorities,
+        torrent.downloaded_state.sequential(),
+        &torrent.downloaded_state.file_priorities_resume(),
     )
 }
 
@@ -2432,6 +2604,8 @@ fn torrent_snapshot(torrent: &TorrentSession) -> TorrentSnapshot {
     let uploaded = torrent.uploaded.load(Ordering::Relaxed);
     let left = torrent.downloaded_state.left_bytes();
     let size = torrent.torrent.length.max(0) as u64;
+    let wanted_total = torrent.downloaded_state.wanted_total_bytes();
+    let wanted_have = torrent.downloaded_state.wanted_have_bytes();
     let piece_count = torrent.downloaded_state.piece_count() as u32;
     let pieces_have = torrent.downloaded_state.have_count();
     let (peers, seeds) = connected_peer_counts(&torrent.peer_states, piece_count as usize);
@@ -2442,10 +2616,10 @@ fn torrent_snapshot(torrent: &TorrentSession) -> TorrentSnapshot {
         info_hash: torrent.torrent.info_hash,
         error: state.error_message(),
         state,
-        progress: if size == 0 {
-            0.0
+        progress: if wanted_total == 0 {
+            1.0
         } else {
-            downloaded as f64 / size as f64
+            wanted_have as f64 / wanted_total as f64
         },
         downloaded,
         uploaded,
@@ -2459,7 +2633,7 @@ fn torrent_snapshot(torrent: &TorrentSession) -> TorrentSnapshot {
         torrent_path: torrent.torrent_cache_path.clone(),
         category: torrent.category.clone(),
         tags: torrent.tags.clone(),
-        sequential: torrent.sequential,
+        sequential: torrent.downloaded_state.sequential(),
         added_at: torrent.added_at,
         completed_at: *torrent.completed_at.lock().unwrap(),
         piece_count,
@@ -2507,7 +2681,7 @@ fn pending_snapshot(info_hash: [u8; 20], pending: &PendingTorrent) -> TorrentSna
         torrent_path: PathBuf::new(),
         category: pending.category.clone(),
         tags: pending.tags.clone(),
-        sequential: pending.sequential,
+        sequential: pending.sequential.load(Ordering::Relaxed),
         added_at: pending.added_at,
         completed_at: None,
         piece_count,
