@@ -16,6 +16,7 @@ pub mod peer;
 pub mod peer_connection;
 pub mod peer_state;
 pub mod picker;
+pub mod priority;
 pub mod protocol;
 pub mod protocol_udp;
 pub mod resume;

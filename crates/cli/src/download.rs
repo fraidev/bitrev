@@ -14,7 +14,7 @@ pub async fn run(cli: Cli, config: Config) -> anyhow::Result<()> {
     for input in &cli.inputs {
         pending.push((
             input.clone(),
-            add_options(input, &config.download_dir, cli.verify)?,
+            add_options(input, &config.download_dir, cli.verify, cli.sequential)?,
         ));
     }
 
@@ -59,13 +59,17 @@ fn add_options(
     input: &str,
     download_dir: &Path,
     verify: bool,
+    sequential: bool,
 ) -> anyhow::Result<AddTorrentOptions> {
     let opts = match classify_input(input) {
         InputKind::Magnet | InputKind::File => AddTorrentOptions::try_from(input)
             .with_context(|| format!("failed to open torrent or magnet {input}"))?,
     };
     let output = util::paths::expand_tilde(download_dir).join(opts.name());
-    Ok(opts.verify(verify).output_dir(output))
+    Ok(opts
+        .verify(verify)
+        .sequential(sequential)
+        .output_dir(output))
 }
 
 fn progress_style() -> ProgressStyle {

@@ -1,9 +1,8 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    future,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -30,7 +29,8 @@ use crate::{
     mse::{initiate, EncryptionPolicy, CRYPTO_PLAINTEXT, CRYPTO_RC4},
     peer::PeerAddr,
     peer_state::PeerStates,
-    picker::{self, select_piece, Availability, BOOTSTRAP_VERIFIED},
+    picker::{self, select_piece, select_sequential, Availability, BOOTSTRAP_VERIFIED},
+    priority::{self, FilePriority},
     protocol::{Frame, Protocol},
     session::{DownloadState, PieceWork},
     storage::Storage,
@@ -80,6 +80,11 @@ struct BlockAssignment {
     first_at: tokio::time::Instant,
 }
 
+struct FileSpan {
+    offset: u64,
+    length: u64,
+}
+
 pub struct TorrentDownloadedState {
     pub semaphore: Semaphore,
     pub pieces: Vec<PieceWorkState>,
@@ -90,6 +95,13 @@ pub struct TorrentDownloadedState {
     block_assignments: Mutex<HashMap<BlockRequest, BlockAssignment>>,
     duplicate_bytes: AtomicU64,
     pub piece_notify: Notify,
+    sequential: AtomicBool,
+    file_priorities: Mutex<Vec<FilePriority>>,
+    piece_priority: Vec<AtomicU8>,
+    piece_files: Mutex<Vec<Vec<usize>>>,
+    file_spans: Mutex<Vec<FileSpan>>,
+    piece_length: AtomicU64,
+    first_last: Mutex<Vec<u32>>,
 }
 
 impl TorrentDownloadedState {
@@ -113,7 +125,199 @@ impl TorrentDownloadedState {
             block_assignments: Mutex::new(HashMap::new()),
             duplicate_bytes: AtomicU64::new(0),
             piece_notify: Notify::new(),
+            sequential: AtomicBool::new(false),
+            file_priorities: Mutex::new(Vec::new()),
+            piece_priority: (0..n)
+                .map(|_| AtomicU8::new(FilePriority::Normal as u8))
+                .collect(),
+            piece_files: Mutex::new(Vec::new()),
+            file_spans: Mutex::new(Vec::new()),
+            piece_length: AtomicU64::new(0),
+            first_last: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn install_content(
+        &self,
+        torrent: &Torrent,
+        sequential: bool,
+        priorities: &[FilePriority],
+    ) -> Vec<(PeerAddr, BlockRequest)> {
+        let piece_files: Vec<Vec<usize>> = (0..self.pieces.len())
+            .map(|index| {
+                utils::map_piece_to_files(torrent, index)
+                    .into_iter()
+                    .map(|m| m.file_index)
+                    .collect()
+            })
+            .collect();
+        let file_spans: Vec<FileSpan> = torrent
+            .files
+            .iter()
+            .map(|file| FileSpan {
+                offset: file.offset.max(0) as u64,
+                length: file.length.max(0) as u64,
+            })
+            .collect();
+        *self.piece_files.lock().unwrap() = piece_files;
+        *self.file_spans.lock().unwrap() = file_spans;
+        self.piece_length
+            .store(torrent.piece_length.max(0) as u64, Ordering::Relaxed);
+        self.sequential.store(sequential, Ordering::Relaxed);
+        self.apply_file_priorities(priorities)
+    }
+
+    pub fn sequential(&self) -> bool {
+        self.sequential.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sequential(&self, sequential: bool) {
+        self.sequential.store(sequential, Ordering::Relaxed);
+        self.piece_notify.notify_waiters();
+    }
+
+    pub fn file_priorities(&self) -> Vec<FilePriority> {
+        self.file_priorities.lock().unwrap().clone()
+    }
+
+    pub fn file_priorities_resume(&self) -> Vec<i64> {
+        FilePriority::encode_list(&self.file_priorities())
+    }
+
+    pub fn apply_file_priorities(
+        &self,
+        priorities: &[FilePriority],
+    ) -> Vec<(PeerAddr, BlockRequest)> {
+        let file_count = {
+            let spans = self.file_spans.lock().unwrap();
+            if spans.is_empty() {
+                priorities.len()
+            } else {
+                spans.len()
+            }
+        };
+        let prios = priority::normalize_file_priorities(file_count, priorities);
+        *self.file_priorities.lock().unwrap() = prios;
+        self.recompute_piece_priority();
+        self.refresh_first_last();
+        let cancels = self.unwant_skipped();
+        self.piece_notify.notify_waiters();
+        cancels
+    }
+
+    pub fn set_file_priority(
+        &self,
+        file_index: usize,
+        prio: FilePriority,
+    ) -> Option<Vec<(PeerAddr, BlockRequest)>> {
+        let mut prios = self.file_priorities();
+        if file_index >= prios.len() {
+            return None;
+        }
+        prios[file_index] = prio;
+        Some(self.apply_file_priorities(&prios))
+    }
+
+    fn recompute_piece_priority(&self) {
+        let prios = self.file_priorities.lock().unwrap().clone();
+        let piece_files = self.piece_files.lock().unwrap();
+        if piece_files.is_empty() {
+            return;
+        }
+        for (index, files) in piece_files.iter().enumerate() {
+            let prio = if files.is_empty() {
+                FilePriority::Normal
+            } else {
+                files
+                    .iter()
+                    .map(|&file_index| {
+                        prios
+                            .get(file_index)
+                            .copied()
+                            .unwrap_or(FilePriority::Normal)
+                    })
+                    .max()
+                    .unwrap_or(FilePriority::Skip)
+            };
+            if let Some(slot) = self.piece_priority.get(index) {
+                slot.store(prio as u8, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn refresh_first_last(&self) {
+        let piece_length = self.piece_length.load(Ordering::Relaxed);
+        let prios = self.file_priorities.lock().unwrap().clone();
+        let spans = self.file_spans.lock().unwrap();
+        let mut out = Vec::new();
+        if piece_length == 0 {
+            *self.first_last.lock().unwrap() = out;
+            return;
+        }
+        for (i, span) in spans.iter().enumerate() {
+            if span.length == 0 {
+                continue;
+            }
+            if prios.get(i).copied().unwrap_or(FilePriority::Normal) == FilePriority::Skip {
+                continue;
+            }
+            let first = (span.offset / piece_length) as u32;
+            let last = ((span.offset + span.length - 1) / piece_length) as u32;
+            if !out.contains(&first) {
+                out.push(first);
+            }
+            if last != first && !out.contains(&last) {
+                out.push(last);
+            }
+        }
+        *self.first_last.lock().unwrap() = out;
+    }
+
+    fn piece_prio(&self, index: u32) -> FilePriority {
+        self.piece_priority
+            .get(index as usize)
+            .map(|slot| FilePriority::from_u8(slot.load(Ordering::Relaxed)))
+            .unwrap_or(FilePriority::Normal)
+    }
+
+    fn unwant_skipped(&self) -> Vec<(PeerAddr, BlockRequest)> {
+        let mut cancels = Vec::new();
+        let mut map = self.block_assignments.lock().unwrap();
+        for (index, pw) in self.pieces.iter().enumerate() {
+            let index = index as u32;
+            if self.wanted(index) || pw.downloaded.load(Ordering::Relaxed) {
+                continue;
+            }
+            let reserved_peer = pw.reserved.lock().unwrap().take();
+            pw.chuncks.lock().unwrap().clear();
+            pw.write_claimed.store(false, Ordering::Relaxed);
+            map.retain(|req, entry| {
+                if req.index == index {
+                    for peer in &entry.requesters {
+                        cancels.push((*peer, *req));
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some(peer) = reserved_peer {
+                let mut offset = 0u32;
+                while offset < pw.piece_work.length {
+                    let length = utils::calculate_block_size(pw.piece_work.length, offset);
+                    let req = BlockRequest {
+                        index,
+                        begin: offset,
+                        length,
+                    };
+                    if !cancels.iter().any(|(p, r)| *p == peer && *r == req) {
+                        cancels.push((peer, req));
+                    }
+                    offset += length;
+                }
+            }
+        }
+        cancels
     }
 
     pub fn set_bootstrap_until(&self, n: usize) {
@@ -126,10 +330,29 @@ impl TorrentDownloadedState {
 
     pub fn is_complete(&self) -> bool {
         !self.pieces.is_empty()
-            && self
-                .pieces
-                .iter()
-                .all(|pw| pw.downloaded.load(std::sync::atomic::Ordering::Relaxed))
+            && self.pieces.iter().enumerate().all(|(i, pw)| {
+                pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) || !self.wanted(i as u32)
+            })
+    }
+
+    pub fn wanted_total_bytes(&self) -> u64 {
+        self.pieces
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.wanted(*i as u32))
+            .map(|(_, pw)| u64::from(pw.piece_work.length))
+            .sum()
+    }
+
+    pub fn wanted_have_bytes(&self) -> u64 {
+        self.pieces
+            .iter()
+            .enumerate()
+            .filter(|(i, pw)| {
+                self.wanted(*i as u32) && pw.downloaded.load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .map(|(_, pw)| u64::from(pw.piece_work.length))
+            .sum()
     }
 
     pub fn downloaded_bytes(&self) -> u64 {
@@ -156,8 +379,11 @@ impl TorrentDownloadedState {
     pub fn left_bytes(&self) -> u64 {
         self.pieces
             .iter()
-            .filter(|pw| !pw.downloaded.load(std::sync::atomic::Ordering::Relaxed))
-            .map(|pw| u64::from(pw.piece_work.length))
+            .enumerate()
+            .filter(|(i, pw)| {
+                self.wanted(*i as u32) && !pw.downloaded.load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .map(|(_, pw)| u64::from(pw.piece_work.length))
             .sum()
     }
 
@@ -196,9 +422,8 @@ impl TorrentDownloadedState {
         }
     }
 
-    /// Hook for file priorities (#36). Every piece is wanted until then.
     pub fn wanted(&self, index: u32) -> bool {
-        (index as usize) < self.pieces.len()
+        (index as usize) < self.pieces.len() && self.piece_prio(index) != FilePriority::Skip
     }
 
     pub fn in_endgame(&self) -> bool {
@@ -235,17 +460,40 @@ impl TorrentDownloadedState {
 
     pub fn pick(&self, peer: PeerAddr, peer_has: &Bitfield, prefer: &[u32]) -> Option<u32> {
         loop {
-            let candidates = self.candidates(peer_has);
+            let mut candidates = self.candidates(peer_has);
             if candidates.is_empty() {
                 return None;
             }
-            let verified = self.verified.get();
-            let bootstrap_until = self.bootstrap_until.load(Ordering::Relaxed);
-            let selected = {
+            let sequential = self.sequential();
+            if !sequential {
+                let band = candidates
+                    .iter()
+                    .map(|index| self.piece_prio(*index))
+                    .max()
+                    .unwrap_or(FilePriority::Normal);
+                candidates.retain(|index| self.piece_prio(*index) == band);
+            }
+            let mut prefer_list = Vec::new();
+            if sequential {
+                prefer_list.extend(
+                    self.first_last
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .copied()
+                        .filter(|index| candidates.contains(index)),
+                );
+            }
+            prefer_list.extend(prefer.iter().copied());
+            let selected = if sequential {
+                select_sequential(&candidates, &prefer_list)
+            } else {
+                let verified = self.verified.get();
+                let bootstrap_until = self.bootstrap_until.load(Ordering::Relaxed);
                 let mut rng = self.rng.lock().unwrap();
                 select_piece(
                     &candidates,
-                    prefer,
+                    &prefer_list,
                     &self.availability,
                     verified,
                     bootstrap_until,
@@ -435,7 +683,7 @@ impl TorrentDownloadedState {
 
     pub fn try_reserve_piece(&self, index: u32, peer: PeerAddr) -> Option<&PieceWorkState> {
         let pw = self.pieces.get(index as usize)?;
-        if pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.wanted(index) || pw.downloaded.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
         let mut reserved = pw.reserved.lock().unwrap();
@@ -1217,6 +1465,27 @@ impl PeerHandler {
         }
     }
 
+    fn cancel_unwanted_outstanding(&self) {
+        let unwanted: Vec<BlockRequest> = self
+            .outstanding_requests
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .filter(|req| !self.downloaded().wanted(req.index))
+            .collect();
+        for req in unwanted {
+            self.outstanding_requests.lock().unwrap().remove(&req);
+            let _ = self
+                .peer_writer_tx
+                .send(WriterRequest::Message(message::format_cancel(
+                    req.index, req.begin, req.length,
+                )));
+            self.downloaded().release_reservation(req.index, self.peer);
+            self.refill_pipeline_slot();
+        }
+    }
+
     fn drain_download_cancels(&self) {
         let cancels = self
             .peers_state
@@ -1428,7 +1697,11 @@ impl PeerHandler {
             .unwrap()
             .iter()
             .copied()
-            .filter(|&index| !self.downloaded().has_piece(index) && self.peer_has_piece(index))
+            .filter(|&index| {
+                !self.downloaded().has_piece(index)
+                    && self.downloaded().wanted(index)
+                    && self.peer_has_piece(index)
+            })
             .collect()
     }
 
@@ -1455,6 +1728,10 @@ impl PeerHandler {
     async fn send_block_request(&self, req: BlockRequest) -> Result<bool, anyhow::Error> {
         if !self.is_downloading() {
             return Ok(false);
+        }
+        if !self.downloaded().wanted(req.index) {
+            self.downloaded().release_reservation(req.index, self.peer);
+            return Ok(true);
         }
         if !self.acquire_pipeline_slot().await? {
             return Ok(false);
@@ -1491,7 +1768,9 @@ impl PeerHandler {
     async fn request_piece_blocks(&self, piece: PieceWork) -> Result<(), anyhow::Error> {
         let mut offset: u32 = 0;
         while offset < piece.length {
-            if !self.is_downloading() {
+            if !self.is_downloading() || !self.downloaded().wanted(piece.index) {
+                self.downloaded()
+                    .release_reservation(piece.index, self.peer);
                 return Ok(());
             }
             let block_size = utils::calculate_block_size(piece.length, offset);
@@ -1541,12 +1820,18 @@ impl PeerHandler {
             self.maybe_snub();
             self.expire_stale_requests();
             self.drain_download_cancels();
+            self.cancel_unwanted_outstanding();
             self.refresh_interest()?;
 
             if self.downloaded().is_complete() {
                 self.refresh_interest()?;
                 trace!("torrent complete, staying connected to seed");
-                future::pending::<()>().await;
+                let ds = self.downloaded();
+                tokio::select! {
+                    _ = ds.piece_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                continue;
             }
 
             let choked = self.chocked.load(Ordering::Relaxed);
@@ -2786,6 +3071,172 @@ mod tests {
         let p1 = peer(1);
         let picked = s.pick(p1, &Bitfield::filled(3), &[1]).unwrap();
         assert_eq!(picked, 1);
+    }
+
+    fn three_file_state() -> (TorrentDownloadedState, crate::torrent::Torrent) {
+        let piece_len = 16u32;
+        let torrent = crate::torrent::Torrent {
+            info_hash: [0; 20],
+            piece_hashes: vec![[0; 20]; 6],
+            piece_length: i64::from(piece_len),
+            length: i64::from(piece_len) * 6,
+            files: vec![
+                crate::torrent::TorrentFileInfo {
+                    path: vec!["a.bin".into()],
+                    length: i64::from(piece_len) * 2,
+                    offset: 0,
+                },
+                crate::torrent::TorrentFileInfo {
+                    path: vec!["b.bin".into()],
+                    length: i64::from(piece_len) * 2,
+                    offset: i64::from(piece_len) * 2,
+                },
+                crate::torrent::TorrentFileInfo {
+                    path: vec!["c.bin".into()],
+                    length: i64::from(piece_len) * 2,
+                    offset: i64::from(piece_len) * 4,
+                },
+            ],
+            name: "bundle".into(),
+            private: false,
+        };
+        let s = state(6, piece_len);
+        s.install_content(&torrent, false, &[FilePriority::Normal; 3]);
+        (s, torrent)
+    }
+
+    #[test]
+    fn skip_middle_file_is_not_picked_and_counts_as_complete() {
+        let (s, _) = three_file_state();
+        s.apply_file_priorities(&[
+            FilePriority::Normal,
+            FilePriority::Skip,
+            FilePriority::Normal,
+        ]);
+        assert!(!s.wanted(2));
+        assert!(!s.wanted(3));
+        assert!(s.wanted(0) && s.wanted(5));
+        assert_eq!(s.left_bytes(), 16 * 4);
+        assert!(!s.is_complete());
+
+        let all = Bitfield::filled(6);
+        let mut picked = Vec::new();
+        while let Some(index) = s.pick(peer(1), &all, &[]) {
+            assert!(index != 2 && index != 3, "skipped piece {index} was picked");
+            s.mark_downloaded(index);
+            picked.push(index);
+        }
+        picked.sort();
+        assert_eq!(picked, vec![0, 1, 4, 5]);
+        assert!(s.is_complete());
+        assert_eq!(s.left_bytes(), 0);
+        assert_eq!(s.wanted_total_bytes(), 16 * 4);
+    }
+
+    #[test]
+    fn high_band_beats_rarity_of_lower_bands() {
+        let (s, _) = three_file_state();
+        s.apply_file_priorities(&[FilePriority::Low, FilePriority::Normal, FilePriority::High]);
+        for _ in 0..8 {
+            s.availability.add_have(4);
+            s.availability.add_have(5);
+        }
+        s.availability.add_have(0);
+        let picked = s.pick(peer(1), &Bitfield::filled(6), &[]).unwrap();
+        assert!(picked == 4 || picked == 5, "high band first, got {picked}");
+    }
+
+    #[test]
+    fn sequential_picks_first_last_then_lowest_index() {
+        let (s, _) = three_file_state();
+        s.set_sequential(true);
+        s.refresh_first_last();
+        let all = Bitfield::filled(6);
+        let mut order = Vec::new();
+        while let Some(index) = s.pick(peer(1), &all, &[]) {
+            s.mark_downloaded(index);
+            order.push(index);
+        }
+        assert_eq!(order, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn sequential_first_last_of_four_piece_files() {
+        let piece_len = 16u32;
+        let torrent = crate::torrent::Torrent {
+            info_hash: [0; 20],
+            piece_hashes: vec![[0; 20]; 8],
+            piece_length: i64::from(piece_len),
+            length: i64::from(piece_len) * 8,
+            files: vec![
+                crate::torrent::TorrentFileInfo {
+                    path: vec!["a.bin".into()],
+                    length: i64::from(piece_len) * 4,
+                    offset: 0,
+                },
+                crate::torrent::TorrentFileInfo {
+                    path: vec!["b.bin".into()],
+                    length: i64::from(piece_len) * 4,
+                    offset: i64::from(piece_len) * 4,
+                },
+            ],
+            name: "two".into(),
+            private: false,
+        };
+        let s = state(8, piece_len);
+        s.install_content(
+            &torrent,
+            true,
+            &[FilePriority::Normal, FilePriority::Normal],
+        );
+        let all = Bitfield::filled(8);
+        let mut order = Vec::new();
+        while let Some(index) = s.pick(peer(1), &all, &[]) {
+            s.mark_downloaded(index);
+            order.push(index);
+        }
+        assert_eq!(order, vec![0, 3, 4, 7, 1, 2, 5, 6]);
+    }
+
+    #[test]
+    fn skip_releases_reservation_and_lists_cancels() {
+        let (s, _) = three_file_state();
+        let p1 = peer(6881);
+        assert!(s.try_reserve_piece(2, p1).is_some());
+        let req = BlockRequest {
+            index: 2,
+            begin: 0,
+            length: 16,
+        };
+        assert!(s.assign_block(req, p1));
+        let cancels = s.apply_file_priorities(&[
+            FilePriority::Normal,
+            FilePriority::Skip,
+            FilePriority::Normal,
+        ]);
+        assert_eq!(cancels, vec![(p1, req)]);
+        assert!(s.pieces[2].reserved.lock().unwrap().is_none());
+        assert!(s.try_reserve_piece(2, p1).is_none());
+    }
+
+    #[test]
+    fn unskip_makes_missing_pieces_candidates_again() {
+        let (s, _) = three_file_state();
+        s.apply_file_priorities(&[
+            FilePriority::Normal,
+            FilePriority::Skip,
+            FilePriority::Normal,
+        ]);
+        s.mark_downloaded(0);
+        s.mark_downloaded(1);
+        s.mark_downloaded(4);
+        s.mark_downloaded(5);
+        assert!(s.is_complete());
+        s.apply_file_priorities(&[FilePriority::Normal; 3]);
+        assert!(!s.is_complete());
+        assert!(s.wanted(2) && s.wanted(3));
+        let picked = s.pick(peer(1), &Bitfield::filled(6), &[]).unwrap();
+        assert!(picked == 2 || picked == 3);
     }
 
     #[test]

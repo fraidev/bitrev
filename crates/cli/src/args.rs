@@ -35,6 +35,10 @@ pub struct Cli {
     #[arg(long)]
     pub verify: bool,
 
+    /// Download wanted pieces in order, with first/last piece of each file first
+    #[arg(long)]
+    pub sequential: bool,
+
     /// Path to the TOML config file
     #[arg(long, value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
@@ -145,6 +149,7 @@ mod tests {
             "--seed",
             "--no-seed",
             "--verify",
+            "--sequential",
             "--config",
             "--quiet",
             "-q",
@@ -203,6 +208,12 @@ mod tests {
         assert!(cli.seed);
         assert!(cli.verify);
         assert!(cli.stay_alive());
+    }
+
+    #[test]
+    fn parses_sequential_flag() {
+        let cli = Cli::parse_from(["bitrev", "--sequential", "t.torrent"]);
+        assert!(cli.sequential);
     }
 
     #[test]
