@@ -403,6 +403,8 @@ async fn fast_path_trusts_bitfield_when_mtimes_match() {
         tags: Vec::new(),
         sequential: 0,
         file_priorities: Vec::new(),
+        save_path: output.to_string_lossy().into_owned(),
+        auto_tmm: 0,
     };
     resume::save(
         &resume::resume_path(&state_dir, &meta.info_hash),
@@ -452,6 +454,8 @@ async fn slow_path_on_mtime_mismatch_rehashes() {
         tags: Vec::new(),
         sequential: 0,
         file_priorities: Vec::new(),
+        save_path: output.to_string_lossy().into_owned(),
+        auto_tmm: 0,
     };
     resume::save(
         &resume::resume_path(&state_dir, &meta.info_hash),
@@ -498,6 +502,8 @@ async fn verify_flag_forces_slow_path() {
         tags: Vec::new(),
         sequential: 0,
         file_priorities: Vec::new(),
+        save_path: output.to_string_lossy().into_owned(),
+        auto_tmm: 0,
     };
     resume::save(
         &resume::resume_path(&state_dir, &meta.info_hash),

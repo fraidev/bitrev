@@ -1,6 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +24,7 @@ use crate::resume::{self, ResumeSnapshot};
 
 pub use crate::dht::{DhtOptions, DhtStats};
 use crate::hash::PieceHasher;
+pub use crate::library::Category;
 use crate::mse::{self, EncryptionPolicy, MseConnector};
 pub use crate::priority::{FileInfo, FilePriority};
 pub use crate::resume::ResumeStatus;
@@ -90,8 +92,7 @@ impl fmt::Debug for TorrentId {
     }
 }
 
-/// Per-torrent lifecycle. `Queued` and `Moving` exist for later issues and are
-/// never entered here.
+/// Per-torrent lifecycle. `Queued` exists for issue 38 and is never entered here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorrentState {
     Checking,
@@ -190,6 +191,14 @@ pub enum ControlError {
     NoMetadata(TorrentId),
     #[error("torrent {id} has no file {index}")]
     NoSuchFile { id: TorrentId, index: usize },
+    #[error("category {0} not found")]
+    CategoryNotFound(String),
+    #[error("category {0} already exists")]
+    CategoryExists(String),
+    #[error("failed to persist categories: {0}")]
+    CategoryPersist(String),
+    #[error("failed to move torrent {id}: {message}")]
+    MoveFailed { id: TorrentId, message: String },
 }
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -254,6 +263,15 @@ pub struct SessionOptions {
     pub preallocate: Preallocate,
     /// Piece LRU for the seeding read path. 0 disables it (the default).
     pub piece_cache_pieces: usize,
+    /// Default data directory when add does not pass `save_path`.
+    pub download_dir: PathBuf,
+    /// Move completed torrents here when `auto_tmm` is on. Empty disables it.
+    pub completed_dir: PathBuf,
+    /// Poll this directory for `.torrent` / magnet files. Empty disables it.
+    pub watch_dir: PathBuf,
+    /// Delete watched files after add instead of moving them to `watch-processed`.
+    pub watch_delete: bool,
+    pub watch_poll: Duration,
 }
 
 impl Default for SessionOptions {
@@ -268,6 +286,11 @@ impl Default for SessionOptions {
             utp: UtpOptions::default(),
             preallocate: Preallocate::default(),
             piece_cache_pieces: 0,
+            download_dir: PathBuf::from("."),
+            completed_dir: PathBuf::new(),
+            watch_dir: PathBuf::new(),
+            watch_delete: false,
+            watch_poll: Duration::from_secs(2),
         }
     }
 }
@@ -285,13 +308,14 @@ pub struct TorrentSession {
     pub torrent: Arc<Torrent>,
     pub torrent_meta: TorrentMeta,
     pub choke_notify: Arc<Notify>,
-    pub output_dir: PathBuf,
+    pub output_dir: Mutex<PathBuf>,
     pub added_at: i64,
     pub completed_at: Arc<Mutex<Option<i64>>>,
     pub torrent_cache_path: PathBuf,
     pub metadata: Arc<MetadataStore>,
-    pub category: String,
-    pub tags: Vec<String>,
+    pub category: Mutex<String>,
+    pub tags: Mutex<BTreeSet<String>>,
+    pub auto_tmm: AtomicBool,
     pub pr_rx: Receiver<PieceResult>,
     rates: Arc<Mutex<RateSample>>,
 }
@@ -320,6 +344,7 @@ pub struct Session {
     owns_lifecycle: bool,
     hasher: Arc<PieceHasher>,
     event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
+    categories: Arc<Mutex<BTreeMap<String, Category>>>,
 }
 
 pub(crate) struct PendingTorrent {
@@ -336,15 +361,16 @@ pub(crate) struct PendingTorrent {
     piece_tx: Arc<Slot<flume::Sender<crate::peer_connection::FullPiece>>>,
     promote_notify: Arc<Notify>,
     trackers: Vec<String>,
-    output_dir: PathBuf,
+    output_dir: Mutex<PathBuf>,
     pr_tx: flume::Sender<PieceResult>,
     pr_rx: Receiver<PieceResult>,
     added_at: i64,
     start_paused: bool,
     verify: bool,
     skip_checking: bool,
-    category: String,
-    tags: Vec<String>,
+    category: Mutex<String>,
+    tags: Mutex<BTreeSet<String>>,
+    auto_tmm: AtomicBool,
     sequential: std::sync::atomic::AtomicBool,
     file_priorities: Mutex<Vec<FilePriority>>,
     rates: Arc<Mutex<RateSample>>,
@@ -405,6 +431,7 @@ pub struct AddTorrentOptions {
     sequential: bool,
     skip_checking: bool,
     file_priorities: Vec<FilePriority>,
+    auto_tmm: Option<bool>,
 }
 
 impl AddTorrentOptions {
@@ -422,6 +449,7 @@ impl AddTorrentOptions {
             sequential: false,
             skip_checking: false,
             file_priorities: Vec::new(),
+            auto_tmm: None,
         }
     }
 
@@ -443,6 +471,7 @@ impl AddTorrentOptions {
             sequential: false,
             skip_checking: false,
             file_priorities: Vec::new(),
+            auto_tmm: None,
         }
     }
 
@@ -500,6 +529,11 @@ impl AddTorrentOptions {
 
     pub fn file_priorities(mut self, priorities: impl Into<Vec<FilePriority>>) -> Self {
         self.file_priorities = priorities.into();
+        self
+    }
+
+    pub fn auto_tmm(mut self, enabled: bool) -> Self {
+        self.auto_tmm = Some(enabled);
         self
     }
 }
@@ -625,13 +659,16 @@ impl Session {
             owns_lifecycle: true,
             hasher: Arc::new(PieceHasher::new()),
             event_tx,
+            categories: Arc::new(Mutex::new(BTreeMap::new())),
         };
         session
             .extensions
             .register(|ctx| Box::new(UtMetadata::new(ctx.clone())));
+        session.load_categories();
         session.spawn_listener();
         session.start_dht();
         session.spawn_tick();
+        session.spawn_watch();
         session
     }
 
@@ -653,6 +690,7 @@ impl Session {
             owns_lifecycle: false,
             hasher: self.hasher.clone(),
             event_tx: self.event_tx.clone(),
+            categories: self.categories.clone(),
         }
     }
 
@@ -717,12 +755,13 @@ impl Session {
         let meta = file::from_filename(path_str)?;
         self.add_torrent(
             AddTorrentOptions::from(meta)
-                .output_dir(PathBuf::from(&data.output_dir))
+                .output_dir(PathBuf::from(data.resolved_save_path()))
                 .paused(data.is_paused())
                 .category(data.category.clone())
                 .tags(data.tags.clone())
                 .sequential(data.is_sequential())
-                .file_priorities(FilePriority::decode_list(&data.file_priorities)),
+                .file_priorities(FilePriority::decode_list(&data.file_priorities))
+                .auto_tmm(data.is_auto_tmm()),
         )
         .await?;
         Ok(())
@@ -1260,6 +1299,223 @@ impl Session {
         Ok(())
     }
 
+    pub fn categories(&self) -> Vec<Category> {
+        self.categories.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn create_category(
+        &self,
+        name: impl Into<String>,
+        save_path: Option<PathBuf>,
+    ) -> Result<(), ControlError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut cats = self.categories.lock().unwrap();
+            if cats.contains_key(&name) {
+                return Err(ControlError::CategoryExists(name));
+            }
+            cats.insert(name.clone(), Category::new(name, save_path));
+        }
+        self.persist_categories()
+    }
+
+    pub fn edit_category(
+        &self,
+        name: &str,
+        save_path: Option<PathBuf>,
+    ) -> Result<(), ControlError> {
+        {
+            let mut cats = self.categories.lock().unwrap();
+            let category = cats
+                .get_mut(name)
+                .ok_or_else(|| ControlError::CategoryNotFound(name.to_string()))?;
+            category.save_path = save_path.filter(|path| !path.as_os_str().is_empty());
+        }
+        self.persist_categories()
+    }
+
+    pub fn remove_category(&self, name: &str) -> Result<(), ControlError> {
+        {
+            let mut cats = self.categories.lock().unwrap();
+            if cats.remove(name).is_none() {
+                return Err(ControlError::CategoryNotFound(name.to_string()));
+            }
+        }
+        for entry in self.torrents.iter() {
+            let torrent = entry.value();
+            let mut category = torrent.category.lock().unwrap();
+            if category.as_str() == name {
+                category.clear();
+                drop(category);
+                self.spawn_flush_one(torrent.clone());
+            }
+        }
+        for entry in self.pending.iter() {
+            let pending = entry.value();
+            let mut category = pending.category.lock().unwrap();
+            if category.as_str() == name {
+                category.clear();
+            }
+        }
+        self.persist_categories()
+    }
+
+    pub fn set_category(
+        &self,
+        id: TorrentId,
+        category: impl Into<String>,
+    ) -> Result<(), ControlError> {
+        let category = category.into();
+        if !category.is_empty() {
+            self.ensure_category(&category)?;
+        }
+        if let Some(pending) = self.pending.get(&id.0) {
+            if !self.torrents.contains_key(&id.0) {
+                *pending.category.lock().unwrap() = category;
+                return Ok(());
+            }
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        *torrent.category.lock().unwrap() = category;
+        self.spawn_flush_one(torrent);
+        Ok(())
+    }
+
+    pub fn set_tags(&self, id: TorrentId, tags: Vec<String>) -> Result<(), ControlError> {
+        self.with_tags(id, |set| {
+            set.clear();
+            set.extend(normalize_tags(tags));
+        })
+    }
+
+    pub fn add_tags(&self, id: TorrentId, tags: Vec<String>) -> Result<(), ControlError> {
+        self.with_tags(id, |set| {
+            set.extend(normalize_tags(tags));
+        })
+    }
+
+    pub fn remove_tags(&self, id: TorrentId, tags: Vec<String>) -> Result<(), ControlError> {
+        self.with_tags(id, |set| {
+            for tag in normalize_tags(tags) {
+                set.remove(&tag);
+            }
+        })
+    }
+
+    fn with_tags(
+        &self,
+        id: TorrentId,
+        f: impl FnOnce(&mut BTreeSet<String>),
+    ) -> Result<(), ControlError> {
+        if let Some(pending) = self.pending.get(&id.0) {
+            if !self.torrents.contains_key(&id.0) {
+                f(&mut pending.tags.lock().unwrap());
+                return Ok(());
+            }
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        f(&mut torrent.tags.lock().unwrap());
+        self.spawn_flush_one(torrent);
+        Ok(())
+    }
+
+    pub async fn set_save_path(
+        &self,
+        id: TorrentId,
+        path: PathBuf,
+        move_files: bool,
+    ) -> Result<(), ControlError> {
+        if let Some(pending) = self.pending.get(&id.0) {
+            if !self.torrents.contains_key(&id.0) {
+                *pending.output_dir.lock().unwrap() = path;
+                pending.auto_tmm.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        let torrent = self
+            .torrents
+            .get(&id.0)
+            .map(|entry| entry.clone())
+            .ok_or(ControlError::NotFound(id))?;
+        torrent.auto_tmm.store(false, Ordering::Relaxed);
+        if !move_files {
+            *torrent.output_dir.lock().unwrap() = path;
+            self.spawn_flush_one(torrent);
+            return Ok(());
+        }
+        self.relocate_torrent(&torrent, id, path).await
+    }
+
+    async fn relocate_torrent(
+        &self,
+        torrent: &Arc<TorrentSession>,
+        id: TorrentId,
+        new_output: PathBuf,
+    ) -> Result<(), ControlError> {
+        let previous = torrent.torrent_state.lock().unwrap().clone();
+        self.set_torrent_state(torrent, id, TorrentState::Moving);
+        match torrent.storage.relocate(&new_output).await {
+            Ok(()) => {
+                *torrent.output_dir.lock().unwrap() = new_output;
+                let next = if previous == TorrentState::Paused
+                    || matches!(previous, TorrentState::Error(_))
+                {
+                    previous
+                } else {
+                    active_state(&torrent.downloaded_state)
+                };
+                self.set_torrent_state(torrent, id, next);
+                self.spawn_flush_one(torrent.clone());
+                Ok(())
+            }
+            Err(e) => {
+                let message = e.to_string();
+                self.set_torrent_state(torrent, id, TorrentState::Error(message.clone()));
+                self.emit(SessionEvent::Error {
+                    id,
+                    message: message.clone(),
+                });
+                Err(ControlError::MoveFailed { id, message })
+            }
+        }
+    }
+
+    async fn maybe_move_on_complete(&self, torrent: &Arc<TorrentSession>, id: TorrentId) {
+        if !torrent.auto_tmm.load(Ordering::Relaxed) {
+            return;
+        }
+        let completed_dir = self.options.completed_dir.clone();
+        if completed_dir.as_os_str().is_empty() {
+            return;
+        }
+        let category = torrent.category.lock().unwrap().clone();
+        let dest_dir = if category.is_empty() {
+            completed_dir
+        } else {
+            completed_dir.join(category)
+        };
+        let name = torrent.torrent.name.clone();
+        let new_output = dest_dir.join(name);
+        let current = torrent.output_dir.lock().unwrap().clone();
+        if current == new_output {
+            return;
+        }
+        if let Err(e) = self.relocate_torrent(torrent, id, new_output).await {
+            warn!(id = %id, error = %e, "failed to move torrent to completed_dir");
+        }
+    }
+
     fn after_content_change(&self, torrent: &Arc<TorrentSession>, id: TorrentId) {
         let state = torrent.torrent_state.lock().unwrap().clone();
         if state != TorrentState::Paused && state != TorrentState::Checking {
@@ -1278,6 +1534,11 @@ impl Session {
             };
             if first {
                 self.emit(SessionEvent::Completed { id });
+                let session = self.share();
+                let torrent = torrent.clone();
+                tokio::spawn(async move {
+                    session.maybe_move_on_complete(&torrent, id).await;
+                });
             }
         }
         self.spawn_flush_one(torrent.clone());
@@ -1339,6 +1600,9 @@ impl Session {
             active_state(&torrent.downloaded_state)
         };
         self.set_torrent_state(&torrent, id, next);
+        if torrent.downloaded_state.is_complete() {
+            self.maybe_move_on_complete(&torrent, id).await;
+        }
         self.spawn_flush_one(torrent);
         Ok(())
     }
@@ -1448,7 +1712,10 @@ impl Session {
         sync_download_state(&torrent.download_state, &state);
         if matches!(
             state,
-            TorrentState::Paused | TorrentState::Checking | TorrentState::Error(_)
+            TorrentState::Paused
+                | TorrentState::Checking
+                | TorrentState::Moving
+                | TorrentState::Error(_)
         ) {
             choke_all_peers(&torrent.peer_states);
         } else if state.transfer_enabled() {
@@ -1505,6 +1772,153 @@ impl Session {
                 id,
                 state: TorrentState::Metadata,
             });
+        }
+    }
+
+    fn load_categories(&self) {
+        let Some(state_dir) = self.options.state_dir.as_ref() else {
+            return;
+        };
+        let loaded = crate::library::load_categories(state_dir);
+        *self.categories.lock().unwrap() = loaded;
+    }
+
+    fn persist_categories(&self) -> Result<(), ControlError> {
+        let Some(state_dir) = self.options.state_dir.as_ref() else {
+            return Ok(());
+        };
+        let cats = self.categories.lock().unwrap().clone();
+        crate::library::save_categories(state_dir, &cats)
+            .map_err(|e| ControlError::CategoryPersist(e.to_string()))
+    }
+
+    fn resolve_output_dir(&self, name: &str, category: &str) -> PathBuf {
+        if !category.is_empty() {
+            let cats = self.categories.lock().unwrap();
+            if let Some(cat) = cats.get(category) {
+                if let Some(path) = &cat.save_path {
+                    if !path.as_os_str().is_empty() {
+                        return path.join(name);
+                    }
+                }
+            }
+        }
+        let download = &self.options.download_dir;
+        if download.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            download.join(name)
+        }
+    }
+
+    fn ensure_category(&self, name: &str) -> Result<(), ControlError> {
+        if name.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut cats = self.categories.lock().unwrap();
+            if cats.contains_key(name) {
+                return Ok(());
+            }
+            cats.insert(name.to_string(), Category::new(name, None));
+        }
+        self.persist_categories()
+    }
+
+    fn spawn_watch(&self) {
+        if self.options.watch_dir.as_os_str().is_empty() {
+            return;
+        }
+        let session = self.share();
+        let poll = self.options.watch_poll;
+        tokio::spawn(async move {
+            let mut seen = std::collections::HashSet::new();
+            let mut interval = tokio::time::interval(poll);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = session.cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        session.poll_watch_dir(&mut seen).await;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn poll_watch_dir(&self, seen: &mut std::collections::HashSet<PathBuf>) {
+        let watch_dir = self.options.watch_dir.clone();
+        if watch_dir.as_os_str().is_empty() {
+            return;
+        }
+        for path in crate::library::collect_watch_files(&watch_dir) {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if let Err(e) = self.ingest_watch_path(&path).await {
+                debug!(path = %path.display(), error = %e, "watch dir skipped file");
+            }
+        }
+    }
+
+    async fn ingest_watch_path(&self, path: &Path) -> anyhow::Result<()> {
+        let is_torrent = crate::library::is_watch_torrent(path);
+        let is_magnet = crate::library::is_watch_magnet_name(path)
+            || crate::library::file_starts_with_magnet(path);
+        if !is_torrent && !is_magnet {
+            return Ok(());
+        }
+
+        let mut opts =
+            if is_torrent {
+                AddTorrentOptions::from_path(path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("watch path is not utf-8: {}", path.display())
+                })?)?
+            } else {
+                let text = std::fs::read_to_string(path)?;
+                let magnet = crate::magnet::Magnet::parse(text.trim())?;
+                AddTorrentOptions::from_magnet(&magnet)
+            };
+        if let Some(category) = crate::library::watch_subdir_category(&self.options.watch_dir, path)
+        {
+            opts = opts.category(category);
+        }
+
+        match self.add_torrent(opts).await {
+            Ok(_) => {}
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "watch dir add failed");
+            }
+        }
+        self.finish_watch_file(path);
+        Ok(())
+    }
+
+    fn finish_watch_file(&self, path: &Path) {
+        if self.options.watch_delete {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    debug!(path = %path.display(), error = %e, "failed to delete watched file");
+                }
+            }
+            return;
+        }
+        let Some(state_dir) = self.options.state_dir.as_ref() else {
+            return;
+        };
+        let processed = crate::library::watch_processed_path(state_dir);
+        if let Err(e) = std::fs::create_dir_all(&processed) {
+            debug!(path = %processed.display(), error = %e, "failed to create watch-processed");
+            return;
+        }
+        let dest = crate::library::unique_processed_path(&processed, path);
+        if let Err(e) = std::fs::rename(path, &dest) {
+            debug!(
+                from = %path.display(),
+                to = %dest.display(),
+                error = %e,
+                "failed to move watched file"
+            );
         }
     }
 
@@ -1613,12 +2027,14 @@ impl Session {
                 }
             }
             if delete_files {
-                delete_torrent_files(&torrent.torrent, &torrent.output_dir);
+                let output_dir = torrent.output_dir.lock().unwrap().clone();
+                delete_torrent_files(&torrent.torrent, &output_dir);
             }
         } else if let Some(pending) = pending {
             disconnect_all_peers(&pending.peer_states);
             if delete_files {
-                delete_torrent_files(&pending.torrent.get(), &pending.output_dir);
+                let output_dir = pending.output_dir.lock().unwrap().clone();
+                delete_torrent_files(&pending.torrent.get(), &output_dir);
             }
         }
         self.emit(SessionEvent::Removed { id });
@@ -1663,6 +2079,7 @@ impl Session {
             sequential: false,
             skip_checking: false,
             file_priorities: Vec::new(),
+            auto_tmm: None,
         };
         let pending = self
             .register_pending(
@@ -1718,6 +2135,7 @@ impl Session {
         let torrent_state = Arc::new(Mutex::new(TorrentState::Metadata));
         let download_state = Arc::new(Mutex::new(DownloadState::Init));
         sync_download_state(&download_state, &TorrentState::Metadata);
+        let auto_tmm = opts.auto_tmm.unwrap_or_else(|| opts.output_dir.is_none());
         let pending = Arc::new(PendingTorrent {
             metadata,
             peer_states: Arc::new(PeerStates::default()),
@@ -1732,15 +2150,16 @@ impl Session {
             piece_tx: Slot::new(piece_tx),
             promote_notify: Arc::new(Notify::new()),
             trackers,
-            output_dir,
+            output_dir: Mutex::new(output_dir),
             pr_tx,
             pr_rx,
             added_at: resume::now_unix(),
             start_paused,
             verify: opts.verify,
             skip_checking: opts.skip_checking,
-            category: opts.category.clone(),
-            tags: opts.tags.clone(),
+            category: Mutex::new(opts.category.clone()),
+            tags: Mutex::new(normalize_tags(opts.tags.clone())),
+            auto_tmm: AtomicBool::new(auto_tmm),
             sequential: AtomicBool::new(opts.sequential),
             file_priorities: Mutex::new(opts.file_priorities.clone()),
             rates: Arc::new(Mutex::new(RateSample::default())),
@@ -1808,29 +2227,42 @@ impl Session {
             );
         }
         let torrent = Arc::new(torrent);
+        let category = if add_torrent.category.is_empty() {
+            reuse
+                .as_ref()
+                .map(|p| p.category.lock().unwrap().clone())
+                .unwrap_or_default()
+        } else {
+            add_torrent.category.clone()
+        };
+        if !category.is_empty() {
+            let _ = self.ensure_category(&category);
+        }
+        let tags = if add_torrent.tags.is_empty() {
+            reuse
+                .as_ref()
+                .map(|p| p.tags.lock().unwrap().clone())
+                .unwrap_or_default()
+        } else {
+            normalize_tags(add_torrent.tags.clone())
+        };
+        let explicit_save = add_torrent.output_dir.is_some();
         let output_dir = add_torrent
             .output_dir
             .clone()
-            .or_else(|| reuse.as_ref().map(|p| p.output_dir.clone()))
-            .unwrap_or_else(|| PathBuf::from(&torrent.name));
+            .or_else(|| reuse.as_ref().map(|p| p.output_dir.lock().unwrap().clone()))
+            .unwrap_or_else(|| self.resolve_output_dir(&torrent.name, &category));
+        let auto_tmm = add_torrent.auto_tmm.unwrap_or_else(|| {
+            reuse
+                .as_ref()
+                .map(|p| p.auto_tmm.load(Ordering::Relaxed))
+                .unwrap_or(!explicit_save)
+        });
         let seed = add_torrent.seed;
         let skip_checking =
             add_torrent.skip_checking || reuse.as_ref().is_some_and(|p| p.skip_checking);
         let verify =
             (add_torrent.verify || reuse.as_ref().is_some_and(|p| p.verify)) && !skip_checking;
-        let category = if add_torrent.category.is_empty() {
-            reuse
-                .as_ref()
-                .map(|p| p.category.clone())
-                .unwrap_or_default()
-        } else {
-            add_torrent.category.clone()
-        };
-        let tags = if add_torrent.tags.is_empty() {
-            reuse.as_ref().map(|p| p.tags.clone()).unwrap_or_default()
-        } else {
-            add_torrent.tags.clone()
-        };
         let mut sequential = add_torrent.sequential
             || reuse
                 .as_ref()
@@ -2110,98 +2542,6 @@ impl Session {
 
         let have_broadcast_writer = have_broadcast.clone();
         let piece_rx = tracker_stream.piece_rx.clone();
-        let storage_writer = storage.clone();
-        let downloaded_writer = downloaded_state.clone();
-        let persist_state_dir = self.options.state_dir.clone();
-        let persist_output_dir = output_dir.clone();
-        let persist_meta_torrent = torrent.clone();
-        let persist_uploaded = uploaded.clone();
-        let persist_torrent_state = torrent_state.clone();
-        let persist_added_at = added_at;
-        let persist_completed_at = completed_at.clone();
-        let persist_cache_path = torrent_cache_path.clone();
-        let persist_category = category.clone();
-        let persist_tags = tags.clone();
-        let event_tx = self.event_tx.clone();
-        let completed_id = TorrentId::new(torrent.info_hash);
-        tokio::spawn(async move {
-            loop {
-                let piece = match piece_rx.recv_async().await {
-                    Ok(piece) => piece,
-                    Err(_) => break,
-                };
-                if let Err(e) = storage_writer.write_piece(piece.index, &piece.buf).await {
-                    debug!(index = piece.index, error = %e, "failed to write piece");
-                    downloaded_writer.remove_downloaded(piece.index);
-                    continue;
-                }
-                if downloaded_writer.is_complete() {
-                    let first_complete = {
-                        let mut done = persist_completed_at.lock().unwrap();
-                        if done.is_none() {
-                            *done = Some(resume::now_unix());
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if first_complete {
-                        if let Err(e) = storage_writer.sync_all().await {
-                            debug!(error = %e, "failed to sync files on completion");
-                        }
-                        let _ = event_tx.send(SessionEvent::Completed { id: completed_id });
-                        let was_downloading = {
-                            let mut state = persist_torrent_state.lock().unwrap();
-                            if *state == TorrentState::Downloading {
-                                *state = TorrentState::Seeding;
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if was_downloading {
-                            let _ = event_tx.send(SessionEvent::StateChanged {
-                                id: completed_id,
-                                state: TorrentState::Seeding,
-                            });
-                        }
-                    }
-                }
-                if let Some(state_dir) = persist_state_dir.as_ref() {
-                    let paused = *persist_torrent_state.lock().unwrap() == TorrentState::Paused;
-                    if let Err(e) = persist_from_parts(
-                        state_dir,
-                        &persist_meta_torrent.info_hash,
-                        &persist_output_dir,
-                        &persist_meta_torrent,
-                        &downloaded_writer,
-                        persist_uploaded.load(Ordering::Relaxed),
-                        paused,
-                        &persist_cache_path,
-                        persist_added_at,
-                        *persist_completed_at.lock().unwrap(),
-                        &persist_category,
-                        &persist_tags,
-                        downloaded_writer.sequential(),
-                        &downloaded_writer.file_priorities_resume(),
-                    ) {
-                        debug!(error = %e, "failed to persist resume after piece write");
-                    }
-                }
-                let _ = have_broadcast_writer.send(piece.index);
-                if pr_tx
-                    .send_async(PieceResult {
-                        index: piece.index,
-                        length: piece.length,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
         let piece_tx = tracker_stream.piece_tx.clone();
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(Some(torrent.clone()));
         let _ = ready_tx;
@@ -2218,19 +2558,89 @@ impl Session {
             torrent: torrent.clone(),
             torrent_meta: torrent_meta.clone(),
             choke_notify,
-            output_dir,
+            output_dir: Mutex::new(output_dir),
             added_at,
             completed_at,
             torrent_cache_path,
             metadata: metadata.clone(),
-            category,
-            tags,
+            category: Mutex::new(category),
+            tags: Mutex::new(tags),
+            auto_tmm: AtomicBool::new(auto_tmm),
             pr_rx: pr_rx.clone(),
             rates,
         });
         let id = TorrentId::new(torrent.info_hash);
         self.torrents
             .insert(torrent.info_hash, torrent_session.clone());
+
+        let writer_session = self.share();
+        let writer_torrent = torrent_session.clone();
+        tokio::spawn(async move {
+            loop {
+                let piece = match piece_rx.recv_async().await {
+                    Ok(piece) => piece,
+                    Err(_) => break,
+                };
+                if let Err(e) = writer_torrent
+                    .storage
+                    .write_piece(piece.index, &piece.buf)
+                    .await
+                {
+                    debug!(index = piece.index, error = %e, "failed to write piece");
+                    writer_torrent
+                        .downloaded_state
+                        .remove_downloaded(piece.index);
+                    continue;
+                }
+                if writer_torrent.downloaded_state.is_complete() {
+                    let first_complete = {
+                        let mut done = writer_torrent.completed_at.lock().unwrap();
+                        if done.is_none() {
+                            *done = Some(resume::now_unix());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if first_complete {
+                        if let Err(e) = writer_torrent.storage.sync_all().await {
+                            debug!(error = %e, "failed to sync files on completion");
+                        }
+                        writer_session.emit(SessionEvent::Completed { id });
+                        let was_downloading = {
+                            let state = writer_torrent.torrent_state.lock().unwrap().clone();
+                            state == TorrentState::Downloading
+                        };
+                        if was_downloading {
+                            writer_session.set_torrent_state(
+                                &writer_torrent,
+                                id,
+                                TorrentState::Seeding,
+                            );
+                        }
+                        writer_session
+                            .maybe_move_on_complete(&writer_torrent, id)
+                            .await;
+                    }
+                }
+                if let Some(state_dir) = writer_session.options.state_dir.as_ref() {
+                    if let Err(e) = persist_torrent(state_dir, &writer_torrent) {
+                        debug!(error = %e, "failed to persist resume after piece write");
+                    }
+                }
+                let _ = have_broadcast_writer.send(piece.index);
+                if pr_tx
+                    .send_async(PieceResult {
+                        index: piece.index,
+                        length: piece.length,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         if let Some(pending) = reuse {
             if torrent.is_private() {
@@ -2250,7 +2660,7 @@ impl Session {
                     "failed to persist resume data on add"
                 );
             }
-            spawn_resume_timer(torrent_session, state_dir, self.cancel.clone());
+            spawn_resume_timer(torrent_session.clone(), state_dir, self.cancel.clone());
         }
 
         if initial_state.transfer_enabled() {
@@ -2265,6 +2675,14 @@ impl Session {
             id,
             state: initial_state,
         });
+
+        if torrent_session.downloaded_state.is_complete() {
+            let session = self.share();
+            let torrent = torrent_session.clone();
+            tokio::spawn(async move {
+                session.maybe_move_on_complete(&torrent, id).await;
+            });
+        }
 
         Ok(AddTorrentResult {
             id,
@@ -2292,10 +2710,12 @@ impl Session {
             return Ok(result_from_pending(pending.value(), magnet.info_hash));
         }
 
-        let output_dir = add_torrent
-            .output_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(magnet.name_or_hash()));
+        if !add_torrent.category.is_empty() {
+            let _ = self.ensure_category(&add_torrent.category);
+        }
+        let output_dir = add_torrent.output_dir.clone().unwrap_or_else(|| {
+            self.resolve_output_dir(&magnet.name_or_hash(), &add_torrent.category)
+        });
         let pending = self
             .register_pending(
                 magnet.info_hash,
@@ -2383,14 +2803,15 @@ impl Session {
             }
 
             let mut opts = AddTorrentOptions::from(meta.clone());
-            opts.output_dir = Some(pending_task.output_dir.clone());
+            opts.output_dir = Some(pending_task.output_dir.lock().unwrap().clone());
             opts.verify = pending_task.verify;
             opts.skip_checking = pending_task.skip_checking;
             opts.paused = Some(pending_task.start_paused);
-            opts.category = pending_task.category.clone();
-            opts.tags = pending_task.tags.clone();
+            opts.category = pending_task.category.lock().unwrap().clone();
+            opts.tags = pending_task.tags.lock().unwrap().iter().cloned().collect();
             opts.sequential = pending_task.sequential.load(Ordering::Relaxed);
             opts.file_priorities = pending_task.file_priorities.lock().unwrap().clone();
+            opts.auto_tmm = Some(pending_task.auto_tmm.load(Ordering::Relaxed));
 
             match promoter
                 .add_torrent_meta(meta, opts, Some(pending_task.clone()))
@@ -2413,6 +2834,13 @@ impl Session {
 
         Ok(result)
     }
+}
+
+fn normalize_tags(tags: Vec<String>) -> BTreeSet<String> {
+    tags.into_iter()
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty())
+        .collect()
 }
 
 fn send_priority_cancels(
@@ -2454,6 +2882,8 @@ fn persist_from_parts(
     tags: &[String],
     sequential: bool,
     file_priorities: &[i64],
+    save_path: &std::path::Path,
+    auto_tmm: bool,
 ) -> Result<PathBuf, resume::ResumeError> {
     resume::persist(
         state_dir,
@@ -2471,6 +2901,8 @@ fn persist_from_parts(
             tags,
             sequential,
             file_priorities,
+            save_path,
+            auto_tmm,
         },
     )
 }
@@ -2479,10 +2911,13 @@ fn persist_torrent(
     state_dir: &std::path::Path,
     torrent: &TorrentSession,
 ) -> Result<PathBuf, resume::ResumeError> {
+    let output_dir = torrent.output_dir.lock().unwrap().clone();
+    let category = torrent.category.lock().unwrap().clone();
+    let tags: Vec<String> = torrent.tags.lock().unwrap().iter().cloned().collect();
     persist_from_parts(
         state_dir,
         &torrent.torrent.info_hash,
-        &torrent.output_dir,
+        &output_dir,
         &torrent.torrent,
         &torrent.downloaded_state,
         torrent.uploaded.load(Ordering::Relaxed),
@@ -2490,10 +2925,12 @@ fn persist_torrent(
         &torrent.torrent_cache_path,
         torrent.added_at,
         *torrent.completed_at.lock().unwrap(),
-        &torrent.category,
-        &torrent.tags,
+        &category,
+        &tags,
         torrent.downloaded_state.sequential(),
         &torrent.downloaded_state.file_priorities_resume(),
+        &output_dir,
+        torrent.auto_tmm.load(Ordering::Relaxed),
     )
 }
 
@@ -2629,10 +3066,10 @@ fn torrent_snapshot(torrent: &TorrentSession) -> TorrentSnapshot {
         upload_rate,
         peers,
         seeds,
-        save_path: torrent.output_dir.clone(),
+        save_path: torrent.output_dir.lock().unwrap().clone(),
         torrent_path: torrent.torrent_cache_path.clone(),
-        category: torrent.category.clone(),
-        tags: torrent.tags.clone(),
+        category: torrent.category.lock().unwrap().clone(),
+        tags: torrent.tags.lock().unwrap().iter().cloned().collect(),
         sequential: torrent.downloaded_state.sequential(),
         added_at: torrent.added_at,
         completed_at: *torrent.completed_at.lock().unwrap(),
@@ -2677,10 +3114,10 @@ fn pending_snapshot(info_hash: [u8; 20], pending: &PendingTorrent) -> TorrentSna
         upload_rate,
         peers,
         seeds,
-        save_path: pending.output_dir.clone(),
+        save_path: pending.output_dir.lock().unwrap().clone(),
         torrent_path: PathBuf::new(),
-        category: pending.category.clone(),
-        tags: pending.tags.clone(),
+        category: pending.category.lock().unwrap().clone(),
+        tags: pending.tags.lock().unwrap().iter().cloned().collect(),
         sequential: pending.sequential.load(Ordering::Relaxed),
         added_at: pending.added_at,
         completed_at: None,

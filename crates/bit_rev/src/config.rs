@@ -221,6 +221,11 @@ impl Config {
             },
             preallocate: self.preallocate,
             piece_cache_pieces: 0,
+            download_dir: util::paths::expand_tilde(&self.download_dir),
+            completed_dir: util::paths::expand_tilde(&self.completed_dir),
+            watch_dir: util::paths::expand_tilde(&self.watch_dir),
+            watch_delete: false,
+            watch_poll: std::time::Duration::from_secs(2),
         }
     }
 }

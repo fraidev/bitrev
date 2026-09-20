@@ -20,6 +20,8 @@ pub enum StorageError {
     PieceOutOfRange(u32),
     #[error("block out of bounds: piece={index} begin={begin} length={length}")]
     BlockOutOfBounds { index: u32, begin: u32, length: u32 },
+    #[error("destination already exists: {0}")]
+    DestinationExists(PathBuf),
 }
 
 /// How `Storage::open` grows files for a fresh download.
@@ -54,8 +56,7 @@ impl Default for StorageOptions {
 }
 
 struct StorageFile {
-    #[allow(dead_code)]
-    path: PathBuf,
+    path: Mutex<PathBuf>,
     /// Shared fd for positional I/O. Write-locked for `set_len` and relocation.
     file: RwLock<Arc<File>>,
 }
@@ -129,6 +130,7 @@ impl PieceCache {
 
 pub struct Storage {
     torrent: Torrent,
+    output_dir: Mutex<PathBuf>,
     files: Vec<StorageFile>,
     cache: Mutex<PieceCache>,
     cache_capacity: usize,
@@ -246,7 +248,7 @@ impl Storage {
         }
     }
 
-    /// `sync_all` every file. Call on torrent completion and before a move (#37).
+    /// `sync_all` every file. Call on torrent completion and before a move.
     pub async fn sync_all(&self) -> Result<(), StorageError> {
         let files = self.file_handles();
         spawn_blocking_io(move || {
@@ -256,6 +258,61 @@ impl Storage {
             Ok(())
         })
         .await
+    }
+
+    pub fn output_dir(&self) -> PathBuf {
+        self.output_dir
+            .lock()
+            .expect("storage output_dir lock")
+            .clone()
+    }
+
+    /// Close, rename, and reopen every file under `new_output`.
+    ///
+    /// Single-file torrent: `new_output` is the file path.
+    /// Multi-file torrent: `new_output` is the root directory.
+    /// On failure, already-moved files are renamed back and handles stay on the original paths.
+    pub async fn relocate(&self, new_output: impl AsRef<Path>) -> Result<(), StorageError> {
+        self.sync_all().await?;
+        let new_output = new_output.as_ref().to_path_buf();
+        let current = self.output_dir();
+        if current == new_output {
+            return Ok(());
+        }
+
+        let mut plan = Vec::with_capacity(self.files.len());
+        for index in 0..self.files.len() {
+            let src = self.files[index]
+                .path
+                .lock()
+                .expect("storage file path lock")
+                .clone();
+            let dest = file_path(&self.torrent, &new_output, index);
+            if src != dest && dest.exists() {
+                return Err(StorageError::DestinationExists(dest));
+            }
+            plan.push((index, src, dest));
+        }
+
+        let mut moved: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+        for (index, src, dest) in plan {
+            if src == dest {
+                continue;
+            }
+            if let Err(e) = relocate_file(&self.files[index], &src, &dest) {
+                for (moved_index, old, new) in moved.into_iter().rev() {
+                    let _ = relocate_file(&self.files[moved_index], &new, &old);
+                }
+                return Err(e);
+            }
+            moved.push((index, src, dest));
+        }
+
+        for (_, old, _) in &moved {
+            remove_empty_parents(old, &current);
+        }
+        *self.output_dir.lock().expect("storage output_dir lock") = new_output;
+        Ok(())
     }
 
     fn file_handles(&self) -> Vec<Arc<File>> {
@@ -323,7 +380,7 @@ fn open_sync(
             .truncate(false)
             .open(&disk_path)?;
         let storage_file = StorageFile {
-            path: disk_path,
+            path: Mutex::new(disk_path),
             file: RwLock::new(Arc::new(file)),
         };
         let length = torrent.files[file_index].length.max(0) as u64;
@@ -333,11 +390,60 @@ fn open_sync(
 
     Ok(Arc::new(Storage {
         torrent: torrent.clone(),
+        output_dir: Mutex::new(output_dir.to_path_buf()),
         files,
         cache: Mutex::new(PieceCache::new(opts.piece_cache_pieces)),
         cache_capacity: opts.piece_cache_pieces,
         hasher: opts.hasher,
     }))
+}
+
+fn relocate_file(file: &StorageFile, src: &Path, dest: &Path) -> Result<(), StorageError> {
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut path = file.path.lock().expect("storage file path lock");
+    let mut handle = file.file.write().expect("storage file lock");
+    handle.sync_all()?;
+    std::fs::rename(src, dest)?;
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dest)
+    {
+        Ok(opened) => {
+            *handle = Arc::new(opened);
+            *path = dest.to_path_buf();
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::rename(dest, src);
+            Err(StorageError::Io(e))
+        }
+    }
+}
+
+fn remove_empty_parents(path: &Path, root: &Path) {
+    let mut current = path.parent().map(Path::to_path_buf);
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if dir != root && !dir.starts_with(root) {
+            break;
+        }
+        if std::fs::remove_dir(&dir).is_err() {
+            break;
+        }
+        if dir == root {
+            break;
+        }
+        current = dir.parent().map(Path::to_path_buf);
+    }
 }
 
 fn write_mapped(files: &[Arc<File>], mappings: &[PieceFileMapping], buf: &[u8]) -> io::Result<()> {
@@ -753,6 +859,58 @@ mod tests {
         read.await.unwrap();
         let got = storage.read_block(0, 0, 16 * 1024).await.unwrap();
         assert_eq!(got, piece);
+    }
+
+    #[tokio::test]
+    async fn relocate_moves_single_file_and_reads_back() {
+        let t = torrent(&[40], 40);
+        let tmp = TempDir::new();
+        let src = tmp.path().join("old.bin");
+        let dest = tmp.path().join("moved").join("new.bin");
+        let storage = Storage::open(&t, &src).await.unwrap();
+        let data: Vec<u8> = (0..40).collect();
+        storage.write_piece(0, &data).await.unwrap();
+
+        storage.relocate(&dest).await.unwrap();
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(storage.read_block(0, 0, 40).await.unwrap(), data);
+        assert_eq!(storage.output_dir(), dest);
+    }
+
+    #[tokio::test]
+    async fn relocate_moves_multi_file_tree() {
+        let t = torrent(&[20, 20], 40);
+        let tmp = TempDir::new();
+        let src = tmp.path().join("old");
+        let dest = tmp.path().join("new");
+        let storage = Storage::open(&t, &src).await.unwrap();
+        let data: Vec<u8> = (0..40).collect();
+        storage.write_piece(0, &data).await.unwrap();
+
+        storage.relocate(&dest).await.unwrap();
+        assert!(!file_path(&t, &src, 0).exists());
+        assert_eq!(std::fs::read(file_path(&t, &dest, 0)).unwrap(), &data[..20]);
+        assert_eq!(std::fs::read(file_path(&t, &dest, 1)).unwrap(), &data[20..]);
+        assert_eq!(storage.read_block(0, 0, 40).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn relocate_fails_when_destination_exists_and_leaves_source() {
+        let t = torrent(&[40], 40);
+        let tmp = TempDir::new();
+        let src = tmp.path().join("old.bin");
+        let dest = tmp.path().join("new.bin");
+        let storage = Storage::open(&t, &src).await.unwrap();
+        let data: Vec<u8> = (0..40).map(|i| (i as u8).wrapping_add(3)).collect();
+        storage.write_piece(0, &data).await.unwrap();
+        std::fs::write(&dest, b"occupied").unwrap();
+
+        let err = storage.relocate(&dest).await.unwrap_err();
+        assert!(matches!(err, StorageError::DestinationExists(_)));
+        assert_eq!(std::fs::read(&src).unwrap(), data);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"occupied");
+        assert_eq!(storage.read_block(0, 0, 40).await.unwrap(), data);
     }
 
     #[tokio::test]

@@ -73,6 +73,16 @@ pub fn dht_dat(state_dir: &Path) -> PathBuf {
     state_dir.join("dht.dat")
 }
 
+/// Category table: `<state_dir>/categories.toml`.
+pub fn categories_toml(state_dir: &Path) -> PathBuf {
+    state_dir.join("categories.toml")
+}
+
+/// Watch-dir files already added: `<state_dir>/watch-processed/`.
+pub fn watch_processed_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("watch-processed")
+}
+
 pub trait PathExt {
     fn compact(&self) -> PathBuf;
     fn icon_suffix(&self) -> Option<&str>;
@@ -426,6 +436,14 @@ mod tests {
             HOME.join(".bitrev").join("torrents")
         );
         assert_eq!(dht_dat(&state_dir()), HOME.join(".bitrev").join("dht.dat"));
+        assert_eq!(
+            categories_toml(&state_dir()),
+            HOME.join(".bitrev").join("categories.toml")
+        );
+        assert_eq!(
+            watch_processed_dir(&state_dir()),
+            HOME.join(".bitrev").join("watch-processed")
+        );
     }
 
     #[test]

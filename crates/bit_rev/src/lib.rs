@@ -9,6 +9,7 @@ pub mod file;
 pub mod handshake;
 pub mod hash;
 pub mod identity;
+pub mod library;
 pub mod magnet;
 pub mod message;
 pub mod mse;

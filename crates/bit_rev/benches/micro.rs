@@ -216,6 +216,8 @@ fn sample_resume() -> ResumeData {
         tags: Vec::new(),
         sequential: 0,
         file_priorities: Vec::new(),
+        save_path: "/tmp/out.bin".into(),
+        auto_tmm: 0,
     }
 }
 
