@@ -131,7 +131,20 @@ impl DhtHandle {
         let bind = SocketAddr::from(([0, 0, 0, 0], options.port));
         let std_sock = std::net::UdpSocket::bind(bind)?;
         std_sock.set_nonblocking(true)?;
-        let socket = UdpSocket::from_std(std_sock)?;
+        let socket = Arc::new(UdpSocket::from_std(std_sock)?);
+        Self::spawn_on(socket, None, options, state_dir, sink, cancel)
+    }
+
+    /// Run DHT on an already-bound UDP socket. `incoming` is `Some` when
+    /// another task owns `recv_from` (uTP) and forwards KRPC here.
+    pub(crate) fn spawn_on(
+        socket: Arc<UdpSocket>,
+        incoming: Option<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+        options: DhtOptions,
+        state_dir: Option<PathBuf>,
+        sink: PeerSink,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Self> {
         let local_addr = socket.local_addr()?;
         let now = Instant::now();
         let table = state_dir
@@ -147,6 +160,7 @@ impl DhtHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = DhtActor {
             socket,
+            incoming,
             table,
             tokens: TokenSecrets::new(now),
             store: AnnounceStore::new(),
@@ -217,7 +231,8 @@ struct TorrentDht {
 }
 
 struct DhtActor {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
+    incoming: Option<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
     table: RoutingTable,
     tokens: TokenSecrets,
     store: AnnounceStore,
@@ -237,12 +252,41 @@ struct DhtActor {
     rx: mpsc::UnboundedReceiver<DhtCmd>,
 }
 
+enum IncomingDatagram {
+    Packet(Vec<u8>, SocketAddr),
+    RecvError,
+    Closed,
+}
+
+async fn recv_datagram(
+    socket: &UdpSocket,
+    incoming: &mut Option<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+    buf: &mut [u8],
+) -> IncomingDatagram {
+    if let Some(rx) = incoming {
+        match rx.recv().await {
+            Some((bytes, from)) => IncomingDatagram::Packet(bytes, from),
+            None => IncomingDatagram::Closed,
+        }
+    } else {
+        match socket.recv_from(buf).await {
+            Ok((n, from)) => IncomingDatagram::Packet(buf[..n].to_vec(), from),
+            Err(e) => {
+                debug!(error = %e, "dht recv failed");
+                IncomingDatagram::RecvError
+            }
+        }
+    }
+}
+
 impl DhtActor {
     async fn run(mut self) {
         self.bootstrap().await;
         let mut interval = tokio::time::interval(TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buf = vec![0u8; MAX_PACKET];
+        let socket = self.socket.clone();
+        let mut incoming = self.incoming.take();
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
@@ -252,10 +296,13 @@ impl DhtActor {
                         Some(cmd) => self.handle_cmd(cmd).await,
                     }
                 }
-                recv = self.socket.recv_from(&mut buf) => {
+                recv = recv_datagram(&socket, &mut incoming, &mut buf) => {
                     match recv {
-                        Ok((n, from)) => self.on_packet(&buf[..n], from).await,
-                        Err(e) => debug!(error = %e, "dht recv failed"),
+                        IncomingDatagram::Packet(bytes, from) => {
+                            self.on_packet(&bytes, from).await;
+                        }
+                        IncomingDatagram::RecvError => {}
+                        IncomingDatagram::Closed => break,
                     }
                 }
                 _ = interval.tick() => self.tick().await,

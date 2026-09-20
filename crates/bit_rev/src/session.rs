@@ -734,18 +734,47 @@ impl Session {
         let sink: PeerSink = Arc::new(move |info_hash, addrs| {
             inlet.add_peers(&info_hash, DiscoverySource::Dht, addrs);
         });
-        match DhtHandle::spawn(
-            self.options.dht.clone(),
-            self.options.state_dir.clone(),
-            sink,
-            self.cancel.clone(),
-        ) {
+        let shared = self.dht_share_socket();
+        let started = if let Some(utp) = shared.as_ref() {
+            debug!(
+                port = utp.local_addr().map(|a| a.port()).unwrap_or(0),
+                "DHT sharing uTP UDP socket"
+            );
+            DhtHandle::spawn_on(
+                utp.udp(),
+                Some(utp.take_krpc_packets()),
+                self.options.dht.clone(),
+                self.options.state_dir.clone(),
+                sink,
+                self.cancel.clone(),
+            )
+        } else {
+            DhtHandle::spawn(
+                self.options.dht.clone(),
+                self.options.state_dir.clone(),
+                sink,
+                self.cancel.clone(),
+            )
+        };
+        match started {
             Ok(handle) => {
                 *self.dht.lock().unwrap() = Some(handle);
             }
             Err(e) => {
                 warn!(error = %e, "failed to start DHT");
             }
+        }
+    }
+
+    /// uTP already owns the UDP port DHT wants, so KRPC is demuxed on that socket.
+    fn dht_share_socket(&self) -> Option<Arc<UtpSocket>> {
+        let socket = self.utp.lock().unwrap().clone()?;
+        let bound = socket.local_addr().ok()?.port();
+        let want = self.options.dht.port;
+        if want == 0 || want == bound {
+            Some(socket)
+        } else {
+            None
         }
     }
 
@@ -3407,6 +3436,37 @@ mod incoming_tests {
         });
         let _ = tokio::time::timeout(Duration::from_secs(2), session.wait_listening()).await;
         assert!(session.utp_local_addr().is_none());
+        session.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dht_starts_when_utp_already_bound_the_same_port() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let session = Session::with_options(SessionOptions {
+            listen_port: port,
+            state_dir: None,
+            dht: DhtOptions {
+                enabled: true,
+                port,
+                bootstrap_nodes: vec![],
+            },
+            utp: crate::utp::UtpOptions {
+                enabled: true,
+                port: 0,
+            },
+            ..SessionOptions::default()
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.wait_listening()).await;
+        let dht = session
+            .dht()
+            .expect("DHT must start on the shared UDP port");
+        let utp = session.utp_local_addr().expect("uTP bound");
+        assert_eq!(dht.udp_port(), port);
+        assert_eq!(utp.port(), port);
         session.shutdown();
     }
 }

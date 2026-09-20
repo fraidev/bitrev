@@ -1,4 +1,7 @@
-//! µTP (BEP-0029) over a dedicated UDP socket.
+//! µTP (BEP-0029) over a UDP socket.
+//!
+//! The session may share that socket with Mainline DHT. KRPC is demuxed in
+//! [`UtpSocket`] and never parsed as uTP.
 //!
 //! Outgoing dials race uTP against TCP via [`crate::transport::RacingConnector`].
 //! The first successful handshake wins and the loser is dropped. That prefers a
@@ -188,5 +191,29 @@ mod tests {
         let reply = Packet::decode(&buf[..n]).unwrap();
         assert_eq!(reply.ty, PacketType::Reset);
         assert_eq!(reply.connection_id, 99);
+    }
+
+    #[tokio::test]
+    async fn krpc_packets_are_forwarded_not_reset() {
+        let server = UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let mut krpc_rx = server.take_krpc_packets();
+        let addr = server.local_addr().unwrap();
+        let udp = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let ping = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe";
+        udp.send_to(ping, addr).await.unwrap();
+        let (bytes, from) = tokio::time::timeout(Duration::from_secs(2), krpc_rx.recv())
+            .await
+            .expect("krpc forwarded")
+            .expect("channel open");
+        assert_eq!(bytes, ping);
+        assert_eq!(from, udp.local_addr().unwrap());
+
+        let mut buf = [0u8; 64];
+        let reset = tokio::time::timeout(Duration::from_millis(200), udp.recv_from(&mut buf)).await;
+        assert!(reset.is_err(), "KRPC must not get a uTP RESET");
     }
 }

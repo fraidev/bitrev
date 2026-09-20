@@ -62,6 +62,7 @@ time_limit = 0
 [dht]
 # Distributed hash table (BEP-0005).
 enabled = true
+# UDP port. Shared with uTP when both use this port.
 port = 6881
 
 [utp]
