@@ -7,6 +7,7 @@ use bit_rev::dht::{DhtHandle, DhtOptions, PeerSink};
 use bit_rev::discovery::DiscoverySource;
 use bit_rev::file::from_filename;
 use bit_rev::session::{AddTorrentOptions, Session, SessionOptions};
+use bit_rev::utp::UtpSocket;
 use common::{
     add_download, wait_for_completion, SeederConfig, SeederPeer, TorrentFixture, DOWNLOAD_TIMEOUT,
     LISTEN_TIMEOUT,
@@ -197,5 +198,64 @@ async fn public_torrent_is_watched_by_dht() {
     })
     .await;
     assert!(session.dht_stats().is_some());
+    session.shutdown();
+}
+
+#[tokio::test]
+async fn dht_shares_udp_socket_with_utp() {
+    let session = Session::with_options(SessionOptions {
+        listen_port: 0,
+        state_dir: None,
+        dht: DhtOptions {
+            enabled: true,
+            port: 0,
+            bootstrap_nodes: vec![],
+        },
+        utp: bit_rev::utp::UtpOptions {
+            enabled: true,
+            port: 0,
+        },
+        ..SessionOptions::default()
+    });
+    tokio::time::timeout(LISTEN_TIMEOUT, session.wait_listening())
+        .await
+        .expect("listen");
+
+    let dht = session.dht().expect("dht started");
+    let utp = session.utp_local_addr().expect("utp bound");
+    assert_eq!(dht.udp_port(), utp.port());
+    assert_eq!(dht.udp_port(), session.listen_port());
+
+    let client = UtpSocket::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("client utp");
+    tokio::time::timeout(Duration::from_secs(2), client.connect(utp))
+        .await
+        .expect("utp connect timeout")
+        .expect("utp connect on shared socket");
+
+    let (sink, found) = collecting_sink();
+    let other = spawn_node(vec![format!("127.0.0.1:{}", dht.udp_port())], sink);
+
+    wait_until(Duration::from_secs(3), || {
+        dht.stats().nodes >= 1 && other.stats().nodes >= 1
+    })
+    .await;
+
+    let info_hash = [0xCDu8; 20];
+    dht.add_torrent(info_hash, 51413, true);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    other.add_torrent(info_hash, 0, true);
+
+    wait_until(Duration::from_secs(3), || {
+        found
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(ih, addrs)| *ih == info_hash && addrs.iter().any(|addr| addr.port() == 51413))
+    })
+    .await;
+
+    other.shutdown();
     session.shutdown();
 }

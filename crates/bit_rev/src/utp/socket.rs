@@ -1,4 +1,7 @@
 //! One UDP socket multiplexing all uTP connections.
+//!
+//! KRPC (BEP-0005) on the same port is forwarded to DHT. Those packets start
+//! with `d` and end with `e`, which never collides with a version-1 uTP header.
 
 use std::collections::HashMap;
 use std::io;
@@ -14,12 +17,14 @@ use super::conn::{drive_conn, UtpStream};
 use super::header::{Packet, PacketType, HEADER_LEN};
 
 type ConnKey = (SocketAddr, u16);
+type KrpcForward = mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>;
 
 struct SocketInner {
     udp: Arc<UdpSocket>,
     conns: Arc<Mutex<HashMap<ConnKey, mpsc::UnboundedSender<Packet>>>>,
     accept_tx: mpsc::Sender<(UtpStream, SocketAddr)>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<(UtpStream, SocketAddr)>>,
+    krpc_tx: Mutex<Option<KrpcForward>>,
     cancel: CancellationToken,
 }
 
@@ -49,6 +54,7 @@ impl UtpSocket {
             conns: Arc::new(Mutex::new(HashMap::new())),
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
+            krpc_tx: Mutex::new(None),
             cancel: cancel.clone(),
         });
         let dispatch = inner.clone();
@@ -64,6 +70,14 @@ impl UtpSocket {
 
     pub fn udp(&self) -> Arc<UdpSocket> {
         self.inner.udp.clone()
+    }
+
+    /// Subscribe to KRPC datagrams demuxed from this socket. Replaces any
+    /// previous subscriber.
+    pub(crate) fn take_krpc_packets(&self) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.inner.krpc_tx.lock().unwrap() = Some(tx);
+        rx
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<UtpStream> {
@@ -115,6 +129,20 @@ impl Drop for UtpSocket {
     }
 }
 
+fn looks_like_krpc(buf: &[u8]) -> bool {
+    buf.len() >= 2 && buf[0] == b'd' && buf[buf.len() - 1] == b'e'
+}
+
+fn forward_krpc(inner: &SocketInner, buf: &[u8], addr: SocketAddr) {
+    let tx = inner.krpc_tx.lock().unwrap().clone();
+    let Some(tx) = tx else {
+        return;
+    };
+    if tx.send((buf.to_vec(), addr)).is_err() {
+        *inner.krpc_tx.lock().unwrap() = None;
+    }
+}
+
 async fn recv_loop(inner: Arc<SocketInner>) {
     let mut buf = vec![0u8; 2048];
     loop {
@@ -128,6 +156,10 @@ async fn recv_loop(inner: Arc<SocketInner>) {
                         continue;
                     }
                 };
+                if looks_like_krpc(&buf[..n]) {
+                    forward_krpc(&inner, &buf[..n], addr);
+                    continue;
+                }
                 if n < HEADER_LEN {
                     continue;
                 }
