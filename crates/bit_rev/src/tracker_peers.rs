@@ -14,6 +14,7 @@ use crate::{
     peer::BencodeResponse,
     peer_connection::{try_spawn_peer, FullPiece, Slot, SpawnPeerParams, TorrentDownloadedState},
     peer_state::PeerStates,
+    rate::BandwidthLimiters,
     session::{DownloadState, PieceResult},
     storage::Storage,
     torrent::Torrent,
@@ -42,6 +43,7 @@ pub struct PeerSpawnRuntime {
     pub piece_tx: Arc<Slot<flume::Sender<FullPiece>>>,
     pub promote_notify: Arc<Notify>,
     pub encryption: crate::mse::EncryptionPolicy,
+    pub limits: BandwidthLimiters,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +201,7 @@ fn clone_runtime(runtime: &PeerSpawnRuntime) -> PeerSpawnRuntime {
         piece_tx: runtime.piece_tx.clone(),
         promote_notify: runtime.promote_notify.clone(),
         encryption: runtime.encryption,
+        limits: runtime.limits.clone(),
     }
 }
 
@@ -249,6 +252,7 @@ async fn process_peers(
             max_peers_global: runtime.max_peers_global,
             connector: runtime.connector.clone(),
             promote_notify: runtime.promote_notify.clone(),
+            limits: runtime.limits.clone(),
         });
     }
 }

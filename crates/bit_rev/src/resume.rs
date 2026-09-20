@@ -12,9 +12,11 @@ use crate::storage;
 use crate::torrent::Torrent;
 use crate::utils;
 
-pub const RESUME_VERSION: i64 = 3;
+pub const RESUME_VERSION: i64 = 4;
 pub const RESUME_VERSION_V1: i64 = 1;
 pub const RESUME_VERSION_V2: i64 = 2;
+pub const RESUME_VERSION_V3: i64 = 3;
+pub const RESUME_VERSION_V4: i64 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResumeError {
@@ -61,6 +63,16 @@ pub struct ResumeData {
     pub save_path: String,
     #[serde(default)]
     pub auto_tmm: i64,
+    #[serde(default)]
+    pub queue_position: i64,
+    #[serde(default)]
+    pub force_start: i64,
+    /// 0 inherit, -1 unlimited, >0 milli-ratio (1.0 = 1000).
+    #[serde(default)]
+    pub ratio_limit: i64,
+    /// 0 inherit, -1 unlimited, >0 minutes.
+    #[serde(default)]
+    pub seeding_time_limit: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +102,30 @@ impl ResumeData {
 
     pub fn is_auto_tmm(&self) -> bool {
         self.auto_tmm != 0
+    }
+
+    pub fn is_force_start(&self) -> bool {
+        self.force_start != 0
+    }
+
+    pub fn ratio_limit_override(&self) -> Option<f64> {
+        if self.ratio_limit == 0 {
+            None
+        } else if self.ratio_limit < 0 {
+            Some(0.0)
+        } else {
+            Some(self.ratio_limit as f64 / 1000.0)
+        }
+    }
+
+    pub fn seeding_time_limit_override(&self) -> Option<u64> {
+        if self.seeding_time_limit == 0 {
+            None
+        } else if self.seeding_time_limit < 0 {
+            Some(0)
+        } else {
+            Some(self.seeding_time_limit as u64)
+        }
     }
 
     /// Resume v3 `save_path`, falling back to `output_dir` for older files.
@@ -333,6 +369,10 @@ pub struct ResumeSnapshot<'a> {
     pub file_priorities: &'a [i64],
     pub save_path: &'a Path,
     pub auto_tmm: bool,
+    pub queue_position: i64,
+    pub force_start: bool,
+    pub ratio_limit: i64,
+    pub seeding_time_limit: i64,
 }
 
 pub fn snapshot(snap: ResumeSnapshot<'_>) -> ResumeData {
@@ -355,6 +395,10 @@ pub fn snapshot(snap: ResumeSnapshot<'_>) -> ResumeData {
         file_priorities: snap.file_priorities.to_vec(),
         save_path: snap.save_path.to_string_lossy().into_owned(),
         auto_tmm: i64::from(snap.auto_tmm),
+        queue_position: snap.queue_position,
+        force_start: i64::from(snap.force_start),
+        ratio_limit: snap.ratio_limit,
+        seeding_time_limit: snap.seeding_time_limit,
     }
 }
 
@@ -403,6 +447,10 @@ mod tests {
             file_priorities: Vec::new(),
             save_path: "/tmp/out.bin".into(),
             auto_tmm: 0,
+            queue_position: 0,
+            force_start: 0,
+            ratio_limit: 0,
+            seeding_time_limit: 0,
         }
     }
 
@@ -569,6 +617,60 @@ mod tests {
         assert!(loaded.save_path.is_empty());
         assert!(!loaded.is_auto_tmm());
         assert_eq!(loaded.resolved_save_path(), "/tmp/out.bin");
+    }
+
+    #[test]
+    fn v3_resume_loads_with_v4_defaults() {
+        #[derive(Serialize)]
+        struct ResumeV3 {
+            version: i64,
+            info_hash: ByteBuf,
+            bitfield: ByteBuf,
+            output_dir: String,
+            files: Vec<ResumeFile>,
+            uploaded: i64,
+            downloaded: i64,
+            torrent_path: String,
+            paused: i64,
+            added_at: i64,
+            completed_at: i64,
+            category: String,
+            tags: Vec<String>,
+            sequential: i64,
+            file_priorities: Vec<i64>,
+            save_path: String,
+            auto_tmm: i64,
+        }
+        let bytes = serde_bencode::to_bytes(&ResumeV3 {
+            version: RESUME_VERSION_V3,
+            info_hash: ByteBuf::from(vec![0xab; 20]),
+            bitfield: ByteBuf::from(vec![0b1010_0000]),
+            output_dir: "/tmp/out.bin".into(),
+            files: vec![ResumeFile {
+                path: vec!["out.bin".into()],
+                length: 16,
+                mtime: 1_700_000_000,
+            }],
+            uploaded: 11,
+            downloaded: 16,
+            torrent_path: "/tmp/torrents/ab.torrent".into(),
+            paused: 0,
+            added_at: 1_700_000_000,
+            completed_at: 0,
+            category: "movies".into(),
+            tags: vec!["hd".into()],
+            sequential: 1,
+            file_priorities: vec![2],
+            save_path: "/tmp/out.bin".into(),
+            auto_tmm: 1,
+        })
+        .unwrap();
+        let loaded = decode(&bytes).unwrap();
+        assert_eq!(loaded.version, RESUME_VERSION_V3);
+        assert_eq!(loaded.queue_position, 0);
+        assert!(!loaded.is_force_start());
+        assert_eq!(loaded.ratio_limit_override(), None);
+        assert_eq!(loaded.seeding_time_limit_override(), None);
     }
 
     #[test]

@@ -27,7 +27,7 @@ derived transfer-enable flag (`Downloading` vs `Paused`).
 | `Downloading` | Missing pieces, transferring | yes |
 | `Seeding` | Complete, uploading | yes |
 | `Paused` | User paused. Peers stay connected but do not request or unchoke | no |
-| `Queued` | Waiting for a queue slot (issue 38). Nothing enters this state yet | no |
+| `Queued` | Waiting for a queue slot (issue 38). No announces or peer connects | no |
 | `Moving` | Move-on-complete in progress (issue 37). Nothing enters this state yet | no |
 | `Error(String)` | Failed. Message is in the snapshot | no |
 
