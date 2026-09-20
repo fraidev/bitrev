@@ -12,8 +12,9 @@ use crate::storage;
 use crate::torrent::Torrent;
 use crate::utils;
 
-pub const RESUME_VERSION: i64 = 2;
+pub const RESUME_VERSION: i64 = 3;
 pub const RESUME_VERSION_V1: i64 = 1;
+pub const RESUME_VERSION_V2: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResumeError {
@@ -56,6 +57,10 @@ pub struct ResumeData {
     pub sequential: i64,
     #[serde(default)]
     pub file_priorities: Vec<i64>,
+    #[serde(default)]
+    pub save_path: String,
+    #[serde(default)]
+    pub auto_tmm: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +86,19 @@ impl ResumeData {
 
     pub fn is_sequential(&self) -> bool {
         self.sequential != 0
+    }
+
+    pub fn is_auto_tmm(&self) -> bool {
+        self.auto_tmm != 0
+    }
+
+    /// Resume v3 `save_path`, falling back to `output_dir` for older files.
+    pub fn resolved_save_path(&self) -> &str {
+        if self.save_path.is_empty() {
+            &self.output_dir
+        } else {
+            &self.save_path
+        }
     }
 
     pub fn bitfield(&self) -> Bitfield {
@@ -146,7 +164,7 @@ pub fn decode(bytes: &[u8]) -> Result<ResumeData, ResumeError> {
     crate::file::check_bencode_depth(bytes).map_err(|e| ResumeError::Decode(e.to_string()))?;
     let data: ResumeData =
         serde_bencode::from_bytes(bytes).map_err(|e| ResumeError::Decode(e.to_string()))?;
-    if data.version != RESUME_VERSION && data.version != RESUME_VERSION_V1 {
+    if data.version < RESUME_VERSION_V1 || data.version > RESUME_VERSION {
         return Err(ResumeError::UnsupportedVersion(data.version));
     }
     if data.info_hash.len() != 20 {
@@ -313,6 +331,8 @@ pub struct ResumeSnapshot<'a> {
     pub tags: &'a [String],
     pub sequential: bool,
     pub file_priorities: &'a [i64],
+    pub save_path: &'a Path,
+    pub auto_tmm: bool,
 }
 
 pub fn snapshot(snap: ResumeSnapshot<'_>) -> ResumeData {
@@ -333,6 +353,8 @@ pub fn snapshot(snap: ResumeSnapshot<'_>) -> ResumeData {
         tags: snap.tags.to_vec(),
         sequential: i64::from(snap.sequential),
         file_priorities: snap.file_priorities.to_vec(),
+        save_path: snap.save_path.to_string_lossy().into_owned(),
+        auto_tmm: i64::from(snap.auto_tmm),
     }
 }
 
@@ -379,6 +401,8 @@ mod tests {
             tags: Vec::new(),
             sequential: 0,
             file_priorities: Vec::new(),
+            save_path: "/tmp/out.bin".into(),
+            auto_tmm: 0,
         }
     }
 
@@ -490,6 +514,61 @@ mod tests {
         assert!(loaded.tags.is_empty());
         assert!(!loaded.is_sequential());
         assert!(loaded.file_priorities.is_empty());
+        assert!(loaded.save_path.is_empty());
+        assert!(!loaded.is_auto_tmm());
+        assert_eq!(loaded.resolved_save_path(), "/tmp/out.bin");
+    }
+
+    #[test]
+    fn v2_resume_loads_with_v3_defaults() {
+        #[derive(Serialize)]
+        struct ResumeV2 {
+            version: i64,
+            info_hash: ByteBuf,
+            bitfield: ByteBuf,
+            output_dir: String,
+            files: Vec<ResumeFile>,
+            uploaded: i64,
+            downloaded: i64,
+            torrent_path: String,
+            paused: i64,
+            added_at: i64,
+            completed_at: i64,
+            category: String,
+            tags: Vec<String>,
+            sequential: i64,
+            file_priorities: Vec<i64>,
+        }
+        let bytes = serde_bencode::to_bytes(&ResumeV2 {
+            version: RESUME_VERSION_V2,
+            info_hash: ByteBuf::from(vec![0xab; 20]),
+            bitfield: ByteBuf::from(vec![0b1010_0000]),
+            output_dir: "/tmp/out.bin".into(),
+            files: vec![ResumeFile {
+                path: vec!["out.bin".into()],
+                length: 16,
+                mtime: 1_700_000_000,
+            }],
+            uploaded: 11,
+            downloaded: 16,
+            torrent_path: "/tmp/torrents/ab.torrent".into(),
+            paused: 0,
+            added_at: 1_700_000_000,
+            completed_at: 0,
+            category: "movies".into(),
+            tags: vec!["hd".into()],
+            sequential: 1,
+            file_priorities: vec![2],
+        })
+        .unwrap();
+        let loaded = decode(&bytes).unwrap();
+        assert_eq!(loaded.version, RESUME_VERSION_V2);
+        assert_eq!(loaded.category, "movies");
+        assert_eq!(loaded.tags, vec!["hd".to_string()]);
+        assert!(loaded.is_sequential());
+        assert!(loaded.save_path.is_empty());
+        assert!(!loaded.is_auto_tmm());
+        assert_eq!(loaded.resolved_save_path(), "/tmp/out.bin");
     }
 
     #[test]
