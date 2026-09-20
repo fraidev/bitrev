@@ -20,6 +20,7 @@ pub mod picker;
 pub mod priority;
 pub mod protocol;
 pub mod protocol_udp;
+pub mod rate;
 pub mod resume;
 pub mod session;
 pub mod storage;

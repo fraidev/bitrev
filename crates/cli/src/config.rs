@@ -131,6 +131,15 @@ fn apply_env(config: &mut Config, env: &impl Fn(&str) -> Option<String>) -> anyh
     if let Some(v) = env_parse(env, "BITREV_DOWNLOAD_LIMIT")? {
         config.download_limit = v;
     }
+    if let Some(v) = env_parse(env, "BITREV_ALT_UPLOAD_LIMIT")? {
+        config.alt_upload_limit = v;
+    }
+    if let Some(v) = env_parse(env, "BITREV_ALT_DOWNLOAD_LIMIT")? {
+        config.alt_download_limit = v;
+    }
+    if let Some(v) = env("BITREV_ALT_SCHEDULE") {
+        config.alt_schedule = v;
+    }
     if let Some(v) = env_bool(env, "BITREV_PEX")? {
         config.pex = v;
     }

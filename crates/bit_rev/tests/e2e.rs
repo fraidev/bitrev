@@ -510,6 +510,10 @@ async fn recheck_does_not_stall_other_download() {
         file_priorities: Vec::new(),
         save_path: output.to_string_lossy().into_owned(),
         auto_tmm: 0,
+        queue_position: 0,
+        force_start: 0,
+        ratio_limit: 0,
+        seeding_time_limit: 0,
     };
     resume::save(
         &resume::resume_path(state_dir.path(), &big.torrent_meta.info_hash),

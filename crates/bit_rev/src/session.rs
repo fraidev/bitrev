@@ -20,6 +20,7 @@ use crate::peer_connection::{
 use crate::peer_state::PeerStates;
 use crate::priority;
 use crate::protocol::Protocol;
+use crate::rate::{AltSchedule, BandwidthLimiters, RateLimiter, SessionLimits, DEFAULT_BURST};
 use crate::resume::{self, ResumeSnapshot};
 
 pub use crate::dht::{DhtOptions, DhtStats};
@@ -92,7 +93,7 @@ impl fmt::Debug for TorrentId {
     }
 }
 
-/// Per-torrent lifecycle. `Queued` exists for issue 38 and is never entered here.
+/// Per-torrent lifecycle. `Queued` waits for a download/upload slot (issue 38).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorrentState {
     Checking,
@@ -147,6 +148,8 @@ pub struct TorrentSnapshot {
     pub piece_count: u32,
     pub pieces_have: u32,
     pub ratio: f64,
+    pub queue_position: i64,
+    pub force_start: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +184,11 @@ pub struct TransferStats {
     pub download_rate: u64,
     pub upload_rate: u64,
     pub torrents: usize,
+    pub download_limit: u64,
+    pub upload_limit: u64,
+    pub alt_download_limit: u64,
+    pub alt_upload_limit: u64,
+    pub alt_mode: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -204,6 +212,10 @@ pub enum ControlError {
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const RATE_TICK: Duration = Duration::from_secs(1);
 const RATE_EMA_ALPHA: f64 = 0.2;
+const SLOW_RATE_BPS: u64 = 1024;
+pub const DEFAULT_MAX_ACTIVE_DOWNLOADS: usize = 5;
+pub const DEFAULT_MAX_ACTIVE_UPLOADS: usize = 8;
+pub const DEFAULT_QUEUE_SLOW_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 struct RateSample {
@@ -272,6 +284,18 @@ pub struct SessionOptions {
     /// Delete watched files after add instead of moving them to `watch-processed`.
     pub watch_delete: bool,
     pub watch_poll: Duration,
+    pub download_limit: u64,
+    pub upload_limit: u64,
+    pub alt_download_limit: u64,
+    pub alt_upload_limit: u64,
+    pub alt_schedule: String,
+    pub seed_ratio_limit: f64,
+    pub seed_time_limit: u64,
+    pub max_active_downloads: usize,
+    pub max_active_uploads: usize,
+    pub max_active: usize,
+    pub dont_count_slow: bool,
+    pub queue_slow_window: Duration,
 }
 
 impl Default for SessionOptions {
@@ -291,6 +315,18 @@ impl Default for SessionOptions {
             watch_dir: PathBuf::new(),
             watch_delete: false,
             watch_poll: Duration::from_secs(2),
+            download_limit: 0,
+            upload_limit: 0,
+            alt_download_limit: 0,
+            alt_upload_limit: 0,
+            alt_schedule: String::new(),
+            seed_ratio_limit: 0.0,
+            seed_time_limit: 0,
+            max_active_downloads: DEFAULT_MAX_ACTIVE_DOWNLOADS,
+            max_active_uploads: DEFAULT_MAX_ACTIVE_UPLOADS,
+            max_active: 0,
+            dont_count_slow: true,
+            queue_slow_window: DEFAULT_QUEUE_SLOW_WINDOW,
         }
     }
 }
@@ -318,6 +354,14 @@ pub struct TorrentSession {
     pub auto_tmm: AtomicBool,
     pub pr_rx: Receiver<PieceResult>,
     rates: Arc<Mutex<RateSample>>,
+    pub queue_position: AtomicU64,
+    pub force_start: AtomicBool,
+    pub download_limiter: Arc<RateLimiter>,
+    pub upload_limiter: Arc<RateLimiter>,
+    pub limits: BandwidthLimiters,
+    ratio_limit: Mutex<Option<f64>>,
+    seeding_time_limit: Mutex<Option<u64>>,
+    slow_since: Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +389,9 @@ pub struct Session {
     hasher: Arc<PieceHasher>,
     event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
     categories: Arc<Mutex<BTreeMap<String, Category>>>,
+    limits: Arc<SessionLimits>,
+    next_queue_pos: Arc<AtomicU64>,
+    restoring: Arc<AtomicBool>,
 }
 
 pub(crate) struct PendingTorrent {
@@ -374,6 +421,14 @@ pub(crate) struct PendingTorrent {
     sequential: std::sync::atomic::AtomicBool,
     file_priorities: Mutex<Vec<FilePriority>>,
     rates: Arc<Mutex<RateSample>>,
+    queue_position: AtomicU64,
+    force_start: AtomicBool,
+    download_limiter: Arc<RateLimiter>,
+    upload_limiter: Arc<RateLimiter>,
+    limits: BandwidthLimiters,
+    ratio_limit: Mutex<Option<f64>>,
+    seeding_time_limit: Mutex<Option<u64>>,
+    slow_since: Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -432,6 +487,11 @@ pub struct AddTorrentOptions {
     skip_checking: bool,
     file_priorities: Vec<FilePriority>,
     auto_tmm: Option<bool>,
+    force_start: bool,
+    ratio_limit: Option<f64>,
+    seeding_time_limit: Option<u64>,
+    download_limit: u64,
+    upload_limit: u64,
 }
 
 impl AddTorrentOptions {
@@ -450,6 +510,11 @@ impl AddTorrentOptions {
             skip_checking: false,
             file_priorities: Vec::new(),
             auto_tmm: None,
+            force_start: false,
+            ratio_limit: None,
+            seeding_time_limit: None,
+            download_limit: 0,
+            upload_limit: 0,
         }
     }
 
@@ -472,6 +537,11 @@ impl AddTorrentOptions {
             skip_checking: false,
             file_priorities: Vec::new(),
             auto_tmm: None,
+            force_start: false,
+            ratio_limit: None,
+            seeding_time_limit: None,
+            download_limit: 0,
+            upload_limit: 0,
         }
     }
 
@@ -534,6 +604,31 @@ impl AddTorrentOptions {
 
     pub fn auto_tmm(mut self, enabled: bool) -> Self {
         self.auto_tmm = Some(enabled);
+        self
+    }
+
+    pub fn force_start(mut self, enabled: bool) -> Self {
+        self.force_start = enabled;
+        self
+    }
+
+    pub fn ratio_limit(mut self, limit: f64) -> Self {
+        self.ratio_limit = Some(limit);
+        self
+    }
+
+    pub fn seeding_time_limit(mut self, minutes: u64) -> Self {
+        self.seeding_time_limit = Some(minutes);
+        self
+    }
+
+    pub fn download_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.download_limit = bytes_per_sec;
+        self
+    }
+
+    pub fn upload_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.upload_limit = bytes_per_sec;
         self
     }
 }
@@ -642,6 +737,12 @@ impl Session {
         let connector: Arc<dyn Connector> =
             Arc::new(MseConnector::new(connector, options.encryption));
         let (event_tx, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let limits = Arc::new(SessionLimits::new(
+            options.download_limit,
+            options.upload_limit,
+            options.alt_download_limit,
+            options.alt_upload_limit,
+        ));
         let session = Self {
             torrents: Arc::new(DashMap::new()),
             download_state: Arc::new(Mutex::new(DownloadState::Init)),
@@ -660,6 +761,9 @@ impl Session {
             hasher: Arc::new(PieceHasher::new()),
             event_tx,
             categories: Arc::new(Mutex::new(BTreeMap::new())),
+            limits,
+            next_queue_pos: Arc::new(AtomicU64::new(0)),
+            restoring: Arc::new(AtomicBool::new(false)),
         };
         session
             .extensions
@@ -669,6 +773,7 @@ impl Session {
         session.start_dht();
         session.spawn_tick();
         session.spawn_watch();
+        session.spawn_alt_schedule();
         session
     }
 
@@ -691,6 +796,9 @@ impl Session {
             hasher: self.hasher.clone(),
             event_tx: self.event_tx.clone(),
             categories: self.categories.clone(),
+            limits: self.limits.clone(),
+            next_queue_pos: self.next_queue_pos.clone(),
+            restoring: self.restoring.clone(),
         }
     }
 
@@ -698,7 +806,10 @@ impl Session {
     /// should keep using `new` / `with_options`.
     pub async fn open(options: SessionOptions) -> anyhow::Result<Self> {
         let session = Self::with_options(options);
+        session.restoring.store(true, Ordering::Relaxed);
         session.load_persisted().await;
+        session.restoring.store(false, Ordering::Relaxed);
+        session.evaluate_queue();
         Ok(session)
     }
 
@@ -753,17 +864,36 @@ impl Session {
             anyhow::bail!("cached torrent path is not utf-8");
         };
         let meta = file::from_filename(path_str)?;
-        self.add_torrent(
-            AddTorrentOptions::from(meta)
-                .output_dir(PathBuf::from(data.resolved_save_path()))
-                .paused(data.is_paused())
-                .category(data.category.clone())
-                .tags(data.tags.clone())
-                .sequential(data.is_sequential())
-                .file_priorities(FilePriority::decode_list(&data.file_priorities))
-                .auto_tmm(data.is_auto_tmm()),
-        )
-        .await?;
+        let mut opts = AddTorrentOptions::from(meta)
+            .output_dir(PathBuf::from(data.resolved_save_path()))
+            .paused(data.is_paused())
+            .category(data.category.clone())
+            .tags(data.tags.clone())
+            .sequential(data.is_sequential())
+            .file_priorities(FilePriority::decode_list(&data.file_priorities))
+            .auto_tmm(data.is_auto_tmm())
+            .force_start(data.is_force_start());
+        if let Some(limit) = data.ratio_limit_override() {
+            opts = opts.ratio_limit(limit);
+        }
+        if let Some(limit) = data.seeding_time_limit_override() {
+            opts = opts.seeding_time_limit(limit);
+        }
+        let added = self.add_torrent(opts).await?;
+        if data.version >= resume::RESUME_VERSION_V4 {
+            if let Some(torrent) = self.torrents.get(&added.id.0) {
+                torrent
+                    .queue_position
+                    .store(data.queue_position.max(0) as u64, Ordering::Relaxed);
+            }
+            if let Some(pending) = self.pending.get(&added.id.0) {
+                pending
+                    .queue_position
+                    .store(data.queue_position.max(0) as u64, Ordering::Relaxed);
+            }
+            let next = (data.queue_position.max(0) as u64).saturating_add(1);
+            let _ = self.next_queue_pos.fetch_max(next, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -1104,6 +1234,7 @@ impl Session {
         for entry in self.pending.iter() {
             self.apply_pending_resume(entry.value(), TorrentId::new(*entry.key()));
         }
+        self.evaluate_queue();
         if let Some(dht) = self.dht() {
             dht.set_all_active(true);
         }
@@ -1117,6 +1248,7 @@ impl Session {
                 dht.set_active(id.0, false);
             }
             self.spawn_flush_one(torrent.value().clone());
+            self.evaluate_queue();
             return Ok(());
         }
         if let Some(pending) = self.pending.get(&id.0) {
@@ -1124,6 +1256,7 @@ impl Session {
             if let Some(dht) = self.dht() {
                 dht.set_active(id.0, false);
             }
+            self.evaluate_queue();
             return Ok(());
         }
         Err(ControlError::NotFound(id))
@@ -1131,13 +1264,21 @@ impl Session {
 
     pub fn resume(&self, id: TorrentId) -> Result<(), ControlError> {
         if let Some(torrent) = self.torrents.get(&id.0) {
-            self.apply_resume(torrent.value(), id);
             {
                 let mut state = self.download_state.lock().unwrap();
                 *state = DownloadState::Downloading;
             }
+            let next = active_state(&torrent.downloaded_state);
+            self.set_torrent_state(torrent.value(), id, next);
+            self.evaluate_queue();
             if let Some(dht) = self.dht() {
-                dht.set_active(id.0, true);
+                let enabled = torrent
+                    .value()
+                    .torrent_state
+                    .lock()
+                    .unwrap()
+                    .transfer_enabled();
+                dht.set_active(id.0, enabled);
             }
             self.spawn_flush_one(torrent.value().clone());
             return Ok(());
@@ -1148,8 +1289,15 @@ impl Session {
                 let mut state = self.download_state.lock().unwrap();
                 *state = DownloadState::Downloading;
             }
+            self.evaluate_queue();
             if let Some(dht) = self.dht() {
-                dht.set_active(id.0, true);
+                let enabled = pending
+                    .value()
+                    .torrent_state
+                    .lock()
+                    .unwrap()
+                    .transfer_enabled();
+                dht.set_active(id.0, enabled);
             }
             return Ok(());
         }
@@ -1541,6 +1689,7 @@ impl Session {
                 });
             }
         }
+        self.evaluate_queue();
         self.spawn_flush_one(torrent.clone());
     }
 
@@ -1571,7 +1720,128 @@ impl Session {
             stats.upload_rate += rates.upload_rate.max(0.0).round() as u64;
             stats.torrents += 1;
         }
+        stats.download_limit = self.limits.current_download().rate();
+        stats.upload_limit = self.limits.current_upload().rate();
+        stats.alt_download_limit = self.limits.alt_download.rate();
+        stats.alt_upload_limit = self.limits.alt_upload.rate();
+        stats.alt_mode = self.limits.alt_mode();
         stats
+    }
+
+    pub fn set_rate_limits(&self, download: u64, upload: u64) {
+        self.limits.download.set_rate(download);
+        self.limits.upload.set_rate(upload);
+        if download > 0 {
+            self.limits.download.set_burst(DEFAULT_BURST);
+        }
+        if upload > 0 {
+            self.limits.upload.set_burst(DEFAULT_BURST);
+        }
+    }
+
+    pub fn set_alt_limits(&self, download: u64, upload: u64) {
+        self.limits.alt_download.set_rate(download);
+        self.limits.alt_upload.set_rate(upload);
+        if download > 0 {
+            self.limits.alt_download.set_burst(DEFAULT_BURST);
+        }
+        if upload > 0 {
+            self.limits.alt_upload.set_burst(DEFAULT_BURST);
+        }
+    }
+
+    pub fn set_alt_mode(&self, on: bool) {
+        self.limits.set_alt_mode(on);
+    }
+
+    pub fn alt_mode(&self) -> bool {
+        self.limits.alt_mode()
+    }
+
+    pub fn set_torrent_rate_limits(
+        &self,
+        id: TorrentId,
+        download: u64,
+        upload: u64,
+    ) -> Result<(), ControlError> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            torrent.download_limiter.set_rate(download);
+            torrent.upload_limiter.set_rate(upload);
+            if download > 0 {
+                torrent.download_limiter.set_burst(DEFAULT_BURST);
+            }
+            if upload > 0 {
+                torrent.upload_limiter.set_burst(DEFAULT_BURST);
+            }
+            return Ok(());
+        }
+        if let Some(pending) = self.pending.get(&id.0) {
+            pending.download_limiter.set_rate(download);
+            pending.upload_limiter.set_rate(upload);
+            return Ok(());
+        }
+        Err(ControlError::NotFound(id))
+    }
+
+    pub fn set_force_start(&self, id: TorrentId, enabled: bool) -> Result<(), ControlError> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            torrent.force_start.store(enabled, Ordering::Relaxed);
+            if enabled {
+                let next = active_state(&torrent.downloaded_state);
+                self.set_torrent_state(torrent.value(), id, next);
+            }
+            self.evaluate_queue();
+            self.spawn_flush_one(torrent.value().clone());
+            return Ok(());
+        }
+        if let Some(pending) = self.pending.get(&id.0) {
+            pending.force_start.store(enabled, Ordering::Relaxed);
+            if enabled {
+                self.apply_pending_resume(pending.value(), id);
+            }
+            self.evaluate_queue();
+            return Ok(());
+        }
+        Err(ControlError::NotFound(id))
+    }
+
+    pub fn set_queue_position(&self, id: TorrentId, pos: usize) -> Result<(), ControlError> {
+        let mut ids = self.queue_order();
+        if !ids.contains(&id) {
+            return Err(ControlError::NotFound(id));
+        }
+        ids.retain(|existing| *existing != id);
+        let pos = pos.min(ids.len());
+        ids.insert(pos, id);
+        self.apply_queue_order(&ids);
+        self.evaluate_queue();
+        self.spawn_flush_resume();
+        Ok(())
+    }
+
+    pub fn queue_top(&self, id: TorrentId) -> Result<(), ControlError> {
+        self.set_queue_position(id, 0)
+    }
+
+    pub fn queue_bottom(&self, id: TorrentId) -> Result<(), ControlError> {
+        let len = self.queue_order().len();
+        self.set_queue_position(id, len.saturating_sub(1))
+    }
+
+    pub fn queue_up(&self, id: TorrentId) -> Result<(), ControlError> {
+        let ids = self.queue_order();
+        let Some(idx) = ids.iter().position(|existing| *existing == id) else {
+            return Err(ControlError::NotFound(id));
+        };
+        self.set_queue_position(id, idx.saturating_sub(1))
+    }
+
+    pub fn queue_down(&self, id: TorrentId) -> Result<(), ControlError> {
+        let ids = self.queue_order();
+        let Some(idx) = ids.iter().position(|existing| *existing == id) else {
+            return Err(ControlError::NotFound(id));
+        };
+        self.set_queue_position(id, idx.saturating_add(1))
     }
 
     pub async fn recheck(&self, id: TorrentId) -> Result<(), ControlError> {
@@ -1699,6 +1969,227 @@ impl Session {
         let _ = self.event_tx.send(event);
     }
 
+    fn queue_order(&self) -> Vec<TorrentId> {
+        let mut items: Vec<(u64, TorrentId)> = Vec::new();
+        for entry in self.torrents.iter() {
+            items.push((
+                entry.queue_position.load(Ordering::Relaxed),
+                TorrentId::new(*entry.key()),
+            ));
+        }
+        for entry in self.pending.iter() {
+            if self.torrents.contains_key(entry.key()) {
+                continue;
+            }
+            items.push((
+                entry.queue_position.load(Ordering::Relaxed),
+                TorrentId::new(*entry.key()),
+            ));
+        }
+        items.sort_by_key(|(pos, id)| (*pos, id.0));
+        items.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn apply_queue_order(&self, ids: &[TorrentId]) {
+        for (i, id) in ids.iter().enumerate() {
+            let pos = i as u64;
+            if let Some(torrent) = self.torrents.get(&id.0) {
+                torrent.queue_position.store(pos, Ordering::Relaxed);
+            }
+            if let Some(pending) = self.pending.get(&id.0) {
+                pending.queue_position.store(pos, Ordering::Relaxed);
+            }
+        }
+        self.next_queue_pos
+            .store(ids.len() as u64, Ordering::Relaxed);
+    }
+
+    fn alloc_queue_position(&self) -> u64 {
+        self.next_queue_pos.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn torrent_is_slow(
+        &self,
+        download_rate: f64,
+        upload_rate: f64,
+        slow_since: Option<std::time::Instant>,
+    ) -> bool {
+        if !self.options.dont_count_slow {
+            return false;
+        }
+        let Some(since) = slow_since else {
+            return false;
+        };
+        let rate = download_rate.max(0.0) + upload_rate.max(0.0);
+        rate < SLOW_RATE_BPS as f64 && since.elapsed() >= self.options.queue_slow_window
+    }
+
+    fn evaluate_queue(&self) {
+        if self.restoring.load(Ordering::Relaxed) {
+            return;
+        }
+        let order = self.queue_order();
+        let mut dl = 0usize;
+        let mut ul = 0usize;
+        let max_dl = self.options.max_active_downloads;
+        let max_ul = self.options.max_active_uploads;
+        let max_all = self.options.max_active;
+
+        let mut assignments: Vec<(TorrentId, TorrentState)> = Vec::new();
+        for id in order {
+            if let Some(torrent) = self.torrents.get(&id.0) {
+                let current = torrent.torrent_state.lock().unwrap().clone();
+                if matches!(
+                    current,
+                    TorrentState::Paused
+                        | TorrentState::Checking
+                        | TorrentState::Moving
+                        | TorrentState::Error(_)
+                ) {
+                    continue;
+                }
+                if self.seed_limit_reached(&torrent) {
+                    assignments.push((id, TorrentState::Paused));
+                    continue;
+                }
+                let complete = torrent.downloaded_state.is_complete();
+                let want = if complete {
+                    TorrentState::Seeding
+                } else {
+                    TorrentState::Downloading
+                };
+                let force = torrent.force_start.load(Ordering::Relaxed);
+                let rates = torrent.rates.lock().unwrap();
+                let slow = self.torrent_is_slow(
+                    rates.download_rate,
+                    rates.upload_rate,
+                    *torrent.slow_since.lock().unwrap(),
+                );
+                drop(rates);
+                let counts = !slow;
+                let ok =
+                    force || slot_available(complete, !complete, dl, ul, max_dl, max_ul, max_all);
+                if ok {
+                    if counts {
+                        if complete {
+                            ul += 1;
+                        } else {
+                            dl += 1;
+                        }
+                    }
+                    assignments.push((id, want));
+                } else {
+                    assignments.push((id, TorrentState::Queued));
+                }
+            } else if let Some(pending) = self.pending.get(&id.0) {
+                let current = pending.torrent_state.lock().unwrap().clone();
+                if matches!(
+                    current,
+                    TorrentState::Paused
+                        | TorrentState::Checking
+                        | TorrentState::Moving
+                        | TorrentState::Error(_)
+                ) {
+                    continue;
+                }
+                let force = pending.force_start.load(Ordering::Relaxed);
+                let rates = pending.rates.lock().unwrap();
+                let slow = self.torrent_is_slow(
+                    rates.download_rate,
+                    rates.upload_rate,
+                    *pending.slow_since.lock().unwrap(),
+                );
+                drop(rates);
+                let counts = !slow;
+                let ok = force || slot_available(false, true, dl, ul, max_dl, max_ul, max_all);
+                if ok {
+                    if counts {
+                        dl += 1;
+                    }
+                    assignments.push((id, TorrentState::Metadata));
+                } else {
+                    assignments.push((id, TorrentState::Queued));
+                }
+            }
+        }
+
+        for (id, state) in assignments {
+            if let Some(torrent) = self.torrents.get(&id.0) {
+                self.set_torrent_state(torrent.value(), id, state);
+                if let Some(dht) = self.dht() {
+                    dht.set_active(
+                        id.0,
+                        torrent.torrent_state.lock().unwrap().transfer_enabled(),
+                    );
+                }
+            } else if let Some(pending) = self.pending.get(&id.0) {
+                let changed = {
+                    let mut current = pending.torrent_state.lock().unwrap();
+                    if *current == state {
+                        false
+                    } else {
+                        *current = state.clone();
+                        true
+                    }
+                };
+                sync_download_state(&pending.download_state, &state);
+                if state == TorrentState::Queued {
+                    choke_all_peers(&pending.peer_states);
+                    disconnect_all_peers(&pending.peer_states);
+                } else if state.transfer_enabled() {
+                    pending.choke_notify.notify_waiters();
+                }
+                if changed {
+                    self.emit(SessionEvent::StateChanged { id, state });
+                }
+                if let Some(dht) = self.dht() {
+                    dht.set_active(
+                        id.0,
+                        pending.torrent_state.lock().unwrap().transfer_enabled(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn seed_limit_reached(&self, torrent: &TorrentSession) -> bool {
+        if !torrent.downloaded_state.is_complete() {
+            return false;
+        }
+        let downloaded = torrent.downloaded_state.downloaded_bytes();
+        let uploaded = torrent.uploaded.load(Ordering::Relaxed);
+        let size = torrent.torrent.length.max(0) as u64;
+        let dl = if downloaded == 0 { size } else { downloaded };
+        let ratio = *torrent.ratio_limit.lock().unwrap();
+        let ratio_limit = ratio.unwrap_or(self.options.seed_ratio_limit);
+        if ratio_limit > 0.0 && dl > 0 && uploaded as f64 / dl as f64 >= ratio_limit {
+            return true;
+        }
+        let time = *torrent.seeding_time_limit.lock().unwrap();
+        let minutes = time.unwrap_or(self.options.seed_time_limit);
+        if minutes > 0 {
+            if let Some(done) = *torrent.completed_at.lock().unwrap() {
+                let now = resume::now_unix();
+                if now.saturating_sub(done) >= (minutes as i64).saturating_mul(60) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn update_slow_since(sample: &RateSample, slow_since: &Mutex<Option<std::time::Instant>>) {
+        let rate = sample.download_rate.max(0.0) + sample.upload_rate.max(0.0);
+        let mut since = slow_since.lock().unwrap();
+        if rate < SLOW_RATE_BPS as f64 {
+            if since.is_none() {
+                *since = Some(std::time::Instant::now());
+            }
+        } else {
+            *since = None;
+        }
+    }
+
     fn set_torrent_state(&self, torrent: &TorrentSession, id: TorrentId, state: TorrentState) {
         let changed = {
             let mut current = torrent.torrent_state.lock().unwrap();
@@ -1710,7 +2201,10 @@ impl Session {
             }
         };
         sync_download_state(&torrent.download_state, &state);
-        if matches!(
+        if state == TorrentState::Queued {
+            choke_all_peers(&torrent.peer_states);
+            disconnect_all_peers(&torrent.peer_states);
+        } else if matches!(
             state,
             TorrentState::Paused
                 | TorrentState::Checking
@@ -1923,22 +2417,69 @@ impl Session {
     }
 
     fn spawn_tick(&self) {
-        let torrents = self.torrents.clone();
-        let pending = self.pending.clone();
-        let event_tx = self.event_tx.clone();
-        let cancel = self.cancel.clone();
+        let session = self.share();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(RATE_TICK);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    _ = session.cancel.cancelled() => break,
                     _ = interval.tick() => {
-                        tick_session(&torrents, &pending, &event_tx);
+                        session.tick();
                     }
                 }
             }
         });
+    }
+
+    fn spawn_alt_schedule(&self) {
+        let Some(schedule) = AltSchedule::parse(&self.options.alt_schedule) else {
+            return;
+        };
+        let session = self.share();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = session.cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        session.set_alt_mode(schedule.active_now());
+                    }
+                }
+            }
+        });
+    }
+
+    fn tick(&self) {
+        tick_session(&self.torrents, &self.pending, &self.event_tx);
+        for entry in self.torrents.iter() {
+            let torrent = entry.value();
+            let rates = torrent.rates.lock().unwrap();
+            Self::update_slow_since(&rates, &torrent.slow_since);
+        }
+        for entry in self.pending.iter() {
+            if self.torrents.contains_key(entry.key()) {
+                continue;
+            }
+            let pending = entry.value();
+            let rates = pending.rates.lock().unwrap();
+            Self::update_slow_since(&rates, &pending.slow_since);
+        }
+        let mut pause_ids = Vec::new();
+        for entry in self.torrents.iter() {
+            let id = TorrentId::new(*entry.key());
+            let state = entry.torrent_state.lock().unwrap().clone();
+            if matches!(state, TorrentState::Seeding | TorrentState::Downloading)
+                && self.seed_limit_reached(entry.value())
+            {
+                pause_ids.push(id);
+            }
+        }
+        for id in pause_ids {
+            let _ = self.pause(id);
+        }
+        self.evaluate_queue();
     }
 
     fn dht_peer_fields(&self) -> (bool, Option<u16>, Option<DhtHandle>) {
@@ -1951,6 +2492,9 @@ impl Session {
     pub fn connect_peer(&self, info_hash: &[u8; 20], addr: SocketAddr) -> bool {
         let (advertise_dht, dht_port, dht) = self.dht_peer_fields();
         if let Some(torrent) = self.torrents.get(info_hash).map(|entry| entry.clone()) {
+            if *torrent.torrent_state.lock().unwrap() == TorrentState::Queued {
+                return false;
+            }
             return try_spawn_peer(spawn_from_session(
                 addr,
                 *info_hash,
@@ -1972,6 +2516,9 @@ impl Session {
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
             return false;
         };
+        if *pending.torrent_state.lock().unwrap() == TorrentState::Queued {
+            return false;
+        }
         try_spawn_peer(spawn_from_pending(
             addr,
             *info_hash,
@@ -2038,6 +2585,7 @@ impl Session {
             }
         }
         self.emit(SessionEvent::Removed { id });
+        self.evaluate_queue();
         Ok(())
     }
 
@@ -2080,6 +2628,11 @@ impl Session {
             skip_checking: false,
             file_priorities: Vec::new(),
             auto_tmm: None,
+            force_start: false,
+            ratio_limit: None,
+            seeding_time_limit: None,
+            download_limit: 0,
+            upload_limit: 0,
         };
         let pending = self
             .register_pending(
@@ -2136,6 +2689,14 @@ impl Session {
         let download_state = Arc::new(Mutex::new(DownloadState::Init));
         sync_download_state(&download_state, &TorrentState::Metadata);
         let auto_tmm = opts.auto_tmm.unwrap_or_else(|| opts.output_dir.is_none());
+        let download_limiter = Arc::new(RateLimiter::new(opts.download_limit, DEFAULT_BURST));
+        let upload_limiter = Arc::new(RateLimiter::new(opts.upload_limit, DEFAULT_BURST));
+        let limits = BandwidthLimiters::new(
+            self.limits.clone(),
+            download_limiter.clone(),
+            upload_limiter.clone(),
+        );
+        let queue_position = self.alloc_queue_position();
         let pending = Arc::new(PendingTorrent {
             metadata,
             peer_states: Arc::new(PeerStates::default()),
@@ -2163,6 +2724,14 @@ impl Session {
             sequential: AtomicBool::new(opts.sequential),
             file_priorities: Mutex::new(opts.file_priorities.clone()),
             rates: Arc::new(Mutex::new(RateSample::default())),
+            queue_position: AtomicU64::new(queue_position),
+            force_start: AtomicBool::new(opts.force_start),
+            download_limiter,
+            upload_limiter,
+            limits,
+            ratio_limit: Mutex::new(opts.ratio_limit),
+            seeding_time_limit: Mutex::new(opts.seeding_time_limit),
+            slow_since: Mutex::new(None),
         });
         self.pending.insert(info_hash, pending.clone());
         Ok(pending)
@@ -2435,6 +3004,8 @@ impl Session {
         };
         let initial_state = if start_paused {
             TorrentState::Paused
+        } else if self.restoring.load(Ordering::Relaxed) {
+            TorrentState::Queued
         } else {
             active_state(&downloaded_state)
         };
@@ -2452,6 +3023,41 @@ impl Session {
             .as_ref()
             .map(|p| p.rates.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(RateSample::default())));
+        let download_limiter = reuse
+            .as_ref()
+            .map(|p| p.download_limiter.clone())
+            .unwrap_or_else(|| {
+                Arc::new(RateLimiter::new(add_torrent.download_limit, DEFAULT_BURST))
+            });
+        let upload_limiter = reuse
+            .as_ref()
+            .map(|p| p.upload_limiter.clone())
+            .unwrap_or_else(|| Arc::new(RateLimiter::new(add_torrent.upload_limit, DEFAULT_BURST)));
+        if reuse.is_none() {
+            download_limiter.set_rate(add_torrent.download_limit);
+            upload_limiter.set_rate(add_torrent.upload_limit);
+        }
+        let limits = BandwidthLimiters::new(
+            self.limits.clone(),
+            download_limiter.clone(),
+            upload_limiter.clone(),
+        );
+        let queue_position = reuse
+            .as_ref()
+            .map(|p| p.queue_position.load(Ordering::Relaxed))
+            .unwrap_or_else(|| self.alloc_queue_position());
+        let force_start = add_torrent.force_start
+            || reuse
+                .as_ref()
+                .is_some_and(|p| p.force_start.load(Ordering::Relaxed));
+        let ratio_limit = add_torrent
+            .ratio_limit
+            .or_else(|| reuse.as_ref().and_then(|p| *p.ratio_limit.lock().unwrap()));
+        let seeding_time_limit = add_torrent.seeding_time_limit.or_else(|| {
+            reuse
+                .as_ref()
+                .and_then(|p| *p.seeding_time_limit.lock().unwrap())
+        });
 
         let metadata = reuse
             .as_ref()
@@ -2517,6 +3123,7 @@ impl Session {
                 piece_tx: piece_tx_slot.clone(),
                 promote_notify: promote_notify.clone(),
                 encryption: self.options.encryption,
+                limits: limits.clone(),
             })
             .await;
 
@@ -2568,6 +3175,14 @@ impl Session {
             auto_tmm: AtomicBool::new(auto_tmm),
             pr_rx: pr_rx.clone(),
             rates,
+            queue_position: AtomicU64::new(queue_position),
+            force_start: AtomicBool::new(force_start),
+            download_limiter,
+            upload_limiter,
+            limits,
+            ratio_limit: Mutex::new(ratio_limit),
+            seeding_time_limit: Mutex::new(seeding_time_limit),
+            slow_since: Mutex::new(None),
         });
         let id = TorrentId::new(torrent.info_hash);
         self.torrents
@@ -2618,6 +3233,7 @@ impl Session {
                                 TorrentState::Seeding,
                             );
                         }
+                        writer_session.evaluate_queue();
                         writer_session
                             .maybe_move_on_complete(&writer_torrent, id)
                             .await;
@@ -2675,6 +3291,9 @@ impl Session {
             id,
             state: initial_state,
         });
+        if !start_paused {
+            self.evaluate_queue();
+        }
 
         if torrent_session.downloaded_state.is_complete() {
             let session = self.share();
@@ -2812,6 +3431,9 @@ impl Session {
             opts.sequential = pending_task.sequential.load(Ordering::Relaxed);
             opts.file_priorities = pending_task.file_priorities.lock().unwrap().clone();
             opts.auto_tmm = Some(pending_task.auto_tmm.load(Ordering::Relaxed));
+            opts.force_start = pending_task.force_start.load(Ordering::Relaxed);
+            opts.ratio_limit = *pending_task.ratio_limit.lock().unwrap();
+            opts.seeding_time_limit = *pending_task.seeding_time_limit.lock().unwrap();
 
             match promoter
                 .add_torrent_meta(meta, opts, Some(pending_task.clone()))
@@ -2884,6 +3506,10 @@ fn persist_from_parts(
     file_priorities: &[i64],
     save_path: &std::path::Path,
     auto_tmm: bool,
+    queue_position: i64,
+    force_start: bool,
+    ratio_limit: i64,
+    seeding_time_limit: i64,
 ) -> Result<PathBuf, resume::ResumeError> {
     resume::persist(
         state_dir,
@@ -2903,6 +3529,10 @@ fn persist_from_parts(
             file_priorities,
             save_path,
             auto_tmm,
+            queue_position,
+            force_start,
+            ratio_limit,
+            seeding_time_limit,
         },
     )
 }
@@ -2931,7 +3561,27 @@ fn persist_torrent(
         &torrent.downloaded_state.file_priorities_resume(),
         &output_dir,
         torrent.auto_tmm.load(Ordering::Relaxed),
+        torrent.queue_position.load(Ordering::Relaxed) as i64,
+        torrent.force_start.load(Ordering::Relaxed),
+        encode_ratio_milli(*torrent.ratio_limit.lock().unwrap()),
+        encode_time_limit(*torrent.seeding_time_limit.lock().unwrap()),
     )
+}
+
+fn encode_ratio_milli(limit: Option<f64>) -> i64 {
+    match limit {
+        None => 0,
+        Some(v) if v <= 0.0 => -1,
+        Some(v) => (v * 1000.0).round() as i64,
+    }
+}
+
+fn encode_time_limit(limit: Option<u64>) -> i64 {
+    match limit {
+        None => 0,
+        Some(0) => -1,
+        Some(v) => v as i64,
+    }
 }
 
 fn spawn_resume_timer(torrent: Arc<TorrentSession>, state_dir: PathBuf, cancel: CancellationToken) {
@@ -3002,6 +3652,27 @@ fn active_state(downloaded: &TorrentDownloadedState) -> TorrentState {
     } else {
         TorrentState::Downloading
     }
+}
+
+fn slot_available(
+    seeding: bool,
+    downloading: bool,
+    dl: usize,
+    ul: usize,
+    max_dl: usize,
+    max_ul: usize,
+    max_all: usize,
+) -> bool {
+    if max_all > 0 && dl + ul >= max_all {
+        return false;
+    }
+    if downloading && max_dl > 0 && dl >= max_dl {
+        return false;
+    }
+    if seeding && max_ul > 0 && ul >= max_ul {
+        return false;
+    }
+    true
 }
 
 fn sync_download_state(download_state: &Mutex<DownloadState>, state: &TorrentState) {
@@ -3080,6 +3751,8 @@ fn torrent_snapshot(torrent: &TorrentSession) -> TorrentSnapshot {
         } else {
             uploaded as f64 / downloaded as f64
         },
+        queue_position: torrent.queue_position.load(Ordering::Relaxed) as i64,
+        force_start: torrent.force_start.load(Ordering::Relaxed),
     }
 }
 
@@ -3124,6 +3797,8 @@ fn pending_snapshot(info_hash: [u8; 20], pending: &PendingTorrent) -> TorrentSna
         piece_count,
         pieces_have,
         ratio: 0.0,
+        queue_position: pending.queue_position.load(Ordering::Relaxed) as i64,
+        force_start: pending.force_start.load(Ordering::Relaxed),
     }
 }
 
@@ -3525,6 +4200,10 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         debug!(%addr, "incoming peer for unknown info hash");
         return;
     };
+    if *target.torrent_state.lock().unwrap() == TorrentState::Queued {
+        debug!(%addr, "refusing incoming peer for queued torrent");
+        return;
+    }
     if target.peer_states.is_banned(addr) {
         debug!(%addr, "refusing banned incoming peer");
         return;
@@ -3565,6 +4244,7 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         incoming_encrypted: encrypted,
         incoming_utp: utp,
         encryption: ctx.encryption,
+        limits: target.limits,
         global_peers: ctx.global_peers,
         max_peers_per_torrent: ctx.max_peers_per_torrent,
         max_peers_global: ctx.max_peers_global,
@@ -3585,6 +4265,8 @@ struct IncomingTarget {
     choke_notify: Arc<Notify>,
     metadata: Arc<crate::extension::MetadataStore>,
     promote_notify: Arc<Notify>,
+    torrent_state: Arc<Mutex<TorrentState>>,
+    limits: BandwidthLimiters,
 }
 
 impl IncomingTarget {
@@ -3601,6 +4283,8 @@ impl IncomingTarget {
             choke_notify: entry.choke_notify.clone(),
             metadata: entry.metadata.clone(),
             promote_notify: Arc::new(Notify::new()),
+            torrent_state: entry.torrent_state.clone(),
+            limits: entry.limits.clone(),
         }
     }
 
@@ -3617,6 +4301,8 @@ impl IncomingTarget {
             choke_notify: entry.choke_notify.clone(),
             metadata: entry.metadata.clone(),
             promote_notify: entry.promote_notify.clone(),
+            torrent_state: entry.torrent_state.clone(),
+            limits: entry.limits.clone(),
         }
     }
 }
@@ -3670,6 +4356,7 @@ fn spawn_from_session(
         max_peers_global,
         connector,
         promote_notify: Arc::new(Notify::new()),
+        limits: torrent.limits.clone(),
     }
 }
 
@@ -3722,6 +4409,7 @@ fn spawn_from_pending(
         max_peers_global,
         connector,
         promote_notify: pending.promote_notify.clone(),
+        limits: pending.limits.clone(),
     }
 }
 

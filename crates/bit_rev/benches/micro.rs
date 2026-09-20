@@ -218,6 +218,10 @@ fn sample_resume() -> ResumeData {
         file_priorities: Vec::new(),
         save_path: "/tmp/out.bin".into(),
         auto_tmm: 0,
+        queue_position: 0,
+        force_start: 0,
+        ratio_limit: 0,
+        seeding_time_limit: 0,
     }
 }
 

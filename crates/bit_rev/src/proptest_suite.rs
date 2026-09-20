@@ -210,6 +210,10 @@ proptest! {
             file_priorities: Vec::new(),
             save_path: String::new(),
             auto_tmm: 0,
+            queue_position: 0,
+            force_start: 0,
+            ratio_limit: 0,
+            seeding_time_limit: 0,
         };
         let bytes = resume::encode(&data).expect("encode");
         let loaded = resume::decode(&bytes).expect("decode");

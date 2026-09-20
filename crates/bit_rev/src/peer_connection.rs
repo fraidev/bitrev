@@ -32,6 +32,7 @@ use crate::{
     picker::{self, select_piece, select_sequential, Availability, BOOTSTRAP_VERIFIED},
     priority::{self, FilePriority},
     protocol::{Frame, Protocol},
+    rate::BandwidthLimiters,
     session::{DownloadState, PieceWork},
     storage::Storage,
     torrent::Torrent,
@@ -940,6 +941,7 @@ pub struct PeerHandlerConfig {
     pub dht_port: Option<u16>,
     pub dht: Option<crate::dht::DhtHandle>,
     pub promote_notify: Arc<Notify>,
+    pub limits: BandwidthLimiters,
 }
 
 pub struct PeerHandler {
@@ -987,6 +989,7 @@ pub struct PeerHandler {
     rate_window_bytes: AtomicU64,
     last_rate: AtomicU64,
     pipeline_notify: Notify,
+    limits: BandwidthLimiters,
 }
 
 impl PeerHandler {
@@ -1041,6 +1044,7 @@ impl PeerHandler {
             rate_window_bytes: AtomicU64::new(0),
             last_rate: AtomicU64::new(0),
             pipeline_notify: Notify::new(),
+            limits: config.limits,
         }
     }
 
@@ -1663,6 +1667,11 @@ impl PeerHandler {
                     }
                 };
                 let length = data.len() as u64;
+                self.limits.acquire_upload(length).await;
+                if !self.is_downloading() {
+                    self.send_reject(req);
+                    continue;
+                }
                 if self
                     .peer_writer_tx
                     .send(WriterRequest::Message(message::format_piece(
@@ -1735,6 +1744,11 @@ impl PeerHandler {
         }
         if !self.acquire_pipeline_slot().await? {
             return Ok(false);
+        }
+        self.limits.acquire_download(req.length as u64).await;
+        if !self.is_downloading() || !self.downloaded().wanted(req.index) {
+            self.refill_pipeline_slot();
+            return Ok(self.is_downloading());
         }
         if !self.downloaded().assign_block(req, self.peer) {
             self.refill_pipeline_slot();
@@ -2663,6 +2677,7 @@ pub struct SpawnPeerParams {
     pub max_peers_global: usize,
     pub max_peers_per_torrent: usize,
     pub promote_notify: Arc<Notify>,
+    pub limits: BandwidthLimiters,
 }
 
 struct PeerSlotGuard {
@@ -2735,6 +2750,7 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             dht_port: params.dht_port,
             dht: params.dht,
             promote_notify: params.promote_notify,
+            limits: params.limits,
         }));
         if let Some(fast) = params.incoming_fast_extension {
             handler.set_fast_extension(fast);
@@ -3384,6 +3400,7 @@ mod tests {
             dht_port: None,
             dht: None,
             promote_notify: Arc::new(Notify::new()),
+            limits: BandwidthLimiters::unlimited(),
         }));
         let connector: Arc<dyn Connector> = Arc::new(crate::transport::TcpConnector::new());
         let connection = PeerConnection::new(

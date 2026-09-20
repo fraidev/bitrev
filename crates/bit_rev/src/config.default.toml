@@ -29,6 +29,11 @@ encryption = "prefer_encrypted"
 # Bytes per second. 0 is unlimited.
 upload_limit = 0
 download_limit = 0
+# Alternative speed limits (qBittorrent-style). 0 is unlimited.
+alt_upload_limit = 0
+alt_download_limit = 0
+# Daily window in local time, `HH:MM-HH:MM`. Empty disables the schedule.
+alt_schedule = ""
 
 # Peer exchange (BEP-0011).
 pex = true
