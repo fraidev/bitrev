@@ -142,6 +142,7 @@ pub struct PeerState {
     pub snubbed: bool,
     pub encrypted: bool,
     pub utp: bool,
+    pub outgoing: bool,
     pub stats: Arc<PeerLiveStats>,
     pub writer_tx: Option<flume::Sender<WriterRequest>>,
 }
@@ -199,6 +200,7 @@ impl PeerState {
             snubbed: false,
             encrypted: false,
             utp: false,
+            outgoing: false,
             stats: Arc::new(PeerLiveStats::default()),
             writer_tx: None,
         }
@@ -236,6 +238,24 @@ impl PeerState {
 
     pub fn set_snubbed(&mut self, snubbed: bool) {
         self.snubbed = snubbed;
+    }
+
+    /// BEP-0011 `added.f` bits. Holepunch (0x08) is never set.
+    pub fn pex_flags(&self, piece_count: usize) -> u8 {
+        let mut flags = 0u8;
+        if self.encrypted {
+            flags |= 0x01;
+        }
+        if piece_count > 0 && (0..piece_count).all(|i| self.bitfield.has_piece(i)) {
+            flags |= 0x02;
+        }
+        if self.utp {
+            flags |= 0x04;
+        }
+        if self.outgoing {
+            flags |= 0x10;
+        }
+        flags
     }
 }
 

@@ -61,6 +61,42 @@ impl BencodeResponse {
     }
 }
 
+/// Compact IPv4 peer list (BEP-0023): 4-byte address + 2-byte port, network order.
+pub fn encode_compact_v4(addrs: &[PeerAddr]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(addrs.len() * 6);
+    for addr in addrs {
+        if let SocketAddr::V4(v4) = addr {
+            buf.extend_from_slice(&v4.ip().octets());
+            buf.extend_from_slice(&v4.port().to_be_bytes());
+        }
+    }
+    buf
+}
+
+/// Compact IPv6 peer list (BEP-0007): 16-byte address + 2-byte port, network order.
+pub fn encode_compact_v6(addrs: &[PeerAddr]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(addrs.len() * 18);
+    for addr in addrs {
+        if let SocketAddr::V6(v6) = addr {
+            buf.extend_from_slice(&v6.ip().octets());
+            buf.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
+    buf
+}
+
+pub fn decode_compact_v4(buf: &[u8]) -> anyhow::Result<Vec<PeerAddr>> {
+    let mut peers = Vec::new();
+    parse_compact_v4(buf, &mut peers)?;
+    Ok(peers)
+}
+
+pub fn decode_compact_v6(buf: &[u8]) -> anyhow::Result<Vec<PeerAddr>> {
+    let mut peers = Vec::new();
+    parse_compact_v6(buf, &mut peers)?;
+    Ok(peers)
+}
+
 fn parse_peers_value(value: &Value, out: &mut Vec<PeerAddr>) -> anyhow::Result<()> {
     match value {
         Value::Bytes(buf) => parse_compact_v4(buf, out),
@@ -250,5 +286,36 @@ mod tests {
     fn compact_peers6_odd_length_is_error() {
         let err = compact_v6_response(&[0u8; 17]).get_peers().unwrap_err();
         assert!(err.to_string().contains("invalid compact peers6 length"));
+    }
+
+    #[test]
+    fn encode_decode_compact_v4_round_trip() {
+        let addrs = vec![
+            "127.0.0.1:6881".parse().unwrap(),
+            "192.168.1.2:6889".parse().unwrap(),
+        ];
+        let encoded = encode_compact_v4(&addrs);
+        assert_eq!(encoded.len(), 12);
+        assert_eq!(decode_compact_v4(&encoded).unwrap(), addrs);
+    }
+
+    #[test]
+    fn encode_compact_v4_skips_ipv6() {
+        let addrs = vec![
+            "127.0.0.1:6881".parse().unwrap(),
+            "[::1]:6881".parse().unwrap(),
+        ];
+        assert_eq!(
+            decode_compact_v4(&encode_compact_v4(&addrs)).unwrap(),
+            vec!["127.0.0.1:6881".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn encode_decode_compact_v6_round_trip() {
+        let addrs = vec!["[::1]:6881".parse().unwrap()];
+        let encoded = encode_compact_v6(&addrs);
+        assert_eq!(encoded.len(), 18);
+        assert_eq!(decode_compact_v6(&encoded).unwrap(), addrs);
     }
 }

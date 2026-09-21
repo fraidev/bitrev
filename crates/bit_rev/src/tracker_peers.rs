@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::{
     discovery::{DiscoverySource, SourceDenied, SourceRegistry},
-    extension::{ExtensionRegistry, MetadataStore},
+    extension::{AddPeersFn, ExtensionRegistry, MetadataStore},
     file::TorrentMeta,
     identity::TrackerIdentity,
     peer::BencodeResponse,
@@ -44,6 +44,7 @@ pub struct PeerSpawnRuntime {
     pub promote_notify: Arc<Notify>,
     pub encryption: crate::mse::EncryptionPolicy,
     pub limits: BandwidthLimiters,
+    pub add_peers: AddPeersFn,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +203,7 @@ fn clone_runtime(runtime: &PeerSpawnRuntime) -> PeerSpawnRuntime {
         promote_notify: runtime.promote_notify.clone(),
         encryption: runtime.encryption,
         limits: runtime.limits.clone(),
+        add_peers: runtime.add_peers.clone(),
     }
 }
 
@@ -242,6 +244,7 @@ async fn process_peers(
             incoming_utp: false,
             encryption: runtime.encryption,
             extensions: runtime.extensions.clone(),
+            add_peers: runtime.add_peers.clone(),
             listen_port: runtime.listen_port,
             metadata: runtime.metadata.clone(),
             advertise_dht: runtime.advertise_dht,

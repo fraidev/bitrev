@@ -20,7 +20,8 @@ use crate::{
     allowed_fast::{generate_allowed_fast_for_ip, DEFAULT_ALLOWED_FAST_SET_SIZE},
     bitfield::Bitfield,
     extension::{
-        ExtensionContext, ExtensionRegistry, ExtensionSession, MetadataStore, DEFAULT_REQQ,
+        AddPeersFn, ExtensionContext, ExtensionRegistry, ExtensionSession, MetadataStore,
+        DEFAULT_REQQ,
     },
     message::{
         self, format_reject_request, validate_request, BlockRequest, Message, RequestError,
@@ -934,6 +935,7 @@ pub struct PeerHandlerConfig {
     pub torrent: Arc<Slot<Arc<Torrent>>>,
     pub choke_notify: Arc<Notify>,
     pub extensions: ExtensionRegistry,
+    pub add_peers: AddPeersFn,
     pub listen_port: u16,
     pub metadata: Arc<MetadataStore>,
     pub info_hash: [u8; 20],
@@ -994,6 +996,7 @@ pub struct PeerHandler {
 
 impl PeerHandler {
     pub fn from_config(config: PeerHandlerConfig) -> Self {
+        let torrent = config.torrent.clone();
         Self {
             unchoke_notify: Notify::new(),
             on_bitfield_notify: Notify::new(),
@@ -1008,7 +1011,7 @@ impl PeerHandler {
             download_state: config.download_state,
             storage: config.storage,
             uploaded: config.uploaded,
-            _torrent: config.torrent,
+            _torrent: torrent.clone(),
             choke_notify: config.choke_notify,
             upload_queue: Mutex::new(VecDeque::new()),
             fast_extension: AtomicBool::new(false),
@@ -1023,6 +1026,12 @@ impl PeerHandler {
                 peer: config.peer,
                 metadata: config.metadata.clone(),
                 peer_states: config.peers_state.clone(),
+                add_peers: config.add_peers.clone(),
+                allows_pex: torrent.get().allows_pex(),
+                piece_count: {
+                    let torrent = torrent.clone();
+                    Arc::new(move || torrent.get().piece_hashes.len())
+                },
             })),
             listen_port: config.listen_port,
             metadata: config.metadata,
@@ -2668,6 +2677,7 @@ pub struct SpawnPeerParams {
     pub incoming_utp: bool,
     pub encryption: EncryptionPolicy,
     pub extensions: ExtensionRegistry,
+    pub add_peers: AddPeersFn,
     pub listen_port: u16,
     pub metadata: Arc<MetadataStore>,
     pub advertise_dht: bool,
@@ -2743,6 +2753,7 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             torrent: params.torrent,
             choke_notify: params.choke_notify,
             extensions: params.extensions,
+            add_peers: params.add_peers,
             listen_port: params.listen_port,
             metadata: params.metadata,
             info_hash: params.info_hash,
@@ -2761,13 +2772,12 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
         if params.incoming_dht == Some(true) {
             handler.peer_dht.store(true, Ordering::Relaxed);
         }
-        if params.incoming_encrypted {
-            if let Some(mut state) = params.peer_states.states.get_mut(&params.peer) {
+        if let Some(mut state) = params.peer_states.states.get_mut(&params.peer) {
+            state.outgoing = params.incoming.is_none();
+            if params.incoming_encrypted {
                 state.encrypted = true;
             }
-        }
-        if params.incoming_utp {
-            if let Some(mut state) = params.peer_states.states.get_mut(&params.peer) {
+            if params.incoming_utp {
                 state.utp = true;
             }
         }
@@ -2808,6 +2818,7 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::noop_add_peers;
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncWriteExt;
 
@@ -3393,6 +3404,7 @@ mod tests {
             torrent: Slot::new(torrent),
             choke_notify: Arc::new(Notify::new()),
             extensions: ExtensionRegistry::new(),
+            add_peers: noop_add_peers(),
             listen_port: 0,
             metadata: MetadataStore::new(meta.info_hash),
             info_hash: meta.info_hash,
