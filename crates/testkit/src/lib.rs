@@ -196,17 +196,12 @@ fn timeval_secs(tv: libc::timeval) -> f64 {
 }
 
 pub fn compact_peers(addrs: &[std::net::SocketAddr]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(addrs.len() * 6);
     for addr in addrs {
-        match addr {
-            std::net::SocketAddr::V4(v4) => {
-                buf.extend_from_slice(&v4.ip().octets());
-                buf.extend_from_slice(&v4.port().to_be_bytes());
-            }
-            std::net::SocketAddr::V6(_) => panic!("compact v4 helper got IPv6 {addr}"),
+        if addr.is_ipv6() {
+            panic!("compact v4 helper got IPv6 {addr}");
         }
     }
-    buf
+    bit_rev::peer::encode_compact_v4(addrs)
 }
 
 #[cfg(test)]
