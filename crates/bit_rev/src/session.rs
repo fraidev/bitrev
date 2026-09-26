@@ -28,6 +28,7 @@ use crate::resume::{self, ResumeSnapshot};
 pub use crate::dht::{DhtOptions, DhtStats};
 use crate::hash::PieceHasher;
 pub use crate::library::Category;
+use crate::lsd::{self, InboundLimiter};
 use crate::mse::{self, EncryptionPolicy, MseConnector};
 pub use crate::priority::{FileInfo, FilePriority};
 pub use crate::resume::ResumeStatus;
@@ -300,6 +301,8 @@ pub struct SessionOptions {
     pub queue_slow_window: Duration,
     /// Peer exchange (BEP-0011). Private torrents still refuse PEX.
     pub pex: bool,
+    /// Local Peer Discovery (BEP-0014). Private torrents still refuse LSD.
+    pub lpd: bool,
 }
 
 impl Default for SessionOptions {
@@ -332,6 +335,7 @@ impl Default for SessionOptions {
             dont_count_slow: true,
             queue_slow_window: DEFAULT_QUEUE_SLOW_WINDOW,
             pex: true,
+            lpd: true,
         }
     }
 }
@@ -397,6 +401,8 @@ pub struct Session {
     limits: Arc<SessionLimits>,
     next_queue_pos: Arc<AtomicU64>,
     restoring: Arc<AtomicBool>,
+    lpd_cookie: String,
+    lpd_limiter: Arc<Mutex<InboundLimiter>>,
 }
 
 pub(crate) struct PendingTorrent {
@@ -769,6 +775,8 @@ impl Session {
             limits,
             next_queue_pos: Arc::new(AtomicU64::new(0)),
             restoring: Arc::new(AtomicBool::new(false)),
+            lpd_cookie: lsd::random_cookie(),
+            lpd_limiter: Arc::new(Mutex::new(InboundLimiter::default())),
         };
         session
             .extensions
@@ -781,6 +789,7 @@ impl Session {
         session.load_categories();
         session.spawn_listener();
         session.start_dht();
+        session.start_lpd();
         session.spawn_tick();
         session.spawn_watch();
         session.spawn_alt_schedule();
@@ -809,6 +818,8 @@ impl Session {
             limits: self.limits.clone(),
             next_queue_pos: self.next_queue_pos.clone(),
             restoring: self.restoring.clone(),
+            lpd_cookie: self.lpd_cookie.clone(),
+            lpd_limiter: self.lpd_limiter.clone(),
         }
     }
 
@@ -945,6 +956,75 @@ impl Session {
                 warn!(error = %e, "failed to start DHT");
             }
         }
+    }
+
+    fn start_lpd(&self) {
+        if !self.options.lpd {
+            return;
+        }
+        let socket = match lsd::bind_multicast() {
+            Ok(socket) => socket,
+            Err(err) => {
+                warn!(error = %err, "failed to join LPD multicast group");
+                return;
+            }
+        };
+        let socket = match tokio::net::UdpSocket::from_std(socket) {
+            Ok(socket) => socket,
+            Err(err) => {
+                warn!(error = %err, "failed to start LPD socket");
+                return;
+            }
+        };
+        let torrents = self.torrents.clone();
+        let listen_addr = self.listen_addr.clone();
+        let fallback_port = self.options.listen_port;
+        let cancel = self.cancel.clone();
+        let cookie = self.lpd_cookie.clone();
+        let session = self.share();
+        tokio::spawn(async move {
+            lsd::run(
+                socket,
+                cancel,
+                cookie,
+                move || lpd_announce_hashes(&torrents),
+                move || {
+                    listen_addr
+                        .lock()
+                        .unwrap()
+                        .map(|addr| addr.port())
+                        .unwrap_or(fallback_port)
+                },
+                move |src, datagram| {
+                    session.handle_lpd_datagram(src, datagram);
+                },
+            )
+            .await;
+        });
+    }
+
+    /// Feed one LPD datagram into `add_peers` without a multicast socket.
+    pub fn handle_lpd_datagram(&self, src: SocketAddr, datagram: &[u8]) -> usize {
+        if !self.options.lpd {
+            return 0;
+        }
+        let mut limiter = self.lpd_limiter.lock().unwrap();
+        let mut added = 0usize;
+        lsd::ingest(
+            datagram,
+            src,
+            &self.lpd_cookie,
+            &mut limiter,
+            std::time::Instant::now(),
+            |hash, addr| {
+                added += self.add_peers(hash, DiscoverySource::Lsd, vec![addr]);
+            },
+        );
+        added
+    }
+
+    pub fn lpd_announce_hashes(&self) -> Vec<[u8; 20]> {
+        lpd_announce_hashes(&self.torrents)
     }
 
     /// uTP already owns the UDP port DHT wants, so KRPC is demuxed on that socket.
@@ -3153,6 +3233,11 @@ impl Session {
                 debug!(error = %denied, "pex disabled for torrent");
             }
         }
+        if self.options.lpd {
+            if let Err(denied) = tracker_stream.register_source(DiscoverySource::Lsd) {
+                debug!(error = %denied, "lpd disabled for torrent");
+            }
+        }
 
         if let Some(dht) = self.dht() {
             match tracker_stream.register_source(DiscoverySource::Dht) {
@@ -3903,6 +3988,18 @@ fn tick_session(
             });
         }
     }
+}
+
+fn lpd_announce_hashes(torrents: &DashMap<[u8; 20], Arc<TorrentSession>>) -> Vec<[u8; 20]> {
+    let members: Vec<([u8; 20], bool, bool)> = torrents
+        .iter()
+        .map(|entry| {
+            let torrent = entry.value();
+            let active = torrent.torrent_state.lock().unwrap().transfer_enabled();
+            (*entry.key(), torrent.torrent.allows_lsd(), active)
+        })
+        .collect();
+    lsd::announceable(&members)
 }
 
 fn disconnect_all_peers(peer_states: &PeerStates) {

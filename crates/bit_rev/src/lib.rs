@@ -10,6 +10,7 @@ pub mod handshake;
 pub mod hash;
 pub mod identity;
 pub mod library;
+pub mod lsd;
 pub mod magnet;
 pub mod message;
 pub mod mse;

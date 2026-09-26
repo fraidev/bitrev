@@ -1,0 +1,6 @@
+BT-SEARCH * HTTP/1.1
+Host: 239.192.152.143:6771
+Port: 6881
+Infohash: ababababababababababababababababababab
+Cookie: cafebabe01234567
+
