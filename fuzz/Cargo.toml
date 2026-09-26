@@ -86,3 +86,10 @@ path = "fuzz_targets/utp_header.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lpd_decode"
+path = "fuzz_targets/lpd_decode.rs"
+test = false
+doc = false
+bench = false

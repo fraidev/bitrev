@@ -22,6 +22,7 @@ sha1.workspace = true
 dashmap.workspace = true
 libc = "0.2"
 rand.workspace = true
+socket2 = { version = "0.5", features = ["all"] }
 tokio-util.workspace = true
 num-bigint = "0.4.6"
 num-traits = "0.2"

@@ -245,6 +245,7 @@ impl Config {
             dont_count_slow: self.queue.dont_count_slow,
             queue_slow_window: crate::session::DEFAULT_QUEUE_SLOW_WINDOW,
             pex: self.pex,
+            lpd: self.lpd,
         }
     }
 }
@@ -352,6 +353,18 @@ mod tests {
         }
         .session_options();
         assert!(!disabled.pex);
+    }
+
+    #[test]
+    fn session_options_maps_lpd() {
+        assert!(Config::default().lpd);
+        assert!(Config::default().session_options().lpd);
+        let disabled = Config {
+            lpd: false,
+            ..Config::default()
+        }
+        .session_options();
+        assert!(!disabled.lpd);
     }
 
     #[test]

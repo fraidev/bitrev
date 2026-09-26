@@ -256,6 +256,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha1",
+ "socket2 0.5.10",
  "tempfile",
  "testkit",
  "thiserror 2.0.16",
