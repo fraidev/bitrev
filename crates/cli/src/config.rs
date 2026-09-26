@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context};
 use bit_rev::config::{Config, EncryptionMode};
+use bit_rev::nat::NatProtocol;
 use bit_rev::session::Preallocate;
 
 use crate::args::Cli;
@@ -147,7 +148,11 @@ fn apply_env(config: &mut Config, env: &impl Fn(&str) -> Option<String>) -> anyh
         config.lpd = v;
     }
     if let Some(v) = env_bool(env, "BITREV_NAT")? {
-        config.nat = v;
+        config.nat.enabled = v;
+    }
+    if let Some(v) = env("BITREV_NAT_PROTOCOL") {
+        config.nat.protocol =
+            NatProtocol::parse(&v).ok_or_else(|| anyhow!("invalid BITREV_NAT_PROTOCOL '{v}'"))?;
     }
     if let Some(v) = env_bool(env, "BITREV_WEBSEED")? {
         config.webseed = v;

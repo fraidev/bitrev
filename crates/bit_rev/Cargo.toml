@@ -28,6 +28,10 @@ num-bigint = "0.4.6"
 num-traits = "0.2"
 toml.workspace = true
 util = { path = "../util" }
+igd-next = "0.17.1"
+crab_nat = "0.8.1"
+async-trait = "0.1.92"
+default-net = "0.22.0"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -41,6 +45,8 @@ proptest = "1.6"
 clap.workspace = true
 criterion = "0.5"
 testkit = { path = "../testkit" }
+tracing-subscriber.workspace = true
+async-trait = "0.1.92"
 
 [[bench]]
 name = "micro"
