@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::discovery::DiscoverySource;
 use crate::message::{format_extended, Message};
 use crate::peer::PeerAddr;
 use crate::peer_state::PeerStates;
@@ -8,12 +9,21 @@ use crate::peer_state::PeerStates;
 use super::handshake::{ExtensionHandshake, PeerExtensionInfo};
 use super::ut_metadata::MetadataStore;
 
+pub type AddPeersFn = Arc<dyn Fn(&[u8; 20], DiscoverySource, Vec<PeerAddr>) -> usize + Send + Sync>;
+
+pub fn noop_add_peers() -> AddPeersFn {
+    Arc::new(|_, _, _| 0)
+}
+
 #[derive(Clone)]
 pub struct ExtensionContext {
     pub info_hash: [u8; 20],
     pub peer: PeerAddr,
     pub metadata: Arc<MetadataStore>,
     pub peer_states: Arc<PeerStates>,
+    pub add_peers: AddPeersFn,
+    pub allows_pex: bool,
+    pub piece_count: Arc<dyn Fn() -> usize + Send + Sync>,
 }
 
 impl ExtensionContext {
@@ -23,7 +33,14 @@ impl ExtensionContext {
             peer: "0.0.0.0:0".parse().expect("probe addr"),
             metadata: MetadataStore::new([0; 20]),
             peer_states: Arc::new(PeerStates::default()),
+            add_peers: noop_add_peers(),
+            allows_pex: true,
+            piece_count: Arc::new(|| 0),
         }
+    }
+
+    pub fn piece_count(&self) -> usize {
+        (self.piece_count)()
     }
 }
 
@@ -36,6 +53,10 @@ pub trait Extension: Send {
     }
     fn should_disconnect(&self) -> bool {
         false
+    }
+    /// When false, the extension is omitted from `m` and does not handle messages.
+    fn enabled(&self) -> bool {
+        true
     }
 }
 
@@ -102,8 +123,12 @@ impl ExtensionRegistry {
         let mut local_ids = BTreeMap::new();
         let mut by_local_id = HashMap::new();
         for entry in entries.iter() {
+            let ext = (entry.factory)(ctx);
+            if !ext.enabled() {
+                continue;
+            }
             local_ids.insert(entry.name.clone(), entry.local_id);
-            by_local_id.insert(entry.local_id, (entry.factory)(ctx));
+            by_local_id.insert(entry.local_id, ext);
         }
         ExtensionSession {
             local_ids,
@@ -330,5 +355,37 @@ mod tests {
                 payload: b"x".to_vec(),
             }
         );
+    }
+
+    struct DisabledExt;
+
+    impl Extension for DisabledExt {
+        fn name(&self) -> &str {
+            "ut_off"
+        }
+
+        fn on_handshake(&mut self, _peer_info: &PeerExtensionInfo) {}
+
+        fn on_message(&mut self, _payload: &[u8]) -> Vec<Vec<u8>> {
+            Vec::new()
+        }
+
+        fn enabled(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn bind_omits_disabled_extensions_from_handshake() {
+        let registry = ExtensionRegistry::new();
+        registry.register(|_ctx| Box::new(DisabledExt));
+        let session = registry.bind(&ExtensionContext::probe());
+        assert!(session.local_id("ut_off").is_none());
+        let msg = session.outgoing_handshake(None, None);
+        let Message::Extended { payload, .. } = msg else {
+            panic!("expected extended handshake");
+        };
+        let decoded = ExtensionHandshake::decode(&payload);
+        assert!(!decoded.m.contains_key("ut_off"));
     }
 }

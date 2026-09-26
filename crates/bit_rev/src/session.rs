@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use crate::dht::{DhtHandle, PeerSink};
 use crate::discovery::DiscoverySource;
-use crate::extension::{Extension, ExtensionContext, ExtensionRegistry, MetadataStore, UtMetadata};
+use crate::extension::{
+    AddPeersFn, Extension, ExtensionContext, ExtensionRegistry, MetadataStore, UtMetadata, UtPex,
+};
 use crate::file::{self, TorrentMeta};
 use crate::handshake::Handshake;
 use crate::magnet::Magnet;
@@ -296,6 +298,8 @@ pub struct SessionOptions {
     pub max_active: usize,
     pub dont_count_slow: bool,
     pub queue_slow_window: Duration,
+    /// Peer exchange (BEP-0011). Private torrents still refuse PEX.
+    pub pex: bool,
 }
 
 impl Default for SessionOptions {
@@ -327,6 +331,7 @@ impl Default for SessionOptions {
             max_active: 0,
             dont_count_slow: true,
             queue_slow_window: DEFAULT_QUEUE_SLOW_WINDOW,
+            pex: true,
         }
     }
 }
@@ -768,6 +773,11 @@ impl Session {
         session
             .extensions
             .register(|ctx| Box::new(UtMetadata::new(ctx.clone())));
+        if session.options.pex {
+            session
+                .extensions
+                .register(|ctx| Box::new(UtPex::new(ctx.clone())));
+        }
         session.load_categories();
         session.spawn_listener();
         session.start_dht();
@@ -966,6 +976,11 @@ impl Session {
         }
     }
 
+    fn add_peers_fn(&self) -> AddPeersFn {
+        let inlet = self.peer_inlet();
+        Arc::new(move |info_hash, source, addrs| inlet.add_peers(info_hash, source, addrs))
+    }
+
     pub fn dht(&self) -> Option<DhtHandle> {
         self.dht.lock().unwrap().clone()
     }
@@ -1068,6 +1083,7 @@ impl Session {
         let pending = self.pending.clone();
         let dht = self.dht.clone();
         let encryption = self.options.encryption;
+        let add_peers = self.add_peers_fn();
 
         let listener = match bind_tcp_listener(port) {
             Ok(listener) => listener,
@@ -1119,6 +1135,7 @@ impl Session {
                             .unwrap()
                             .map(|bound| bound.port())
                             .unwrap_or(port);
+                        let add_peers = add_peers.clone();
                         tokio::spawn(async move {
                             accept_incoming(
                                 boxed_stream(stream),
@@ -1135,6 +1152,7 @@ impl Session {
                                     pending,
                                     dht,
                                     encryption,
+                                    add_peers,
                                 },
                             )
                             .await;
@@ -2511,6 +2529,7 @@ impl Session {
                 self.options.max_peers_global,
                 self.connector.clone(),
                 self.options.encryption,
+                self.add_peers_fn(),
             ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
@@ -2535,6 +2554,7 @@ impl Session {
             self.options.max_peers_global,
             self.connector.clone(),
             self.options.encryption,
+            self.add_peers_fn(),
         ))
     }
 
@@ -3124,8 +3144,15 @@ impl Session {
                 promote_notify: promote_notify.clone(),
                 encryption: self.options.encryption,
                 limits: limits.clone(),
+                add_peers: self.add_peers_fn(),
             })
             .await;
+
+        if self.options.pex {
+            if let Err(denied) = tracker_stream.register_source(DiscoverySource::Pex) {
+                debug!(error = %denied, "pex disabled for torrent");
+            }
+        }
 
         if let Some(dht) = self.dht() {
             match tracker_stream.register_source(DiscoverySource::Dht) {
@@ -3996,8 +4023,14 @@ impl PeerInlet {
         added
     }
 
+    fn add_peers_fn(&self) -> AddPeersFn {
+        let inlet = self.clone();
+        Arc::new(move |info_hash, source, addrs| inlet.add_peers(info_hash, source, addrs))
+    }
+
     fn connect_peer(&self, info_hash: &[u8; 20], addr: SocketAddr) -> bool {
         let (advertise_dht, dht_port, dht) = self.dht_fields();
+        let add_peers = self.add_peers_fn();
         if let Some(torrent) = self.torrents.get(info_hash).map(|entry| entry.clone()) {
             return try_spawn_peer(spawn_from_session(
                 addr,
@@ -4015,6 +4048,7 @@ impl PeerInlet {
                 self.max_peers_global,
                 self.connector.clone(),
                 self.encryption,
+                add_peers,
             ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
@@ -4036,6 +4070,7 @@ impl PeerInlet {
             self.max_peers_global,
             self.connector.clone(),
             self.encryption,
+            add_peers,
         ))
     }
 }
@@ -4053,6 +4088,7 @@ pub struct IncomingPeerContext {
     pub(crate) pending: Arc<DashMap<[u8; 20], Arc<PendingTorrent>>>,
     pub dht: Option<DhtHandle>,
     pub encryption: EncryptionPolicy,
+    pub add_peers: AddPeersFn,
 }
 
 impl Session {
@@ -4069,6 +4105,7 @@ impl Session {
             pending: self.pending.clone(),
             dht: self.dht(),
             encryption: self.options.encryption,
+            add_peers: self.add_peers_fn(),
         }
     }
 
@@ -4250,6 +4287,7 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         max_peers_global: ctx.max_peers_global,
         connector: ctx.connector,
         promote_notify: target.promote_notify,
+        add_peers: ctx.add_peers,
     });
 }
 
@@ -4324,6 +4362,7 @@ fn spawn_from_session(
     max_peers_global: usize,
     connector: Arc<dyn crate::transport::Connector>,
     encryption: EncryptionPolicy,
+    add_peers: AddPeersFn,
 ) -> SpawnPeerParams {
     SpawnPeerParams {
         peer,
@@ -4346,6 +4385,7 @@ fn spawn_from_session(
         incoming_utp: false,
         encryption,
         extensions,
+        add_peers,
         listen_port,
         metadata: torrent.metadata.clone(),
         advertise_dht: advertise_dht && torrent.torrent.allows_dht(),
@@ -4377,6 +4417,7 @@ fn spawn_from_pending(
     max_peers_global: usize,
     connector: Arc<dyn crate::transport::Connector>,
     encryption: EncryptionPolicy,
+    add_peers: AddPeersFn,
 ) -> SpawnPeerParams {
     SpawnPeerParams {
         peer,
@@ -4399,6 +4440,7 @@ fn spawn_from_pending(
         incoming_utp: false,
         encryption,
         extensions,
+        add_peers,
         listen_port,
         metadata: pending.metadata.clone(),
         advertise_dht: advertise_dht && pending.torrent.get().allows_dht(),

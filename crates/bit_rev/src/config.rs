@@ -244,6 +244,7 @@ impl Config {
             max_active: self.queue.max_active,
             dont_count_slow: self.queue.dont_count_slow,
             queue_slow_window: crate::session::DEFAULT_QUEUE_SLOW_WINDOW,
+            pex: self.pex,
         }
     }
 }
@@ -312,6 +313,8 @@ mod tests {
         assert_eq!(options.max_peers_global, expected.max_peers_global);
         assert_eq!(options.state_dir, expected.state_dir);
         assert_eq!(options.encryption, expected.encryption);
+        assert_eq!(options.pex, expected.pex);
+        assert!(options.pex);
         assert_eq!(
             options.encryption,
             crate::mse::EncryptionPolicy::PreferEncrypted
@@ -338,6 +341,17 @@ mod tests {
         assert!(!disabled.dht.enabled);
         assert_eq!(disabled.dht.port, 6999);
         assert!(disabled.dht.bootstrap_nodes.is_empty());
+    }
+
+    #[test]
+    fn session_options_maps_pex() {
+        assert!(Config::default().session_options().pex);
+        let disabled = Config {
+            pex: false,
+            ..Config::default()
+        }
+        .session_options();
+        assert!(!disabled.pex);
     }
 
     #[test]

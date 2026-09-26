@@ -591,6 +591,9 @@ mod tests {
             peer: addr,
             metadata: store,
             peer_states: Arc::new(PeerStates::default()),
+            add_peers: crate::extension::noop_add_peers(),
+            allows_pex: true,
+            piece_count: Arc::new(|| 0),
         }
     }
 

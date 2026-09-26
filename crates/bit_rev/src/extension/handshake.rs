@@ -6,6 +6,7 @@ use crate::identity;
 
 pub const DEFAULT_REQQ: i64 = 250;
 pub const UT_METADATA: &str = "ut_metadata";
+pub const UT_PEX: &str = "ut_pex";
 pub const MAX_METADATA_SIZE: i64 = 8 * 1024 * 1024;
 pub const MAX_EXTENSION_PAYLOAD: usize = 2 * 1024 * 1024;
 
