@@ -1,0 +1,28 @@
+# bitrev daemon. Create the account before enabling:
+#   sudo useradd --system --home-dir /var/lib/bitrev --create-home bitrev
+#
+# RUST_LOG selects the tracing filter (info, debug, or a target list such as
+# tower_http=debug,server=debug). The default below is info.
+
+[Unit]
+Description=bitrev BitTorrent daemon
+Documentation=https://github.com/fraidev/bitrev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bitrev
+Group=bitrev
+StateDirectory=bitrev
+Environment=BITREV_STATE_DIR=/var/lib/bitrev
+Environment=BITREV_DOWNLOAD_DIR=/var/lib/bitrev/downloads
+Environment=BITREV_SERVER_HOST=127.0.0.1
+Environment=BITREV_SERVER_PORT=8080
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/bitrev serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

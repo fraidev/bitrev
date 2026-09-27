@@ -154,7 +154,7 @@ async fn shutdown_session(session: &Session) {
     }
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {

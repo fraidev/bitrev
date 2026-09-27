@@ -11,6 +11,14 @@ Exemple of how to download a debian iso:
 cargo run --release --bin bitrev -- samples/debian-13.6.0-amd64-netinst.iso.torrent
 ```
 
+Daemon (Sonarr, Radarr, and the Web UI talk to this process):
+
+```bash
+RUST_LOG=info cargo run --bin bitrev -- serve
+```
+
+`RUST_LOG` selects the tracing filter. Unset, `bitrev serve` logs at `info` (raise it with `-v`, lower it with `-q`). A target filter such as `RUST_LOG=tower_http=debug,server=debug` logs each HTTP request with method, path, status, and latency. The default bind is `127.0.0.1:8080`. `GET /healthz` returns `{"ok":true}` without auth.
+
 Tests:
 
 ```bash
