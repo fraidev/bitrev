@@ -353,7 +353,7 @@ async fn json_magnet_add_and_files_default_empty() {
         .unwrap();
     assert_eq!(added.status(), StatusCode::CREATED);
     let body = body_json(added).await;
-    assert_eq!(body["state"], "metadata");
+    assert_eq!(body["state"], "paused");
     let hash = body["id"].as_str().unwrap().to_string();
     assert_eq!(hash, "0123456789abcdef0123456789abcdef01234567");
 
