@@ -195,6 +195,7 @@ pub struct TransferStats {
     pub alt_mode: bool,
     /// Reachability of the mapped listen port. `None` until the check finishes.
     pub port_open: Option<bool>,
+    pub ip_filter: crate::ip_filter::IpFilterStats,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -310,6 +311,8 @@ pub struct SessionOptions {
     pub nat: NatOptions,
     /// HTTP web seeds (BEP-0019 / BEP-0017). Private torrents still use metainfo URLs.
     pub webseed: bool,
+    /// Blocklist file. Empty disables filtering.
+    pub ip_filter_path: PathBuf,
 }
 
 impl Default for SessionOptions {
@@ -345,6 +348,7 @@ impl Default for SessionOptions {
             lpd: true,
             nat: NatOptions::default(),
             webseed: true,
+            ip_filter_path: PathBuf::new(),
         }
     }
 }
@@ -415,6 +419,7 @@ pub struct Session {
     nat_external: Arc<Mutex<Option<SocketAddr>>>,
     nat_port_open: Arc<Mutex<Option<bool>>>,
     nat_done: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 }
 
 pub(crate) struct PendingTorrent {
@@ -730,6 +735,47 @@ fn bind_tcp_listener(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::from_std(std_listener)
 }
 
+async fn ip_filter_reload_loop(
+    filter: Arc<crate::ip_filter::IpFilterHandle>,
+    cancel: CancellationToken,
+    mut tick: tokio::time::Interval,
+) {
+    #[cfg(unix)]
+    {
+        let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(signal) => Some(signal),
+            Err(err) => {
+                warn!(error = %err, "ip filter SIGHUP reload unavailable");
+                None
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => filter.poll_mtime(),
+                _ = async {
+                    match sighup.as_mut() {
+                        Some(signal) => {
+                            signal.recv().await;
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => filter.reload(),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => filter.poll_mtime(),
+            }
+        }
+    }
+}
+
 impl Session {
     pub fn new() -> Self {
         Self::with_options(SessionOptions::default())
@@ -767,6 +813,9 @@ impl Session {
         let connector: Arc<dyn Connector> =
             Arc::new(MseConnector::new(connector, options.encryption));
         let (event_tx, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let ip_filter = Arc::new(crate::ip_filter::IpFilterHandle::open(
+            options.ip_filter_path.clone(),
+        ));
         let limits = Arc::new(SessionLimits::new(
             options.download_limit,
             options.upload_limit,
@@ -799,6 +848,7 @@ impl Session {
             nat_external: Arc::new(Mutex::new(None)),
             nat_port_open: Arc::new(Mutex::new(None)),
             nat_done: Arc::new(Mutex::new(None)),
+            ip_filter,
         };
         session
             .extensions
@@ -816,6 +866,7 @@ impl Session {
         session.spawn_tick();
         session.spawn_watch();
         session.spawn_alt_schedule();
+        session.spawn_ip_filter_reload();
         session
     }
 
@@ -846,7 +897,32 @@ impl Session {
             nat_external: self.nat_external.clone(),
             nat_port_open: self.nat_port_open.clone(),
             nat_done: self.nat_done.clone(),
+            ip_filter: self.ip_filter.clone(),
         }
+    }
+
+    /// Re-read `ip_filter_path`. A broken file keeps the previous list.
+    pub fn reload_ip_filter(&self) {
+        self.ip_filter.reload();
+    }
+
+    pub fn ip_filter_stats(&self) -> crate::ip_filter::IpFilterStats {
+        self.ip_filter.stats()
+    }
+
+    fn spawn_ip_filter_reload(&self) {
+        if self.options.ip_filter_path.as_os_str().is_empty() {
+            return;
+        }
+        let filter = self.ip_filter.clone();
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::ip_filter::reload_interval());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval` fires immediately. Skip that tick.
+            tick.tick().await;
+            ip_filter_reload_loop(filter, cancel, tick).await;
+        });
     }
 
     /// Reload torrents persisted under `options.state_dir`. One-shot callers
@@ -1086,6 +1162,7 @@ impl Session {
             connector: self.connector.clone(),
             dht: self.dht.clone(),
             encryption: self.options.encryption,
+            ip_filter: self.ip_filter.clone(),
         }
     }
 
@@ -1252,6 +1329,7 @@ impl Session {
         let dht = self.dht.clone();
         let encryption = self.options.encryption;
         let add_peers = self.add_peers_fn();
+        let ip_filter = self.ip_filter.clone();
 
         let listener = match bind_tcp_listener(port) {
             Ok(listener) => listener,
@@ -1304,6 +1382,7 @@ impl Session {
                             .map(|bound| bound.port())
                             .unwrap_or(port);
                         let add_peers = add_peers.clone();
+                        let ip_filter = ip_filter.clone();
                         tokio::spawn(async move {
                             accept_incoming(
                                 boxed_stream(stream),
@@ -1321,6 +1400,7 @@ impl Session {
                                     dht,
                                     encryption,
                                     add_peers,
+                                    ip_filter,
                                 },
                             )
                             .await;
@@ -1912,6 +1992,7 @@ impl Session {
         stats.alt_upload_limit = self.limits.alt_upload.rate();
         stats.alt_mode = self.limits.alt_mode();
         stats.port_open = self.port_open();
+        stats.ip_filter = self.ip_filter.stats();
         stats
     }
 
@@ -2705,6 +2786,7 @@ impl Session {
                 self.connector.clone(),
                 self.options.encryption,
                 self.add_peers_fn(),
+                self.ip_filter.clone(),
             ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
@@ -2730,6 +2812,7 @@ impl Session {
             self.connector.clone(),
             self.options.encryption,
             self.add_peers_fn(),
+            self.ip_filter.clone(),
         ))
     }
 
@@ -3323,6 +3406,7 @@ impl Session {
                 encryption: self.options.encryption,
                 limits: limits.clone(),
                 add_peers: self.add_peers_fn(),
+                ip_filter: self.ip_filter.clone(),
             })
             .await;
 
@@ -4170,6 +4254,7 @@ struct PeerInlet {
     connector: Arc<dyn Connector>,
     dht: Arc<Mutex<Option<DhtHandle>>>,
     encryption: EncryptionPolicy,
+    ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 }
 
 impl PeerInlet {
@@ -4226,6 +4311,9 @@ impl PeerInlet {
 
         let mut added = 0;
         for addr in addrs {
+            if self.ip_filter.blocks(addr) {
+                continue;
+            }
             if self.global_peers.load(Ordering::Relaxed) >= self.max_peers_global {
                 break;
             }
@@ -4268,6 +4356,7 @@ impl PeerInlet {
                 self.connector.clone(),
                 self.encryption,
                 add_peers,
+                self.ip_filter.clone(),
             ));
         }
         let Some(pending) = self.pending.get(info_hash).map(|entry| entry.clone()) else {
@@ -4290,6 +4379,7 @@ impl PeerInlet {
             self.connector.clone(),
             self.encryption,
             add_peers,
+            self.ip_filter.clone(),
         ))
     }
 }
@@ -4308,6 +4398,7 @@ pub struct IncomingPeerContext {
     pub dht: Option<DhtHandle>,
     pub encryption: EncryptionPolicy,
     pub add_peers: AddPeersFn,
+    pub ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 }
 
 impl Session {
@@ -4325,6 +4416,7 @@ impl Session {
             dht: self.dht(),
             encryption: self.options.encryption,
             add_peers: self.add_peers_fn(),
+            ip_filter: self.ip_filter.clone(),
         }
     }
 
@@ -4354,6 +4446,9 @@ async fn accept_incoming_kind(
     ctx: IncomingPeerContext,
     utp: bool,
 ) {
+    if ctx.ip_filter.blocks(addr) {
+        return;
+    }
     let incoming = match peek_incoming(stream, addr).await {
         Ok(mut incoming) => {
             incoming.utp = utp;
@@ -4394,6 +4489,9 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         kind,
         utp,
     } = incoming;
+    if ctx.ip_filter.blocks(addr) {
+        return;
+    }
     debug!(%addr, ?kind, "accepting incoming peer");
     let mut encrypted = false;
     match kind {
@@ -4507,6 +4605,7 @@ pub async fn accept_incoming_stream(incoming: IncomingStream, ctx: IncomingPeerC
         connector: ctx.connector,
         promote_notify: target.promote_notify,
         add_peers: ctx.add_peers,
+        ip_filter: ctx.ip_filter,
     });
 }
 
@@ -4582,6 +4681,7 @@ fn spawn_from_session(
     connector: Arc<dyn crate::transport::Connector>,
     encryption: EncryptionPolicy,
     add_peers: AddPeersFn,
+    ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 ) -> SpawnPeerParams {
     SpawnPeerParams {
         peer,
@@ -4616,6 +4716,7 @@ fn spawn_from_session(
         connector,
         promote_notify: Arc::new(Notify::new()),
         limits: torrent.limits.clone(),
+        ip_filter,
     }
 }
 
@@ -4637,6 +4738,7 @@ fn spawn_from_pending(
     connector: Arc<dyn crate::transport::Connector>,
     encryption: EncryptionPolicy,
     add_peers: AddPeersFn,
+    ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 ) -> SpawnPeerParams {
     SpawnPeerParams {
         peer,
@@ -4671,6 +4773,7 @@ fn spawn_from_pending(
         connector,
         promote_notify: pending.promote_notify.clone(),
         limits: pending.limits.clone(),
+        ip_filter,
     }
 }
 

@@ -93,3 +93,10 @@ path = "fuzz_targets/lpd_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ipfilter_parse"
+path = "fuzz_targets/ipfilter_parse.rs"
+test = false
+doc = false
+bench = false

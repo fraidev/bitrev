@@ -316,6 +316,7 @@ impl Config {
                 enabled: self.nat.enabled && self.nat.protocol != NatProtocol::Off,
                 protocol: self.nat.protocol,
             },
+            ip_filter_path: util::paths::expand_tilde(&self.ip_filter.path),
         }
     }
 }

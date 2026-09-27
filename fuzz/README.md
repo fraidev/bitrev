@@ -21,6 +21,7 @@ Issue: https://github.com/fraidev/bitrev/issues/65
 | `krpc_decode` | `dht::krpc::decode` |
 | `utp_header` | `utp::Packet::decode` |
 | `lpd_decode` | `lsd::decode` (BEP-0014 LPD) |
+| `ipfilter_parse` | `ip_filter::IpFilter::parse_bytes` |
 
 New parsers (KRPC, `ut_metadata`, magnet, `ut_pex`, LPD, `ipfilter.dat`) add one
 target here with a seed corpus under `corpus/<target>/`.
