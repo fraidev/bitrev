@@ -50,6 +50,7 @@ fn test_meta(announce: String) -> TorrentMeta {
             nodes: None,
             encoding: None,
             httpseeds: None,
+            url_list: None,
             announce_list: None,
             creation_date: None,
             comment: None,

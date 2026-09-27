@@ -32,6 +32,7 @@ pub mod tracker_peers;
 pub mod transport;
 pub mod utils;
 pub mod utp;
+pub mod webseed;
 
 #[cfg(test)]
 mod seeding_tests;

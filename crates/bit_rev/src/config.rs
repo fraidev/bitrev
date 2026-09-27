@@ -311,6 +311,7 @@ impl Config {
             queue_slow_window: crate::session::DEFAULT_QUEUE_SLOW_WINDOW,
             pex: self.pex,
             lpd: self.lpd,
+            webseed: self.webseed,
             nat: NatOptions {
                 enabled: self.nat.enabled && self.nat.protocol != NatProtocol::Off,
                 protocol: self.nat.protocol,
@@ -385,6 +386,7 @@ mod tests {
         assert_eq!(options.encryption, expected.encryption);
         assert_eq!(options.pex, expected.pex);
         assert!(options.pex);
+        assert!(options.webseed);
         assert_eq!(
             options.encryption,
             crate::mse::EncryptionPolicy::PreferEncrypted
