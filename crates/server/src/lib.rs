@@ -1,8 +1,8 @@
 //! HTTP shell for `bitrev serve`.
 //!
-//! This crate owns the process bind, cookie auth, `GET /healthz`, and the
-//! native `/api/v1` JSON API. qBittorrent compatibility and the Web UI land
-//! in later issues.
+//! This crate owns the process bind, cookie auth, `GET /healthz`, the native
+//! `/api/v1` JSON API, and the qBittorrent Web API v2 facade at `/api/v2`.
+//! The Web UI lands in a later issue.
 //!
 //! Request logs are `tracing` spans named `http` with `method`, `path`,
 //! `status`, and `latency`. The CLI installs a `tracing-subscriber` filter
@@ -17,6 +17,7 @@
 mod api;
 mod auth;
 mod password;
+mod qbittorrent;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ pub struct AppState {
     pub session: Arc<Session>,
     pub config: ServerConfig,
     pub sessions: Arc<SessionStore>,
+    pub qbit_sync: Arc<qbittorrent::SyncCache>,
 }
 
 /// Router used by `bitrev serve` and by in-process tests.
@@ -48,12 +50,14 @@ pub struct AppState {
 /// `config.password` is the password login accepts. Call [`ensure_password`]
 /// first when the configured password is empty.
 pub fn app(session: Arc<Session>, config: ServerConfig) -> Router {
+    let qbit_enabled = config.qbittorrent_compat;
     let state = AppState {
         session,
         config,
         sessions: Arc::new(SessionStore::default()),
+        qbit_sync: Arc::new(qbittorrent::SyncCache::default()),
     };
-    let router = api::mount(Router::new())
+    let router = qbittorrent::mount(api::mount(Router::new()), qbit_enabled)
         .route("/healthz", get(healthz))
         .route("/", get(index))
         .route("/login", get(login_page))

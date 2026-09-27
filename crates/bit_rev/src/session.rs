@@ -154,6 +154,11 @@ pub struct TorrentSnapshot {
     pub ratio: f64,
     pub queue_position: i64,
     pub force_start: bool,
+    /// `None` inherits the session seed ratio. `Some(0.0)` is unlimited.
+    pub ratio_limit: Option<f64>,
+    /// `None` inherits the session seed time. `Some(0)` is unlimited. Minutes.
+    pub seeding_time_limit: Option<u64>,
+    pub piece_length: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1996,6 +2001,51 @@ impl Session {
         stats
     }
 
+    /// Normal (non-alternative) global limits. `0` is unlimited.
+    pub fn normal_rate_limits(&self) -> (u64, u64) {
+        (self.limits.download.rate(), self.limits.upload.rate())
+    }
+
+    /// Replace per-torrent share-limit overrides.
+    ///
+    /// `None` inherits the session limit. `Some(0.0)` / `Some(0)` means unlimited.
+    pub fn set_share_limits(
+        &self,
+        id: TorrentId,
+        ratio_limit: Option<f64>,
+        seeding_time_limit: Option<u64>,
+    ) -> Result<(), ControlError> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            *torrent.ratio_limit.lock().unwrap() = ratio_limit;
+            *torrent.seeding_time_limit.lock().unwrap() = seeding_time_limit;
+            self.spawn_flush_one(torrent.value().clone());
+            return Ok(());
+        }
+        if let Some(pending) = self.pending.get(&id.0) {
+            *pending.ratio_limit.lock().unwrap() = ratio_limit;
+            *pending.seeding_time_limit.lock().unwrap() = seeding_time_limit;
+            return Ok(());
+        }
+        Err(ControlError::NotFound(id))
+    }
+
+    /// qBittorrent piece states: `0` missing, `2` have. Empty before metadata.
+    pub fn piece_states(&self, id: TorrentId) -> Result<Vec<u8>, ControlError> {
+        if let Some(torrent) = self.torrents.get(&id.0) {
+            let count = torrent.downloaded_state.piece_count();
+            let mut states = Vec::with_capacity(count);
+            for index in 0..count {
+                let have = torrent.downloaded_state.has_piece(index as u32);
+                states.push(if have { 2 } else { 0 });
+            }
+            return Ok(states);
+        }
+        if self.pending.contains_key(&id.0) {
+            return Ok(Vec::new());
+        }
+        Err(ControlError::NotFound(id))
+    }
+
     pub fn set_rate_limits(&self, download: u64, upload: u64) {
         self.limits.download.set_rate(download);
         self.limits.upload.set_rate(upload);
@@ -2965,9 +3015,14 @@ impl Session {
         let (piece_tx, _piece_rx) = flume::unbounded();
         let (pr_tx, pr_rx) = flume::unbounded();
         let start_paused = opts.paused.unwrap_or(false);
-        let torrent_state = Arc::new(Mutex::new(TorrentState::Metadata));
+        let initial_state = if start_paused {
+            TorrentState::Paused
+        } else {
+            TorrentState::Metadata
+        };
+        let torrent_state = Arc::new(Mutex::new(initial_state.clone()));
         let download_state = Arc::new(Mutex::new(DownloadState::Init));
-        sync_download_state(&download_state, &TorrentState::Metadata);
+        sync_download_state(&download_state, &initial_state);
         let auto_tmm = opts.auto_tmm.unwrap_or_else(|| opts.output_dir.is_none());
         let download_limiter = Arc::new(RateLimiter::new(opts.download_limit, DEFAULT_BURST));
         let upload_limiter = Arc::new(RateLimiter::new(opts.upload_limit, DEFAULT_BURST));
@@ -3697,7 +3752,7 @@ impl Session {
         self.emit(SessionEvent::Added { id });
         self.emit(SessionEvent::StateChanged {
             id,
-            state: TorrentState::Metadata,
+            state: pending.torrent_state.lock().unwrap().clone(),
         });
 
         let promoter = self.share();
@@ -4071,6 +4126,9 @@ fn torrent_snapshot(torrent: &TorrentSession) -> TorrentSnapshot {
         },
         queue_position: torrent.queue_position.load(Ordering::Relaxed) as i64,
         force_start: torrent.force_start.load(Ordering::Relaxed),
+        ratio_limit: *torrent.ratio_limit.lock().unwrap(),
+        seeding_time_limit: *torrent.seeding_time_limit.lock().unwrap(),
+        piece_length: torrent.torrent.piece_length.max(0) as u64,
     }
 }
 
@@ -4117,6 +4175,9 @@ fn pending_snapshot(info_hash: [u8; 20], pending: &PendingTorrent) -> TorrentSna
         ratio: 0.0,
         queue_position: pending.queue_position.load(Ordering::Relaxed) as i64,
         force_start: pending.force_start.load(Ordering::Relaxed),
+        ratio_limit: *pending.ratio_limit.lock().unwrap(),
+        seeding_time_limit: *pending.seeding_time_limit.lock().unwrap(),
+        piece_length: torrent.piece_length.max(0) as u64,
     }
 }
 
