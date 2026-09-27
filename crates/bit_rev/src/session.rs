@@ -30,6 +30,7 @@ use crate::hash::PieceHasher;
 pub use crate::library::Category;
 use crate::lsd::{self, InboundLimiter};
 use crate::mse::{self, EncryptionPolicy, MseConnector};
+use crate::nat::{self, MapProto, NatOptions, PortMapper};
 pub use crate::priority::{FileInfo, FilePriority};
 pub use crate::resume::ResumeStatus;
 pub use crate::storage::Preallocate;
@@ -192,6 +193,8 @@ pub struct TransferStats {
     pub alt_download_limit: u64,
     pub alt_upload_limit: u64,
     pub alt_mode: bool,
+    /// Reachability of the mapped listen port. `None` until the check finishes.
+    pub port_open: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -303,6 +306,8 @@ pub struct SessionOptions {
     pub pex: bool,
     /// Local Peer Discovery (BEP-0014). Private torrents still refuse LSD.
     pub lpd: bool,
+    /// Local-router port mapping. Off unless config enables it.
+    pub nat: NatOptions,
 }
 
 impl Default for SessionOptions {
@@ -336,6 +341,7 @@ impl Default for SessionOptions {
             queue_slow_window: DEFAULT_QUEUE_SLOW_WINDOW,
             pex: true,
             lpd: true,
+            nat: NatOptions::default(),
         }
     }
 }
@@ -403,6 +409,9 @@ pub struct Session {
     restoring: Arc<AtomicBool>,
     lpd_cookie: String,
     lpd_limiter: Arc<Mutex<InboundLimiter>>,
+    nat_external: Arc<Mutex<Option<SocketAddr>>>,
+    nat_port_open: Arc<Mutex<Option<bool>>>,
+    nat_done: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 pub(crate) struct PendingTorrent {
@@ -723,6 +732,11 @@ impl Session {
     }
 
     pub fn with_options(options: SessionOptions) -> Self {
+        Self::with_nat_mapper(options, None)
+    }
+
+    /// `mapper` replaces gateway I/O. `None` builds the configured protocol client.
+    pub fn with_nat_mapper(options: SessionOptions, mapper: Option<Arc<dyn PortMapper>>) -> Self {
         let (utp_tx, utp_rx) = tokio::sync::watch::channel(None);
         let connector: Arc<dyn Connector> = if options.utp.enabled {
             Arc::new(RacingConnector::new(
@@ -732,18 +746,19 @@ impl Session {
         } else {
             Arc::new(TcpConnector::new())
         };
-        Self::with_connector_and_utp(options, connector, utp_tx)
+        Self::with_connector_and_utp(options, connector, utp_tx, mapper)
     }
 
     pub fn with_connector(options: SessionOptions, connector: Arc<dyn Connector>) -> Self {
         let (utp_tx, _utp_rx) = tokio::sync::watch::channel(None);
-        Self::with_connector_and_utp(options, connector, utp_tx)
+        Self::with_connector_and_utp(options, connector, utp_tx, None)
     }
 
     fn with_connector_and_utp(
         options: SessionOptions,
         connector: Arc<dyn Connector>,
         utp_bind: tokio::sync::watch::Sender<UtpBindState>,
+        nat_mapper: Option<Arc<dyn PortMapper>>,
     ) -> Self {
         let connector: Arc<dyn Connector> =
             Arc::new(MseConnector::new(connector, options.encryption));
@@ -777,6 +792,9 @@ impl Session {
             restoring: Arc::new(AtomicBool::new(false)),
             lpd_cookie: lsd::random_cookie(),
             lpd_limiter: Arc::new(Mutex::new(InboundLimiter::default())),
+            nat_external: Arc::new(Mutex::new(None)),
+            nat_port_open: Arc::new(Mutex::new(None)),
+            nat_done: Arc::new(Mutex::new(None)),
         };
         session
             .extensions
@@ -790,6 +808,7 @@ impl Session {
         session.spawn_listener();
         session.start_dht();
         session.start_lpd();
+        session.spawn_nat(nat_mapper);
         session.spawn_tick();
         session.spawn_watch();
         session.spawn_alt_schedule();
@@ -820,13 +839,23 @@ impl Session {
             restoring: self.restoring.clone(),
             lpd_cookie: self.lpd_cookie.clone(),
             lpd_limiter: self.lpd_limiter.clone(),
+            nat_external: self.nat_external.clone(),
+            nat_port_open: self.nat_port_open.clone(),
+            nat_done: self.nat_done.clone(),
         }
     }
 
     /// Reload torrents persisted under `options.state_dir`. One-shot callers
     /// should keep using `new` / `with_options`.
     pub async fn open(options: SessionOptions) -> anyhow::Result<Self> {
-        let session = Self::with_options(options);
+        Self::open_with_mapper(options, None).await
+    }
+
+    pub async fn open_with_mapper(
+        options: SessionOptions,
+        mapper: Option<Arc<dyn PortMapper>>,
+    ) -> anyhow::Result<Self> {
+        let session = Self::with_nat_mapper(options, mapper);
         session.restoring.store(true, Ordering::Relaxed);
         session.load_persisted().await;
         session.restoring.store(false, Ordering::Relaxed);
@@ -1084,6 +1113,61 @@ impl Session {
 
     pub fn global_peer_count(&self) -> usize {
         self.global_peers.load(Ordering::Relaxed)
+    }
+
+    fn spawn_nat(&self, mapper: Option<Arc<dyn PortMapper>>) {
+        if !self.options.nat.enabled || self.options.nat.protocol == nat::NatProtocol::Off {
+            return;
+        }
+        let mapper = mapper.unwrap_or_else(|| nat::mapper_for(self.options.nat.protocol));
+        let targets = self.nat_targets();
+        if targets.is_empty() {
+            return;
+        }
+        nat::spawn(
+            mapper,
+            targets,
+            self.cancel.clone(),
+            self.nat_external.clone(),
+            self.nat_port_open.clone(),
+            self.nat_done.clone(),
+        );
+    }
+
+    fn nat_targets(&self) -> Vec<(MapProto, u16)> {
+        let mut targets = Vec::new();
+        if let Some(addr) = *self.listen_addr.lock().unwrap() {
+            if addr.port() != 0 {
+                targets.push((MapProto::Tcp, addr.port()));
+            }
+        }
+        let mut udp_ports = BTreeSet::new();
+        if self.options.utp.enabled {
+            if let Some(addr) = self.utp_local_addr() {
+                if addr.port() != 0 {
+                    udp_ports.insert(addr.port());
+                }
+            }
+        }
+        if self.options.dht.enabled {
+            if let Some(dht) = self.dht() {
+                if dht.udp_port() != 0 {
+                    udp_ports.insert(dht.udp_port());
+                }
+            }
+        }
+        for port in udp_ports {
+            targets.push((MapProto::Udp, port));
+        }
+        targets
+    }
+
+    pub fn external_address(&self) -> Option<SocketAddr> {
+        *self.nat_external.lock().unwrap()
+    }
+
+    pub fn port_open(&self) -> Option<bool> {
+        *self.nat_port_open.lock().unwrap()
     }
 
     pub fn listen_port(&self) -> u16 {
@@ -1823,6 +1907,7 @@ impl Session {
         stats.alt_download_limit = self.limits.alt_download.rate();
         stats.alt_upload_limit = self.limits.alt_upload.rate();
         stats.alt_mode = self.limits.alt_mode();
+        stats.port_open = self.port_open();
         stats
     }
 
@@ -2024,6 +2109,12 @@ impl Session {
     pub async fn shutdown_graceful(&self) {
         self.flush_resume().await;
         self.shutdown();
+        if self.owns_lifecycle {
+            let done = self.nat_done.lock().unwrap().take();
+            if let Some(done) = done {
+                let _ = done.await;
+            }
+        }
     }
 
     fn spawn_flush_resume(&self) {

@@ -41,9 +41,6 @@ pex = true
 # Local peer discovery (BEP-0014).
 lpd = true
 
-# UPnP / NAT-PMP port mapping.
-nat = true
-
 # HTTP/FTP web seeds (BEP-0017 / BEP-0019).
 webseed = true
 
@@ -73,6 +70,11 @@ port = 6881
 [utp]
 # Micro Transport Protocol (BEP-0029).
 enabled = true
+
+# UPnP / NAT-PMP port mapping. protocol: auto | natpmp | upnp | off
+[nat]
+enabled = true
+protocol = "auto"
 
 [queue]
 max_active_downloads = 5

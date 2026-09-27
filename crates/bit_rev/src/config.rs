@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dht::DhtOptions;
 use crate::file::AnnounceParams;
+use crate::nat::{NatOptions, NatProtocol};
 use crate::session::{
     Preallocate, SessionOptions, DEFAULT_LISTEN_PORT, DEFAULT_MAX_PEERS_GLOBAL,
     DEFAULT_MAX_PEERS_PER_TORRENT,
@@ -35,7 +36,8 @@ pub struct Config {
     pub alt_schedule: String,
     pub pex: bool,
     pub lpd: bool,
-    pub nat: bool,
+    #[serde(deserialize_with = "deserialize_nat")]
+    pub nat: NatConfig,
     pub webseed: bool,
     pub ipv6: bool,
     pub queue: QueueConfig,
@@ -70,6 +72,12 @@ pub enum EncryptionMode {
     #[default]
     PreferEncrypted,
     RequireEncrypted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NatConfig {
+    pub enabled: bool,
+    pub protocol: NatProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,7 +132,7 @@ impl Default for Config {
             alt_schedule: String::new(),
             pex: true,
             lpd: true,
-            nat: true,
+            nat: NatConfig::default(),
             webseed: true,
             ipv6: true,
             queue: QueueConfig::default(),
@@ -153,6 +161,63 @@ impl Default for DhtConfig {
             port: DEFAULT_LISTEN_PORT,
         }
     }
+}
+
+impl Default for NatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protocol: NatProtocol::Auto,
+        }
+    }
+}
+
+fn deserialize_nat<'de, D>(deserializer: D) -> Result<NatConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Table {
+        #[serde(default = "nat_enabled_default")]
+        enabled: bool,
+        #[serde(default)]
+        protocol: NatProtocol,
+    }
+
+    fn nat_enabled_default() -> bool {
+        true
+    }
+
+    struct NatVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for NatVisitor {
+        type Value = NatConfig;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a bool or a nat table")
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, enabled: bool) -> Result<Self::Value, E> {
+            Ok(NatConfig {
+                enabled,
+                protocol: NatProtocol::Auto,
+            })
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let table = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+            Ok(NatConfig {
+                enabled: table.enabled,
+                protocol: table.protocol,
+            })
+        }
+    }
+
+    deserializer.deserialize_any(NatVisitor)
 }
 
 impl Default for UtpConfig {
@@ -246,6 +311,10 @@ impl Config {
             queue_slow_window: crate::session::DEFAULT_QUEUE_SLOW_WINDOW,
             pex: self.pex,
             lpd: self.lpd,
+            nat: NatOptions {
+                enabled: self.nat.enabled && self.nat.protocol != NatProtocol::Off,
+                protocol: self.nat.protocol,
+            },
         }
     }
 }
@@ -353,6 +422,41 @@ mod tests {
         }
         .session_options();
         assert!(!disabled.pex);
+    }
+
+    #[test]
+    fn session_options_maps_nat() {
+        let options = Config::default().session_options();
+        assert!(options.nat.enabled);
+        assert_eq!(options.nat.protocol, NatProtocol::Auto);
+
+        let disabled = Config {
+            nat: NatConfig {
+                enabled: false,
+                protocol: NatProtocol::Upnp,
+            },
+            ..Config::default()
+        }
+        .session_options();
+        assert!(!disabled.nat.enabled);
+
+        let off = Config {
+            nat: NatConfig {
+                enabled: true,
+                protocol: NatProtocol::Off,
+            },
+            ..Config::default()
+        }
+        .session_options();
+        assert!(!off.nat.enabled);
+        assert_eq!(off.nat.protocol, NatProtocol::Off);
+    }
+
+    #[test]
+    fn nat_bool_still_parses() {
+        let parsed: Config = toml::from_str("nat = false\n").unwrap();
+        assert!(!parsed.nat.enabled);
+        assert_eq!(parsed.nat.protocol, NatProtocol::Auto);
     }
 
     #[test]

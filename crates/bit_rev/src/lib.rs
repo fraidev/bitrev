@@ -14,6 +14,7 @@ pub mod lsd;
 pub mod magnet;
 pub mod message;
 pub mod mse;
+pub mod nat;
 pub mod peer;
 pub mod peer_connection;
 pub mod peer_state;
