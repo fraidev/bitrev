@@ -1,8 +1,8 @@
 //! HTTP shell for `bitrev serve`.
 //!
-//! Routes for the native API, qBittorrent compatibility, and the Web UI land
-//! in later issues. This crate owns the process bind, cookie auth, and
-//! `GET /healthz`.
+//! This crate owns the process bind, cookie auth, `GET /healthz`, and the
+//! native `/api/v1` JSON API. qBittorrent compatibility and the Web UI land
+//! in later issues.
 //!
 //! Request logs are `tracing` spans named `http` with `method`, `path`,
 //! `status`, and `latency`. The CLI installs a `tracing-subscriber` filter
@@ -14,6 +14,7 @@
 //! RUST_LOG=tower_http=debug,server=debug bitrev serve
 //! ```
 
+mod api;
 mod auth;
 mod password;
 
@@ -21,10 +22,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::Request;
 use axum::response::Html;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use bit_rev::config::ServerConfig;
 use bit_rev::session::Session;
@@ -52,12 +53,11 @@ pub fn app(session: Arc<Session>, config: ServerConfig) -> Router {
         config,
         sessions: Arc::new(SessionStore::default()),
     };
-    Router::new()
+    let router = api::mount(Router::new())
         .route("/healthz", get(healthz))
         .route("/", get(index))
         .route("/login", get(login_page))
-        .route("/api/v1/login", post(auth::login))
-        .route("/api/v1/logout", post(auth::logout))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_api_auth,
@@ -80,7 +80,8 @@ pub fn app(session: Arc<Session>, config: ServerConfig) -> Router {
                     },
                 ),
         )
-        .with_state(state)
+        .with_state(state);
+    router
 }
 
 /// Bind `addr` and run until `shutdown` completes, then drain in-flight HTTP.
