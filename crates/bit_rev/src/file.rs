@@ -65,6 +65,13 @@ pub struct TorrentFile {
     pub encoding: Option<String>,
     #[serde(default)]
     pub httpseeds: Option<Vec<String>>,
+    /// BEP-0019 `url-list`: one URL string or a list of URL strings.
+    #[serde(
+        default,
+        rename = "url-list",
+        deserialize_with = "deserialize_url_list"
+    )]
+    pub url_list: Option<Vec<String>>,
     #[serde(default)]
     #[serde(rename = "announce-list")]
     pub announce_list: Option<Vec<Vec<String>>>,
@@ -76,6 +83,59 @@ pub struct TorrentFile {
     #[serde(default)]
     #[serde(rename = "created by")]
     pub created_by: Option<String>,
+}
+
+fn deserialize_url_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a url-list string or list of strings")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(Some(vec![value.to_string()]))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+            Ok(Some(vec![value]))
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            let text = std::str::from_utf8(value).map_err(E::custom)?;
+            Ok(Some(vec![text.to_string()]))
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+            self.visit_bytes(&value)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut urls = Vec::new();
+            while let Some(url) = seq.next_element::<String>()? {
+                urls.push(url);
+            }
+            Ok(Some(urls))
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -106,6 +166,7 @@ impl TorrentMeta {
             nodes: None,
             encoding: None,
             httpseeds: None,
+            url_list: None,
             announce_list: None,
             creation_date: None,
             comment: None,
@@ -486,6 +547,7 @@ mod tests {
                 nodes: None,
                 encoding: None,
                 httpseeds: None,
+                url_list: None,
                 announce_list: None,
                 creation_date: None,
                 comment: None,
@@ -558,6 +620,7 @@ mod tests {
             nodes: None,
             encoding: None,
             httpseeds: None,
+            url_list: None,
             announce_list: None,
             creation_date: None,
             comment: None,
@@ -574,6 +637,33 @@ mod tests {
     ) -> Vec<u8> {
         ser::to_bytes(&torrent_file(name, piece_length, pieces, length, files))
             .expect("serialize torrent")
+    }
+
+    #[test]
+    fn url_list_accepts_string_or_list() {
+        fn bstr(value: &str) -> String {
+            format!("{}:{value}", value.len())
+        }
+        let pieces = vec![0u8; 20];
+        let one = "http://cdn.example/a";
+        let two = "http://mirror/b";
+
+        let mut single = encode_torrent("file.bin", 16, pieces.clone(), Some(16), None);
+        assert_eq!(single.pop(), Some(b'e'));
+        single.extend(format!("8:url-list{}", bstr(one)).into_bytes());
+        single.push(b'e');
+        let meta = from_bytes(&single).expect("string url-list");
+        assert_eq!(
+            meta.torrent_file.url_list.as_deref(),
+            Some([one.to_string()].as_slice())
+        );
+
+        let mut many = encode_torrent("file.bin", 16, pieces, Some(16), None);
+        assert_eq!(many.pop(), Some(b'e'));
+        many.extend(format!("8:url-listl{}{}e", bstr(one), bstr(two)).into_bytes());
+        many.push(b'e');
+        let meta = from_bytes(&many).expect("list url-list");
+        assert_eq!(meta.torrent_file.url_list.unwrap(), [one, two]);
     }
 
     #[test]

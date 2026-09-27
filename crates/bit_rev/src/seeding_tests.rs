@@ -56,6 +56,7 @@ fn torrent_meta(name: &str, data: &[u8], piece_length: i64) -> TorrentMeta {
         nodes: None,
         encoding: None,
         httpseeds: None,
+        url_list: None,
         announce_list: None,
         creation_date: None,
         comment: None,

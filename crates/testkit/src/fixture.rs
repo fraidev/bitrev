@@ -462,6 +462,7 @@ impl TorrentFixture {
             nodes: None,
             encoding: None,
             httpseeds: None,
+            url_list: None,
             announce_list: builder.announce_list,
             creation_date: None,
             comment: None,

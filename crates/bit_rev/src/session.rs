@@ -308,6 +308,8 @@ pub struct SessionOptions {
     pub lpd: bool,
     /// Local-router port mapping. Off unless config enables it.
     pub nat: NatOptions,
+    /// HTTP web seeds (BEP-0019 / BEP-0017). Private torrents still use metainfo URLs.
+    pub webseed: bool,
 }
 
 impl Default for SessionOptions {
@@ -342,6 +344,7 @@ impl Default for SessionOptions {
             pex: true,
             lpd: true,
             nat: NatOptions::default(),
+            webseed: true,
         }
     }
 }
@@ -449,6 +452,7 @@ pub(crate) struct PendingTorrent {
     ratio_limit: Mutex<Option<f64>>,
     seeding_time_limit: Mutex<Option<u64>>,
     slow_since: Mutex<Option<std::time::Instant>>,
+    webseeds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2830,6 +2834,7 @@ impl Session {
                 info_hash,
                 resume::info_hash_hex(&info_hash),
                 Vec::new(),
+                Vec::new(),
                 opts.output_dir
                     .unwrap_or_else(|| std::env::temp_dir().join("bitrev-metadata")),
                 &dummy,
@@ -2847,6 +2852,7 @@ impl Session {
         info_hash: [u8; 20],
         name: String,
         trackers: Vec<String>,
+        webseeds: Vec<String>,
         output_dir: PathBuf,
         opts: &AddTorrentOptions,
     ) -> anyhow::Result<Arc<PendingTorrent>> {
@@ -2923,6 +2929,7 @@ impl Session {
             ratio_limit: Mutex::new(opts.ratio_limit),
             seeding_time_limit: Mutex::new(opts.seeding_time_limit),
             slow_since: Mutex::new(None),
+            webseeds,
         });
         self.pending.insert(info_hash, pending.clone());
         Ok(pending)
@@ -3461,6 +3468,20 @@ impl Session {
             }
         });
 
+        if self.options.webseed {
+            crate::webseed::spawn(crate::webseed::WebSeedCtx {
+                torrent: torrent.clone(),
+                meta: torrent_meta.clone(),
+                downloaded: torrent_session.downloaded_state.clone(),
+                storage: torrent_session.storage.clone(),
+                piece_tx: torrent_session.piece_tx.clone(),
+                peer_states: torrent_session.peer_states.clone(),
+                download_state: torrent_session.download_state.clone(),
+                limits: torrent_session.limits.clone(),
+                cancel: torrent_session.tracker.cancel_token(),
+            });
+        }
+
         if let Some(pending) = reuse {
             if torrent.is_private() {
                 if let Some(dht) = self.dht() {
@@ -3543,6 +3564,7 @@ impl Session {
                 magnet.info_hash,
                 magnet.name_or_hash(),
                 magnet.trackers.clone(),
+                magnet.webseeds.clone(),
                 output_dir,
                 &add_torrent,
             )
@@ -3622,6 +3644,15 @@ impl Session {
                         .map(|url| vec![url])
                         .collect(),
                 );
+            }
+            if !pending_task.webseeds.is_empty() {
+                let mut urls = meta.torrent_file.url_list.take().unwrap_or_default();
+                for url in &pending_task.webseeds {
+                    if !urls.iter().any(|existing| existing == url) {
+                        urls.push(url.clone());
+                    }
+                }
+                meta.torrent_file.url_list = Some(urls);
             }
 
             let mut opts = AddTorrentOptions::from(meta.clone());
@@ -4834,6 +4865,7 @@ mod incoming_tests {
             nodes: None,
             encoding: None,
             httpseeds: None,
+            url_list: None,
             announce_list: None,
             creation_date: None,
             comment: None,
