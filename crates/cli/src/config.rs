@@ -338,6 +338,16 @@ mod tests {
     }
 
     #[test]
+    fn default_server_bind_is_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let config = load_config(Some(&missing), |_| None, &FlagOverrides::default()).unwrap();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 8080);
+        assert!(config.server.password.is_empty());
+    }
+
+    #[test]
     fn nested_env_overrides_dht_and_server_port() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.toml");

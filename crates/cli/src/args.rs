@@ -62,6 +62,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Run the HTTP daemon until SIGINT or SIGTERM.
+    ///
+    /// Binds `server.host:server.port` from config (default `127.0.0.1:8080`).
+    /// `RUST_LOG` selects the tracing filter. When unset, the level follows
+    /// `-v` / `-q` and otherwise defaults to `info`.
+    Serve,
 }
 
 #[derive(Debug, Subcommand)]
@@ -125,7 +131,7 @@ pub fn init_tracing(verbose: u8, quiet: u8) {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::Cli;
+    use super::{Cli, Command};
 
     #[test]
     fn version_matches_identity() {
@@ -158,6 +164,7 @@ mod tests {
             "--help",
             "--version",
             "config",
+            "serve",
         ] {
             assert!(help.contains(needle), "help is missing {needle}:\n{help}");
         }
@@ -220,6 +227,14 @@ mod tests {
     fn no_seed_overrides_seed() {
         let cli = Cli::parse_from(["bitrev", "--seed", "--no-seed", "t.torrent"]);
         assert!(!cli.stay_alive());
+    }
+
+    #[test]
+    fn parses_serve_subcommand() {
+        let cli = Cli::parse_from(["bitrev", "--config", "/tmp/c.toml", "serve"]);
+        assert!(matches!(cli.command, Some(Command::Serve)));
+        assert!(cli.inputs.is_empty());
+        assert_eq!(cli.config.as_deref().unwrap().as_os_str(), "/tmp/c.toml");
     }
 
     #[test]

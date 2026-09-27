@@ -1,6 +1,7 @@
 use bitrev_cli::args::{init_tracing, Cli, Command, ConfigCommand};
 use bitrev_cli::config::{default_config_path, load_config, write_default_config, FlagOverrides};
 use bitrev_cli::download;
+use bitrev_cli::serve;
 use clap::Parser;
 
 fn main() {
@@ -33,6 +34,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 &FlagOverrides::from(&cli),
             )?;
             download::run(cli, config).await
+        }
+        Some(Command::Serve) => {
+            init_tracing(cli.verbose, cli.quiet);
+            let config = load_config(
+                cli.config.as_deref(),
+                |key| std::env::var(key).ok(),
+                &FlagOverrides::from(&cli),
+            )?;
+            serve::run(config).await
         }
     }
 }

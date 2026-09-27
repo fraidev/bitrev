@@ -2,6 +2,7 @@
 members = [
     "crates/bit_rev",
     "crates/cli",
+    "crates/server",
     "crates/util",
     "crates/testkit",
     "crates/interop",
@@ -9,6 +10,7 @@ members = [
 default-members = [
     "crates/bit_rev",
     "crates/cli",
+    "crates/server",
     "crates/util",
     "crates/testkit",
 ]

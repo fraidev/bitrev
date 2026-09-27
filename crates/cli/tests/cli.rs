@@ -27,6 +27,7 @@ fn help_lists_every_flag() {
         "-v",
         "--version",
         "config",
+        "serve",
     ] {
         assert!(
             help.contains(needle),
