@@ -1,0 +1,6 @@
+# eMule ipfilter.dat fixture
+001.002.003.004 - 001.002.003.010 , 000 , example range
+2001:db8::1 - 2001:db8::1 , 000 , v6 single
+009.009.009.009 - 009.009.009.009 , 200 , permitted level
+# blank line below
+

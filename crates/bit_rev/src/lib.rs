@@ -9,6 +9,7 @@ pub mod file;
 pub mod handshake;
 pub mod hash;
 pub mod identity;
+pub mod ip_filter;
 pub mod library;
 pub mod lsd;
 pub mod magnet;

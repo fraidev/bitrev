@@ -45,6 +45,7 @@ pub struct PeerSpawnRuntime {
     pub encryption: crate::mse::EncryptionPolicy,
     pub limits: BandwidthLimiters,
     pub add_peers: AddPeersFn,
+    pub ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +205,7 @@ fn clone_runtime(runtime: &PeerSpawnRuntime) -> PeerSpawnRuntime {
         encryption: runtime.encryption,
         limits: runtime.limits.clone(),
         add_peers: runtime.add_peers.clone(),
+        ip_filter: runtime.ip_filter.clone(),
     }
 }
 
@@ -256,6 +258,7 @@ async fn process_peers(
             connector: runtime.connector.clone(),
             promote_notify: runtime.promote_notify.clone(),
             limits: runtime.limits.clone(),
+            ip_filter: runtime.ip_filter.clone(),
         });
     }
 }

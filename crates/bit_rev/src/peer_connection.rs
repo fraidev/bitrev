@@ -2232,6 +2232,7 @@ pub struct PeerConnection {
     pub peer_id: [u8; 20],
     connector: Arc<dyn Connector>,
     encryption: EncryptionPolicy,
+    ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 }
 
 impl PeerConnection {
@@ -2242,6 +2243,7 @@ impl PeerConnection {
         handler: Arc<PeerHandler>,
         connector: Arc<dyn Connector>,
         encryption: EncryptionPolicy,
+        ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
     ) -> Self {
         Self {
             handler,
@@ -2251,6 +2253,7 @@ impl PeerConnection {
             peer_id,
             connector,
             encryption,
+            ip_filter,
         }
     }
 
@@ -2292,6 +2295,9 @@ impl PeerConnection {
         &self,
         protocol: &Protocol,
     ) -> anyhow::Result<(BoxedPeerStream, crate::handshake::Handshake)> {
+        if self.ip_filter.blocks(self.peer) {
+            anyhow::bail!("blocked by ip filter");
+        }
         let mut ours = crate::handshake::Handshake::outgoing(self.info_hash, self.peer_id);
         if self.handler.advertise_dht {
             ours.enable_dht();
@@ -2309,6 +2315,9 @@ impl PeerConnection {
             Ok(result) => Ok(result),
             Err(err) if self.encryption == EncryptionPolicy::PreferPlaintext => {
                 debug!(peer = %self.peer, error = %err, "plaintext handshake failed, retrying mse");
+                if self.ip_filter.blocks(self.peer) {
+                    anyhow::bail!("blocked by ip filter");
+                }
                 let stream = self.connector.dial(self.peer).await?;
                 let outcome = initiate(
                     stream,
@@ -2688,6 +2697,7 @@ pub struct SpawnPeerParams {
     pub max_peers_per_torrent: usize,
     pub promote_notify: Arc<Notify>,
     pub limits: BandwidthLimiters,
+    pub ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
 }
 
 struct PeerSlotGuard {
@@ -2721,6 +2731,9 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
     }
     if params.peer_states.is_banned(params.peer) {
         debug!(peer = %params.peer, "refusing banned peer");
+        return false;
+    }
+    if params.ip_filter.blocks(params.peer) {
         return false;
     }
 
@@ -2788,6 +2801,7 @@ pub fn try_spawn_peer(params: SpawnPeerParams) -> bool {
             handler.clone(),
             params.connector,
             params.encryption,
+            params.ip_filter,
         );
         let requester = handler.task_peer_chunk_requester();
         let uploader = handler.task_peer_uploader();
@@ -3382,6 +3396,25 @@ mod tests {
         tokio::sync::broadcast::Receiver<u32>,
         tempfile::TempDir,
     ) {
+        connection_fixture_with(
+            addr,
+            Arc::new(crate::transport::TcpConnector::new()),
+            crate::ip_filter::IpFilterHandle::disabled(),
+        )
+        .await
+    }
+
+    async fn connection_fixture_with(
+        addr: PeerAddr,
+        connector: Arc<dyn Connector>,
+        ip_filter: Arc<crate::ip_filter::IpFilterHandle>,
+    ) -> (
+        PeerConnection,
+        Arc<PeerStates>,
+        flume::Receiver<WriterRequest>,
+        tokio::sync::broadcast::Receiver<u32>,
+        tempfile::TempDir,
+    ) {
         let meta = tiny_meta();
         let torrent = Arc::new(crate::torrent::Torrent::new(&meta).unwrap());
         let dir = tempfile::tempdir().unwrap();
@@ -3415,7 +3448,6 @@ mod tests {
             promote_notify: Arc::new(Notify::new()),
             limits: BandwidthLimiters::unlimited(),
         }));
-        let connector: Arc<dyn Connector> = Arc::new(crate::transport::TcpConnector::new());
         let connection = PeerConnection::new(
             addr,
             meta.info_hash,
@@ -3423,9 +3455,46 @@ mod tests {
             handler,
             connector,
             crate::mse::EncryptionPolicy::Disabled,
+            ip_filter,
         );
         let have_rx = tokio::sync::broadcast::channel(8).0.subscribe();
         (connection, peer_states, writer_rx, have_rx, dir)
+    }
+
+    struct FlagConnector {
+        dialed: Arc<AtomicBool>,
+    }
+
+    impl Connector for FlagConnector {
+        fn dial(&self, _addr: SocketAddr) -> crate::transport::DialFuture<'_> {
+            self.dialed.store(true, Ordering::SeqCst);
+            Box::pin(async { Err(std::io::Error::other("blocked peer should not be dialed")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn outgoing_blocked_address_never_reaches_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ipfilter.dat");
+        std::fs::write(&path, "127.0.0.1 - 127.0.0.1 , 000 , local\n").unwrap();
+        let filter = Arc::new(crate::ip_filter::IpFilterHandle::open(path));
+        let dialed = Arc::new(AtomicBool::new(false));
+        let addr = peer(6881);
+        let (connection, _peers, writer_rx, have_rx, _tmp) = connection_fixture_with(
+            addr,
+            Arc::new(FlagConnector {
+                dialed: dialed.clone(),
+            }),
+            filter.clone(),
+        )
+        .await;
+        let err = connection
+            .manage_peer_incoming(writer_rx, have_rx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("blocked by ip filter"), "{err:#}");
+        assert!(!dialed.load(Ordering::SeqCst), "blocked peer was dialed");
+        assert_eq!(filter.stats().hits, 1);
     }
 
     #[tokio::test]
