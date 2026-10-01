@@ -97,6 +97,9 @@ pub async fn login(State(state): State<AppState>, headers: HeaderMap, body: Byte
     let user_ok = constant_time_eq(creds.username.as_bytes(), state.config.username.as_bytes());
     let pass_ok = constant_time_eq(creds.password.as_bytes(), state.config.password.as_bytes());
     if !user_ok || !pass_ok {
+        if is_form(&headers) {
+            return axum::response::Redirect::to("/login?error=1").into_response();
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),

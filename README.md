@@ -17,7 +17,7 @@ Daemon (Sonarr, Radarr, and the Web UI talk to this process):
 RUST_LOG=info cargo run --bin bitrev -- serve
 ```
 
-`RUST_LOG` selects the tracing filter. Unset, `bitrev serve` logs at `info` (raise it with `-v`, lower it with `-q`). A target filter such as `RUST_LOG=tower_http=debug,server=debug` logs each HTTP request with method, path, status, and latency. The default bind is `127.0.0.1:8080`. `GET /healthz` returns `{"ok":true}` without auth.
+`RUST_LOG` selects the tracing filter. Unset, `bitrev serve` logs at `info` (raise it with `-v`, lower it with `-q`). A target filter such as `RUST_LOG=tower_http=debug,server=debug` logs each HTTP request with method, path, status, and latency. The default bind is `127.0.0.1:8080`. Open that URL in a browser for the Web UI. `GET /healthz` returns `{"ok":true}` without auth.
 
 Tests:
 

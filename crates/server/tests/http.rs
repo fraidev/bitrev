@@ -76,7 +76,7 @@ async fn healthz_is_open_and_has_no_library_data() {
 #[tokio::test]
 async fn login_page_and_index_are_reachable_without_a_cookie() {
     let running = running("secret").await;
-    for path in ["/", "/login"] {
+    for path in ["/", "/login", "/app.css", "/app.js", "/login.js"] {
         let response = running
             .app
             .clone()
@@ -85,6 +85,84 @@ async fn login_page_and_index_are_reachable_without_a_cookie() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
+    running.session.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn index_serves_the_web_ui_title() {
+    let running = running("secret").await;
+    let response = running
+        .app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(body_bytes(response).await).unwrap();
+    assert!(body.contains("<title>bitrev</title>"), "{body}");
+    assert!(
+        body.contains("No torrents. Add a magnet or .torrent."),
+        "{body}"
+    );
+    running.session.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn form_login_sets_sid_then_opens_the_ui_and_torrent_list() {
+    let running = running("secret").await;
+    let response = running
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/login")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("username=admin&password=secret"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/");
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("SID="), "{cookie}");
+    let sid = cookie.split(';').next().unwrap();
+
+    let page = running
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("cookie", sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = String::from_utf8(body_bytes(page).await).unwrap();
+    assert!(html.contains("<title>bitrev</title>"), "{html}");
+
+    let torrents = running
+        .app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .header("cookie", sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(torrents.status(), StatusCode::OK);
+
     running.session.shutdown_graceful().await;
 }
 

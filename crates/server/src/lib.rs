@@ -1,8 +1,8 @@
 //! HTTP shell for `bitrev serve`.
 //!
 //! This crate owns the process bind, cookie auth, `GET /healthz`, the native
-//! `/api/v1` JSON API, and the qBittorrent Web API v2 facade at `/api/v2`.
-//! The Web UI lands in a later issue.
+//! `/api/v1` JSON API, the qBittorrent Web API v2 facade at `/api/v2`, and the
+//! static Web UI served at `/`.
 //!
 //! Request logs are `tracing` spans named `http` with `method`, `path`,
 //! `status`, and `latency`. The CLI installs a `tracing-subscriber` filter
@@ -18,14 +18,14 @@ mod api;
 mod auth;
 mod password;
 mod qbittorrent;
+mod ui;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
-use axum::response::Html;
 use axum::routing::get;
 use axum::{Json, Router};
 use bit_rev::config::ServerConfig;
@@ -57,10 +57,8 @@ pub fn app(session: Arc<Session>, config: ServerConfig) -> Router {
         sessions: Arc::new(SessionStore::default()),
         qbit_sync: Arc::new(qbittorrent::SyncCache::default()),
     };
-    let router = qbittorrent::mount(api::mount(Router::new()), qbit_enabled)
+    let router = ui::mount(qbittorrent::mount(api::mount(Router::new()), qbit_enabled))
         .route("/healthz", get(healthz))
-        .route("/", get(index))
-        .route("/login", get(login_page))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -104,24 +102,4 @@ pub async fn serve(
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({"ok": true}))
-}
-
-async fn index(State(state): State<AppState>) -> Html<String> {
-    let port = state.session.listen_port();
-    Html(format!(
-        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>bitrev</title></head>\
-<body><p>bitrev is running. Engine listen port {port}.</p><p><a href=\"/login\">Log in</a></p></body></html>\n"
-    ))
-}
-
-async fn login_page() -> Html<&'static str> {
-    Html(
-        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>bitrev login</title></head>\
-<body><h1>bitrev</h1>\
-<form method=\"post\" action=\"/api/v1/login\">\
-<label>Username <input name=\"username\" autocomplete=\"username\"></label>\
-<label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\"></label>\
-<button type=\"submit\">Log in</button>\
-</form></body></html>\n",
-    )
 }
