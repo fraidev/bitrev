@@ -33,6 +33,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/session", get(session_info))
+        .route("/api/v1/settings", get(get_settings).patch(patch_settings))
         .route("/api/v1/torrents", get(list_torrents).post(add_torrent))
         .route(
             "/api/v1/torrents/{hash}",
@@ -462,6 +463,122 @@ async fn session_info(State(state): State<AppState>) -> Json<SessionBody> {
         state.session.transfer_stats(),
         state.session.listen_port(),
     ))
+}
+
+#[derive(Serialize)]
+struct SettingsBody {
+    download_dir: String,
+    listen_port: u16,
+    max_peers_per_torrent: usize,
+    max_connections: usize,
+    dht: bool,
+    pex: bool,
+    lpd: bool,
+    nat: bool,
+    webseed: bool,
+    upload_limit: u64,
+    download_limit: u64,
+    alt_upload_limit: u64,
+    alt_download_limit: u64,
+    alt_mode: bool,
+    seed_ratio_limit: f64,
+    seed_time_limit: u64,
+    max_active_downloads: usize,
+    max_active_uploads: usize,
+    max_active: usize,
+    server_host: String,
+    server_port: u16,
+    server_username: String,
+    qbittorrent_compat: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsPatch {
+    #[serde(default)]
+    download_limit: Option<u64>,
+    #[serde(default)]
+    upload_limit: Option<u64>,
+    #[serde(default)]
+    alt_download_limit: Option<u64>,
+    #[serde(default)]
+    alt_upload_limit: Option<u64>,
+    #[serde(default)]
+    alt_mode: Option<bool>,
+}
+
+impl SettingsPatch {
+    fn is_empty(&self) -> bool {
+        self.download_limit.is_none()
+            && self.upload_limit.is_none()
+            && self.alt_download_limit.is_none()
+            && self.alt_upload_limit.is_none()
+            && self.alt_mode.is_none()
+    }
+}
+
+fn settings_body(state: &AppState) -> SettingsBody {
+    let options = state.session.options();
+    let (download_limit, upload_limit) = state.session.normal_rate_limits();
+    let stats = state.session.transfer_stats();
+    SettingsBody {
+        download_dir: path_string(&options.download_dir),
+        listen_port: state.session.listen_port(),
+        max_peers_per_torrent: options.max_peers_per_torrent,
+        max_connections: options.max_peers_global,
+        dht: options.dht.enabled,
+        pex: options.pex,
+        lpd: options.lpd,
+        nat: options.nat.enabled,
+        webseed: options.webseed,
+        upload_limit,
+        download_limit,
+        alt_upload_limit: stats.alt_upload_limit,
+        alt_download_limit: stats.alt_download_limit,
+        alt_mode: stats.alt_mode,
+        seed_ratio_limit: options.seed_ratio_limit,
+        seed_time_limit: options.seed_time_limit,
+        max_active_downloads: options.max_active_downloads,
+        max_active_uploads: options.max_active_uploads,
+        max_active: options.max_active,
+        server_host: state.config.host.clone(),
+        server_port: state.config.port,
+        server_username: state.config.username.clone(),
+        qbittorrent_compat: state.config.qbittorrent_compat,
+    }
+}
+
+async fn get_settings(State(state): State<AppState>) -> Json<SettingsBody> {
+    Json(settings_body(&state))
+}
+
+async fn patch_settings(
+    State(state): State<AppState>,
+    Json(body): Json<SettingsPatch>,
+) -> Result<Json<SettingsBody>, ApiError> {
+    if body.is_empty() {
+        return Err(ApiError::bad_request("no settings to apply"));
+    }
+    if body.download_limit.is_some() || body.upload_limit.is_some() {
+        let (mut download, mut upload) = state.session.normal_rate_limits();
+        if let Some(limit) = body.download_limit {
+            download = limit;
+        }
+        if let Some(limit) = body.upload_limit {
+            upload = limit;
+        }
+        state.session.set_rate_limits(download, upload);
+    }
+    if body.alt_download_limit.is_some() || body.alt_upload_limit.is_some() {
+        let stats = state.session.transfer_stats();
+        let download = body.alt_download_limit.unwrap_or(stats.alt_download_limit);
+        let upload = body.alt_upload_limit.unwrap_or(stats.alt_upload_limit);
+        state.session.set_alt_limits(download, upload);
+    }
+    if let Some(on) = body.alt_mode {
+        state.session.set_alt_mode(on);
+    }
+    Ok(Json(settings_body(&state)))
 }
 
 async fn list_torrents(State(state): State<AppState>) -> Json<Vec<SnapshotBody>> {

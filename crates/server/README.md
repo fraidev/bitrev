@@ -2,6 +2,8 @@
 
 `bitrev serve` binds the daemon from `server.host` / `server.port` (default `127.0.0.1:8080`). Cookie name is `SID`.
 
+Open `http://127.0.0.1:8080` for the Web UI. Log in with `server.username` and `server.password`. The page talks to `/api/v1` and uses the same `SID` cookie.
+
 ## Sonarr and Radarr
 
 Point a qBittorrent download client at this process. The facade is mounted at `/api/v2` when `server.qbittorrent_compat` is true (the default).

@@ -471,3 +471,77 @@ async fn sse_yields_added_and_drop_does_not_block_add() {
 
     running.session.shutdown_graceful().await;
 }
+
+#[tokio::test]
+async fn settings_reads_safe_keys_and_applies_speed_limits() {
+    let running = running().await;
+    let sid = sid(&running.app).await;
+
+    let locked = running
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(locked.status(), StatusCode::FORBIDDEN);
+
+    let current = running
+        .app
+        .clone()
+        .oneshot(with_sid(
+            Request::builder().uri("/api/v1/settings"),
+            &sid,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    let body = body_json(current).await;
+    assert!(body.get("password").is_none());
+    assert_eq!(body["download_limit"], 0);
+    assert_eq!(body["server_username"], "admin");
+    assert_eq!(body["server_host"], "127.0.0.1");
+    assert_eq!(body["server_port"], 8080);
+    assert!(body["qbittorrent_compat"].as_bool().unwrap());
+
+    let patched = running
+        .app
+        .clone()
+        .oneshot(with_sid(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/settings")
+                .header("content-type", "application/json"),
+            &sid,
+            Body::from(r#"{"download_limit":2048,"upload_limit":1024,"alt_mode":true}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+    let body = body_json(patched).await;
+    assert_eq!(body["download_limit"], 2048);
+    assert_eq!(body["upload_limit"], 1024);
+    assert_eq!(body["alt_mode"], true);
+    assert!(body.get("password").is_none());
+
+    let session = running
+        .app
+        .oneshot(with_sid(
+            Request::builder().uri("/api/v1/session"),
+            &sid,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    let session = body_json(session).await;
+    assert_eq!(session["alt_mode"], true);
+    assert_eq!(session["download_limit"], 0);
+    assert_eq!(session["alt_download_limit"], 0);
+
+    running.session.shutdown_graceful().await;
+}

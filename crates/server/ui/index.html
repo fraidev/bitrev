@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bitrev</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <a href="/">bitrev</a>
+      <span id="version" class="muted"></span>
+    </div>
+    <div class="session-stats" aria-live="polite">
+      <span id="down-rate">Down ...</span>
+      <span id="up-rate">Up ...</span>
+      <span id="listen-port">Port ...</span>
+    </div>
+    <nav class="top-nav">
+      <button type="button" id="nav-torrents" aria-current="page">Torrents</button>
+      <button type="button" id="nav-settings">Settings</button>
+      <button type="button" id="logout">Log out</button>
+    </nav>
+  </header>
+
+  <p id="status" class="banner" hidden></p>
+
+  <main id="view-torrents">
+    <form id="add-form" class="panel add-form">
+      <label class="grow">Magnet
+        <input id="add-magnet" name="magnet" type="text" placeholder="magnet:?xt=urn:btih:..." autocomplete="off" spellcheck="false">
+      </label>
+      <label>.torrent file
+        <input id="add-file" name="torrent" type="file" accept=".torrent,application/x-bittorrent">
+      </label>
+      <label>Save path
+        <input id="add-save-path" name="save_path" type="text" autocomplete="off">
+      </label>
+      <label>Category
+        <input id="add-category" name="category" type="text" list="category-list" autocomplete="off">
+        <datalist id="category-list"></datalist>
+      </label>
+      <label class="check">
+        <input id="add-paused" name="paused" type="checkbox">
+        Start paused
+      </label>
+      <button type="submit">Add</button>
+    </form>
+
+    <div class="toolbar">
+      <label class="check">
+        <input id="delete-files" type="checkbox">
+        Delete files when removing
+      </label>
+    </div>
+
+    <div class="layout">
+      <section class="panel table-panel">
+        <p id="empty" class="empty">No torrents. Add a magnet or .torrent.</p>
+        <div class="table-scroll">
+          <table class="torrent-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Progress</th>
+                <th>State</th>
+                <th>Down</th>
+                <th>Up</th>
+                <th>Ratio</th>
+                <th>ETA</th>
+                <th>Category</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="torrent-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside id="detail" class="panel detail" hidden>
+        <div class="detail-head">
+          <h2 id="detail-name">Torrent</h2>
+          <button type="button" id="detail-close">Close</button>
+        </div>
+        <p id="detail-error" class="banner" hidden></p>
+        <p id="detail-meta" class="muted"></p>
+        <ul id="detail-files" class="file-list"></ul>
+      </aside>
+    </div>
+  </main>
+
+  <main id="view-settings" hidden>
+    <form id="settings-form" class="panel settings-form">
+      <h2>Speed limits</h2>
+      <p class="muted">These apply immediately. 0 means unlimited. Values are bytes per second.</p>
+      <div class="settings-grid">
+        <label>Download limit
+          <input id="set-download-limit" name="download_limit" type="number" min="0" step="1" required>
+        </label>
+        <label>Upload limit
+          <input id="set-upload-limit" name="upload_limit" type="number" min="0" step="1" required>
+        </label>
+        <label>Alt download limit
+          <input id="set-alt-download-limit" name="alt_download_limit" type="number" min="0" step="1" required>
+        </label>
+        <label>Alt upload limit
+          <input id="set-alt-upload-limit" name="alt_upload_limit" type="number" min="0" step="1" required>
+        </label>
+      </div>
+      <label class="check">
+        <input id="set-alt-mode" name="alt_mode" type="checkbox">
+        Use alt speed limits
+      </label>
+      <button type="submit">Save limits</button>
+    </form>
+
+    <section class="panel">
+      <h2>Session</h2>
+      <p class="muted">Read from the running process. Change these in the config file, then restart <code>bitrev serve</code>.</p>
+      <dl id="settings-readonly" class="readonly"></dl>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
