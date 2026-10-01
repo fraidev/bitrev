@@ -3,13 +3,13 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use bit_rev::file::{File, Info, TorrentFile, TorrentMeta};
+use bit_rev::create::{create_torrent, CreateOptions};
+use bit_rev::file::TorrentMeta;
 use bit_rev::torrent::Torrent;
 use bit_rev::utils::{calculate_piece_size, map_piece_to_files};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use serde_bencode::ser;
-use serde_bytes::ByteBuf;
 use tempfile::TempDir;
 
 use super::{hex_encode, sha1_bytes};
@@ -370,19 +370,22 @@ impl TorrentFixture {
         let payload_root = temp_dir.path().join("payload");
         std::fs::create_dir_all(&payload_root).expect("payload root");
 
-        let total_length: u64 = builder.files.iter().map(|f| f.length).sum();
+        // create_torrent lists files in sorted path order. Payload bytes and
+        // the on-disk index follow that order so piece reads stay aligned.
+        let mut specs = builder.files.clone();
+        specs.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let total_length: u64 = specs.iter().map(|f| f.length).sum();
         let piece_length = builder.piece_length;
         let mut rng = StdRng::seed_from_u64(builder.seed);
-        let mut piece_hashes = Vec::new();
-        let mut piece_buf = Vec::with_capacity(piece_length as usize);
         let mut payload = if builder.keep_payload {
             Some(Vec::with_capacity(total_length as usize))
         } else {
             None
         };
 
-        let mut written = Vec::with_capacity(builder.files.len());
-        for spec in &builder.files {
+        let mut written = Vec::with_capacity(specs.len());
+        for spec in &specs {
             let mut disk_path = payload_root.clone();
             for component in &spec.path {
                 disk_path.push(component);
@@ -400,16 +403,6 @@ impl TorrentFixture {
                 if let Some(payload) = &mut payload {
                     payload.extend_from_slice(&chunk[..n]);
                 }
-                let mut off = 0;
-                while off < n {
-                    let take = (piece_length as usize - piece_buf.len()).min(n - off);
-                    piece_buf.extend_from_slice(&chunk[off..off + take]);
-                    off += take;
-                    if piece_buf.len() == piece_length as usize {
-                        piece_hashes.push(sha1_bytes(&piece_buf));
-                        piece_buf.clear();
-                    }
-                }
                 remaining -= n as u64;
             }
             written.push(WrittenFile {
@@ -418,58 +411,32 @@ impl TorrentFixture {
                 disk_path,
             });
         }
-        if !piece_buf.is_empty() {
-            piece_hashes.push(sha1_bytes(&piece_buf));
-        }
 
-        let mut pieces_concat = Vec::with_capacity(piece_hashes.len() * 20);
-        for hash in &piece_hashes {
-            pieces_concat.extend_from_slice(hash);
-        }
-
-        let (length, files) = if builder.files.len() == 1 {
-            (Some(builder.files[0].length as i64), None)
+        let source = if written.len() == 1 {
+            written[0].disk_path.clone()
         } else {
-            (
-                None,
-                Some(
-                    builder
-                        .files
-                        .iter()
-                        .map(|f| File {
-                            path: f.path.clone(),
-                            length: f.length as i64,
-                            md5sum: None,
-                        })
-                        .collect(),
-                ),
-            )
+            payload_root
         };
-
-        let torrent_file = TorrentFile {
-            info: Info {
-                name: builder.name.clone(),
-                pieces: ByteBuf::from(pieces_concat),
-                piece_length: i64::from(piece_length),
-                md5sum: None,
-                length,
-                files,
-                private: if builder.private { Some(1) } else { None },
-                path: None,
-                root_hash: None,
-            },
-            announce: builder.announce,
-            nodes: None,
-            encoding: None,
-            httpseeds: None,
-            url_list: None,
-            announce_list: builder.announce_list,
-            creation_date: None,
-            comment: None,
-            created_by: None,
-        };
-        let torrent_meta = TorrentMeta::new(torrent_file).expect("fixture metainfo");
-        let torrent_bytes = ser::to_bytes(&torrent_meta.torrent_file).expect("bencode torrent");
+        let mut opts = CreateOptions::new(source)
+            .piece_length(u64::from(piece_length))
+            .name(builder.name.clone())
+            .private(builder.private);
+        if let Some(url) = builder.announce.clone() {
+            opts = opts.announce(url);
+        }
+        if let Some(list) = builder.announce_list.clone() {
+            opts = opts.announce_tiers(list);
+        }
+        let torrent_bytes = create_torrent(opts).expect("create torrent");
+        let torrent_meta =
+            bit_rev::file::from_bytes(&torrent_bytes).expect("parse created torrent");
+        let rewritten = ser::to_bytes(&torrent_meta.torrent_file).expect("re-encode torrent");
+        let rewritten_meta =
+            bit_rev::file::from_bytes(&rewritten).expect("reparse re-encoded torrent");
+        assert_eq!(
+            rewritten_meta.info_hash, torrent_meta.info_hash,
+            "re-encoding the created torrent changed the info hash"
+        );
         let torrent_path = temp_dir.path().join(format!("{}.torrent", builder.name));
         std::fs::write(&torrent_path, &torrent_bytes).expect("write torrent");
 
@@ -479,7 +446,7 @@ impl TorrentFixture {
             piece_length,
             total_length,
             files: written,
-            piece_hashes,
+            piece_hashes: torrent_meta.piece_hashes.clone(),
             torrent_meta,
             torrent_bytes,
             torrent_path,

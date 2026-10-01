@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bit_rev::create::{create_torrent, CreateOptions};
 use bit_rev::mse::EncryptionPolicy;
 use bit_rev::resume::{self, ResumeData, RESUME_VERSION};
 use bit_rev::session::{AddTorrentOptions, Session, SessionOptions};
@@ -900,6 +901,78 @@ async fn e2e_utp_two_sessions_through_lossy_relay() {
             .any(|entry| entry.utp),
         "lossy uTP download should mark the peer as utp"
     );
+
+    leecher.shutdown();
+    seeder.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_created_torrent_seeds_to_leecher() {
+    let src = unique_temp_dir();
+    let root = src.path().join("bundle");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::write(root.join("a.txt"), b"alpha-from-create").unwrap();
+    std::fs::write(root.join("nested").join("b.bin"), vec![0x5Au8; 40_000]).unwrap();
+    std::fs::write(root.join("empty.bin"), b"").unwrap();
+
+    let bytes =
+        create_torrent(CreateOptions::new(&root).piece_length(16 * 1024)).expect("create torrent");
+    let meta = bit_rev::file::from_bytes(&bytes).expect("parse created torrent");
+    assert!(meta.torrent_file.info.files.is_some());
+    let info_hash = meta.info_hash;
+
+    let seeder = test_session(None).await;
+    seeder
+        .add_torrent(
+            AddTorrentOptions::from(meta.clone())
+                .output_dir(&root)
+                .seed(true),
+        )
+        .await
+        .expect("add seeder");
+    let mut addr = seeder.wait_listening().await;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    let download_dir = unique_temp_dir();
+    let output = download_dir.path().to_path_buf();
+    let leecher = test_session(None).await;
+    let added = add_download(&leecher, meta, &output).await;
+    assert!(
+        leecher.connect_peer(&info_hash, addr),
+        "leecher should dial the seeder session"
+    );
+    wait_for_completion(
+        &added.pr_rx,
+        &added.torrent,
+        &added.already_have,
+        DOWNLOAD_TIMEOUT,
+    )
+    .await;
+
+    let files = added
+        .torrent_meta
+        .as_ref()
+        .expect("leecher metainfo")
+        .torrent_file
+        .info
+        .files
+        .clone()
+        .expect("multi-file");
+    for file in &files {
+        let mut from = root.clone();
+        let mut got = output.clone();
+        for component in &file.path {
+            from.push(component);
+            got.push(component);
+        }
+        assert_eq!(
+            std::fs::read(&got).unwrap_or_else(|err| panic!("read {got:?}: {err}")),
+            std::fs::read(&from).unwrap(),
+            "bytes mismatch for {got:?}"
+        );
+    }
 
     leecher.shutdown();
     seeder.shutdown();

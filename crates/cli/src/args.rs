@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 
 /// A BitTorrent client.
 #[derive(Debug, Parser)]
@@ -68,6 +68,44 @@ pub enum Command {
     /// `RUST_LOG` selects the tracing filter. When unset, the level follows
     /// `-v` / `-q` and otherwise defaults to `info`.
     Serve,
+    /// Create a .torrent from a file or directory.
+    Create(CreateArgs),
+}
+
+/// `bitrev create` flags.
+#[derive(Debug, Args)]
+pub struct CreateArgs {
+    /// File or directory to include.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+
+    /// Output path. Defaults to <name>.torrent next to the source.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Piece length in bytes. 0 chooses a power of two between 16 KiB and 16 MiB.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub piece_length: u64,
+
+    /// Tracker announce URL. Repeat for another tier.
+    #[arg(long = "announce", value_name = "URL")]
+    pub announce: Vec<String>,
+
+    /// Mark the torrent private (BEP-0027).
+    #[arg(long)]
+    pub private: bool,
+
+    /// Comment stored in the torrent.
+    #[arg(long, value_name = "TEXT")]
+    pub comment: Option<String>,
+
+    /// Web seed URL (BEP-0019 url-list). Repeat to add another.
+    #[arg(long = "web-seed", value_name = "URL")]
+    pub web_seed: Vec<String>,
+
+    /// Override the name stored in the info dict.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,6 +203,7 @@ mod tests {
             "--version",
             "config",
             "serve",
+            "create",
         ] {
             assert!(help.contains(needle), "help is missing {needle}:\n{help}");
         }
@@ -235,6 +274,43 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Serve)));
         assert!(cli.inputs.is_empty());
         assert_eq!(cli.config.as_deref().unwrap().as_os_str(), "/tmp/c.toml");
+    }
+
+    #[test]
+    fn parses_create_subcommand() {
+        let cli = Cli::parse_from([
+            "bitrev",
+            "create",
+            "dir",
+            "-o",
+            "out.torrent",
+            "--piece-length",
+            "16384",
+            "--announce",
+            "http://a/announce",
+            "--announce",
+            "http://b/announce",
+            "--private",
+            "--comment",
+            "note",
+            "--web-seed",
+            "http://cdn/a",
+            "--web-seed",
+            "http://cdn/b",
+            "--name",
+            "custom",
+        ]);
+        let Some(Command::Create(args)) = cli.command else {
+            panic!("expected create");
+        };
+        assert_eq!(args.path.as_os_str(), "dir");
+        assert_eq!(args.output.unwrap().as_os_str(), "out.torrent");
+        assert_eq!(args.piece_length, 16384);
+        assert_eq!(args.announce, ["http://a/announce", "http://b/announce"]);
+        assert!(args.private);
+        assert_eq!(args.comment.as_deref(), Some("note"));
+        assert_eq!(args.web_seed, ["http://cdn/a", "http://cdn/b"]);
+        assert_eq!(args.name.as_deref(), Some("custom"));
     }
 
     #[test]
