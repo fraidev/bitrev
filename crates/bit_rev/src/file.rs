@@ -22,7 +22,7 @@ pub struct Node(String, i64);
 pub struct File {
     pub path: Vec<String>,
     pub length: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub md5sum: Option<String>,
 }
 
@@ -32,18 +32,17 @@ pub struct Info {
     pub pieces: ByteBuf,
     #[serde(rename = "piece length")]
     pub piece_length: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub md5sum: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<File>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private: Option<u8>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<Vec<String>>,
-    #[serde(default)]
-    #[serde(rename = "root hash")]
+    #[serde(default, rename = "root hash", skip_serializing_if = "Option::is_none")]
     pub root_hash: Option<String>,
 }
 
@@ -57,31 +56,41 @@ impl Info {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TorrentFile {
     pub info: Info,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announce: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<Node>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub httpseeds: Option<Vec<String>>,
     /// BEP-0019 `url-list`: one URL string or a list of URL strings.
     #[serde(
         default,
         rename = "url-list",
-        deserialize_with = "deserialize_url_list"
+        deserialize_with = "deserialize_url_list",
+        skip_serializing_if = "Option::is_none"
     )]
     pub url_list: Option<Vec<String>>,
-    #[serde(default)]
-    #[serde(rename = "announce-list")]
+    #[serde(
+        default,
+        rename = "announce-list",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub announce_list: Option<Vec<Vec<String>>>,
-    #[serde(default)]
-    #[serde(rename = "creation date")]
+    #[serde(
+        default,
+        rename = "creation date",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub creation_date: Option<i64>,
-    #[serde(rename = "comment")]
+    #[serde(default, rename = "comment", skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "created by")]
+    #[serde(
+        default,
+        rename = "created by",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_by: Option<String>,
 }
 
@@ -244,7 +253,7 @@ fn validate_torrent_file(torrent_file: &TorrentFile) -> Result<()> {
     Ok(())
 }
 
-fn validate_file_path(path: &[String]) -> Result<()> {
+pub(crate) fn validate_file_path(path: &[String]) -> Result<()> {
     if path.is_empty() {
         anyhow::bail!("file path must not be empty");
     }
@@ -256,7 +265,7 @@ fn validate_file_path(path: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn path_component_is_safe(component: &str) -> bool {
+pub(crate) fn path_component_is_safe(component: &str) -> bool {
     if component.is_empty() || component == ".." {
         return false;
     }

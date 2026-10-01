@@ -1,5 +1,6 @@
 use bitrev_cli::args::{init_tracing, Cli, Command, ConfigCommand};
 use bitrev_cli::config::{default_config_path, load_config, write_default_config, FlagOverrides};
+use bitrev_cli::create;
 use bitrev_cli::download;
 use bitrev_cli::serve;
 use clap::Parser;
@@ -43,6 +44,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 &FlagOverrides::from(&cli),
             )?;
             serve::run(config).await
+        }
+        Some(Command::Create(args)) => {
+            init_tracing(cli.verbose, cli.quiet);
+            create::run(args).await
         }
     }
 }
